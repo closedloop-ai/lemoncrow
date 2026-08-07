@@ -30,6 +30,8 @@ EXPECTED_TOOLS = {
     "index",
     "blame",
     "cache",
+    # F3: index coverage -- advertised, not hidden.
+    "code_coverage_check",
 }
 
 

@@ -41,6 +41,10 @@ EXPECTED_TOOLS = {
     "code_search",
     "bash",
     "web_fetch",
+    # F3: tells an empty search result apart from an unindexed file. Advertised
+    # rather than hidden because a caller has to know it exists to audit a
+    # negative result -- the whole point of it.
+    "code_coverage_check",
 }
 
 
