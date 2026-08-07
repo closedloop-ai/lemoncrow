@@ -45,6 +45,10 @@ EXPECTED_TOOLS = {
     # rather than hidden because a caller has to know it exists to audit a
     # negative result -- the whole point of it.
     "code_coverage_check",
+    # F2: diff -> changed symbols -> impacted callers. Advertised for the same
+    # reason: a review that cannot ask what a change touches falls back to
+    # reading the diff and stopping at the file boundary.
+    "code_changes",
 }
 
 

@@ -99,8 +99,7 @@ class IndexRebuilding(RuntimeError):
 
     def __init__(self, repo_root: Path | str, detail: str) -> None:
         super().__init__(
-            f"code index for {repo_root} is being rebuilt ({detail}); "
-            "results would be incomplete -- retry shortly"
+            f"code index for {repo_root} is being rebuilt ({detail}); " "results would be incomplete -- retry shortly"
         )
         self.repo_root = str(repo_root)
         self.detail = detail

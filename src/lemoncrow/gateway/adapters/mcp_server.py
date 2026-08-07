@@ -9556,6 +9556,32 @@ def tool_code_coverage_check(
     return check_coverage(paths=paths, repo_root=_code_repo_root(repo_root)).to_dict()
 
 
+@mcp_tool(name="code_changes")
+def tool_code_changes(
+    base_ref: str = "HEAD",
+    paths: list[str] | None = None,
+    depth: int = 1,
+    limit: int = 100,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Diff since `base_ref`, mapped to changed symbols and the callers they reach.
+
+    Carries "what does this change touch?" past the file boundary. `depth`
+    expands callers by that many hops. The call graph is name-keyed, so every
+    edge carries `match_kind: "name"` and over-reports rather than missing
+    callers; `impacted_total` gives the count before `limit` truncation.
+    """
+    from lemoncrow.infra.code_intel.change_impact import analyze_changes
+
+    return analyze_changes(
+        base_ref=base_ref,
+        paths=paths,
+        depth=depth,
+        limit=limit,
+        repo_root=_code_repo_root(repo_root),
+    ).to_dict()
+
+
 @mcp_tool(name="blame")
 def tool_blame(
     query: str | None = None,

@@ -38,6 +38,8 @@ def _preindex(repo_root: str | Path) -> None:
 EXPECTED_TOOLS = {
     # F3 -- see tests/gateway/test_mcp_tool_handlers.py for why it is advertised.
     "code_coverage_check",
+    # F2 -- diff -> changed symbols -> impacted callers.
+    "code_changes",
     "read",
     "edit",
     "code_search",
