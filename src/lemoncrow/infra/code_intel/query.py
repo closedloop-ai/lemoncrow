@@ -31,7 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
+from lemoncrow.infra.code_intel.completeness import MATCH_NAME, OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.store import CodeIntelStore
 
 __all__ = [
@@ -452,7 +452,7 @@ def code_query(
                 scanned=0,
                 truncated=False,
                 scan_capped=False,
-                match_kind="name" if spec.name_keyed else None,
+                match_kind=MATCH_NAME if spec.name_keyed else None,
                 engine_index_version=index_version,
             )
 
@@ -495,6 +495,6 @@ def code_query(
         scanned=scanned,
         truncated=scanned > limit,
         scan_capped=scanned >= MAX_SCAN,
-        match_kind="name" if spec.name_keyed else None,
+        match_kind=MATCH_NAME if spec.name_keyed else None,
         engine_index_version=index_version,
     )

@@ -154,7 +154,7 @@ from lemoncrow.gateway.adapters.mcp.tools_commodity import (  # noqa: F401  (reg
     tool_web_fetch,
 )
 from lemoncrow.gateway.adapters.mcp_branding import icon_metadata
-from lemoncrow.infra.code_intel.completeness import CODE_OP_OBJECTIVES, OBJECTIVE_RANKED
+from lemoncrow.infra.code_intel.completeness import CODE_OP_MATCH_KINDS, CODE_OP_OBJECTIVES, OBJECTIVE_RANKED
 from lemoncrow.infra.code_intel.freshness import (  # noqa: F401  (IndexRebuilding re-exported for handlers/tests)
     FRESHNESS_REBUILT,
     IndexRebuilding,
@@ -8606,6 +8606,16 @@ def _maybe_attach_code_rendered(op: str, payload: dict[str, Any], *, render_comp
     if objective is not None:
         result.setdefault("objective", objective)
 
+    # ...and say how the edges were matched. Exhaustive is necessary, not
+    # sufficient: both edge stores are name-keyed, so a complete enumeration of
+    # a method called `open` is every `open()` in the repo. Those rows are real
+    # lines, so replaying them through grep confirms rather than catches them.
+    # A consumer that shows callsites to a human needs to know that before it
+    # decides whether to trust the set or validate it.
+    match_kind = CODE_OP_MATCH_KINDS.get(op)
+    if match_kind is not None:
+        result.setdefault("match_kind", match_kind)
+
     return result
 
 
@@ -11004,13 +11014,25 @@ def _tool_broker_handler(args: dict[str, Any]) -> dict[str, Any] | Any:
         call_spec = TOOLS.get(target)
         if call_spec is None:
             raise _ToolArgumentError(f"unknown tool: {target}")
-        if _tool_advertised_now(target, call_spec):
-            raise _ToolArgumentError(f"{target!r} is already exposed; call it directly")
         arguments = args.get("arguments") or {}
         if not isinstance(arguments, dict):
             raise _ToolArgumentError("tool arguments must be an object")
         handler = cast(Callable[[dict[str, Any]], Any], call_spec["handler"])
-        return handler(arguments)
+        result = handler(arguments)
+        # An advertised tool used to be refused here as "call it directly" --
+        # advice the caller may be unable to take. A host captures its tool list
+        # when the session connects, so any tool added since then is advertised
+        # by the server and absent from the caller's list, and the refusal left
+        # that caller with no route at all. `search` still hides advertised
+        # tools (one route per tool, no wasted hop); `call` runs them and says
+        # where the direct route is.
+        if _tool_advertised_now(target, call_spec) and isinstance(result, dict):
+            result.setdefault(
+                "broker_note",
+                f"{target!r} is advertised directly -- call it by name. If it is missing from "
+                "your tool list, that list predates the tool; reconnect to refresh it.",
+            )
+        return result
 
     raise _ToolArgumentError(f"unknown broker action: {action}")
 

@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
+from lemoncrow.infra.code_intel.completeness import MATCH_NAME, MATCH_RESOLVED, OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.store import CodeIntelStore, SymbolRow
 
 __all__ = [
@@ -45,11 +45,6 @@ __all__ = [
     "LineRange",
     "analyze_changes",
 ]
-
-#: Name-matched: the callee text equalled the symbol's name. Over-reports.
-MATCH_NAME = "name"
-#: Resolved to a symbol id. Nothing produces this until F9's sidecar lands.
-MATCH_RESOLVED = "resolved"
 
 STATUS_ADDED = "added"
 STATUS_MODIFIED = "modified"

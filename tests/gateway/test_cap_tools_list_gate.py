@@ -183,13 +183,35 @@ def test_broker_search_never_returns_an_advertised_tool(monkeypatch: pytest.Monk
     assert not (found & advertised)
 
 
-def test_broker_refuses_an_already_advertised_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    from lemoncrow.gateway.adapters import mcp_server
+def test_broker_runs_an_already_advertised_tool_and_points_at_the_direct_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The broker must not dead-end a caller whose tool list predates the tool.
 
+    This used to raise "already exposed; call it directly" -- advice the caller
+    could not act on. A host captures tools/list once at connect time, so a tool
+    added since (``relations``, as it happens) is advertised by the server and
+    absent from a live session's list; refusing left it reachable by no route,
+    and the reviewer that hit this had to hand-drive raw JSON-RPC.
+    """
     monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
     assert "read" in {tool["name"] for tool in _list()}
-    with pytest.raises(mcp_server._ToolArgumentError, match="already exposed"):
-        _broker({"action": "call", "name": "read", "arguments": {}})
+    _stub_handler(monkeypatch, "read")
+
+    result = _broker({"action": "call", "name": "read", "arguments": {"files": ["x.py"]}})
+
+    assert result["called"] == "read"
+    assert result["args"] == {"files": ["x.py"]}
+    assert "reconnect" in result["broker_note"]
+
+
+def test_broker_note_is_absent_when_the_tool_is_genuinely_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The note is a nudge toward a route that exists -- not boilerplate."""
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    assert "blame" not in {tool["name"] for tool in _list()}
+    _stub_handler(monkeypatch, "blame")
+
+    assert "broker_note" not in _broker({"action": "call", "name": "blame", "arguments": {}})
 
 
 @pytest.mark.parametrize("name", sorted({"agent", "codemod", "mcp", "sql", "tool", "workflow"}))

@@ -16,9 +16,13 @@ import pytest
 
 from lemoncrow.infra.code_intel.change_impact import analyze_changes
 from lemoncrow.infra.code_intel.completeness import (
+    CODE_OP_MATCH_KINDS,
     CODE_OP_OBJECTIVES,
+    MATCH_NAME,
+    MATCH_RESOLVED,
     OBJECTIVE_EXHAUSTIVE,
     OBJECTIVE_RANKED,
+    with_match_kind,
     with_objective,
 )
 from lemoncrow.infra.code_intel.coverage import check_coverage
@@ -62,6 +66,43 @@ def test_unverified_engine_ops_are_absent_rather_than_guessed() -> None:
     """Absent must read as unclassified, never as exhaustive."""
     for op in ("pattern", "node", "blame", "index"):
         assert op not in CODE_OP_OBJECTIVES
+
+
+def test_with_match_kind_stamps_in_place() -> None:
+    payload: dict[str, object] = {"rows": []}
+    assert with_match_kind(payload, MATCH_NAME) is payload
+    assert payload["match_kind"] == MATCH_NAME
+
+
+def test_every_enumerative_symbol_op_states_how_it_matched() -> None:
+    """Exhaustive is necessary, not sufficient.
+
+    A complete enumeration over a name-keyed edge store is still every
+    ``open()`` in the repo when the changed method is called ``open``. Those
+    rows are real lines, so a grep replay confirms them instead of catching
+    them -- the consumer has to be told which kind of match it got.
+    """
+    for op in ("callers", "callees", "usages"):
+        assert CODE_OP_OBJECTIVES[op] == OBJECTIVE_EXHAUSTIVE
+        assert CODE_OP_MATCH_KINDS[op] == MATCH_NAME
+
+
+def test_ranked_ops_carry_no_match_kind() -> None:
+    """A ranked answer is an ordering, not an edge set; the question is moot."""
+    for op in ("search", "explore", "context", "centrality", "pattern", "node"):
+        assert op not in CODE_OP_MATCH_KINDS
+
+
+def test_no_op_claims_resolved_until_a_resolution_sidecar_exists() -> None:
+    """Guard against the constant being flipped ahead of the data.
+
+    Neither edge store has a column a row could be resolved *by*:
+    ``call_edges`` keeps raw dotted callee text, ``"references"`` a bare
+    ``symbol_name``. Claiming ``resolved`` here would hand a consumer exactly
+    the false confidence this module exists to remove.
+    """
+    assert MATCH_RESOLVED not in set(CODE_OP_MATCH_KINDS.values())
+    assert set(CODE_OP_MATCH_KINDS.values()) == {MATCH_NAME}
 
 
 def test_every_open_module_stamps_an_objective(repo: Path, workspace_root: Path) -> None:

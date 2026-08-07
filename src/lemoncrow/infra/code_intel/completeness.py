@@ -29,6 +29,33 @@ An op absent from :data:`CODE_OP_OBJECTIVES` carries no ``objective`` field.
 That is deliberate: the closed engine owns those code paths, and asserting an
 objective we have not verified would manufacture the false confidence this
 module exists to remove. Absent means unclassified, never "exhaustive".
+
+Exhaustive is necessary, not sufficient
+---------------------------------------
+
+Complete is not the same as correct, and for anything that shows a callsite to
+a human the difference decides whether the output is trustworthy. Both edge
+stores behind these ops are keyed by *name*: ``call_edges`` records the callee
+as raw dotted call text with no ``symbol_id``, and ``"references"`` records a
+bare ``symbol_name``. So a change to a method called ``open`` enumerates every
+``open()`` in the repository -- exhaustively, untruncated, and wrong. The rows
+are real lines, which is exactly why a grep replay does not catch them.
+
+The error is one-directional: name matching over-reports and never
+under-reports. That is the safe direction for an exemption (no false
+negatives) and the unsafe one for review output (confident false findings). So
+every enumerative response also states :data:`CODE_OP_MATCH_KINDS` as
+``match_kind``, and a consumer that surfaces rows to a human gates on
+``objective == "exhaustive" and not truncated and match_kind == "resolved"``,
+validating the rows itself whenever the answer is ``"name"``.
+
+Today that value is ``"name"`` everywhere, guaranteed by the schema rather than
+by convention -- there is no column any row could be resolved *by*. It is
+stamped at the top level for that reason: it describes every row in the payload
+because no two rows can currently disagree. When F9's resolution sidecar lands
+and rows can differ, ``match_kind`` moves onto the row and the top-level value
+becomes ``"mixed"``; a consumer already gating on ``== "resolved"`` stays
+correct through that change without an edit.
 """
 
 from __future__ import annotations
@@ -36,9 +63,13 @@ from __future__ import annotations
 from typing import Any
 
 __all__ = [
+    "CODE_OP_MATCH_KINDS",
     "CODE_OP_OBJECTIVES",
+    "MATCH_NAME",
+    "MATCH_RESOLVED",
     "OBJECTIVE_EXHAUSTIVE",
     "OBJECTIVE_RANKED",
+    "with_match_kind",
     "with_objective",
 ]
 
@@ -63,7 +94,32 @@ CODE_OP_OBJECTIVES: dict[str, str] = {
 }
 
 
+#: The edge text equalled the symbol's name. Over-reports, never under-reports.
+MATCH_NAME = "name"
+
+#: The edge was resolved to a symbol id. Nothing produces this until F9's
+#: resolution sidecar lands; it exists so consumers can write the predicate
+#: they will still want then.
+MATCH_RESOLVED = "resolved"
+
+#: How each enumerative op's edges were matched. Ranked ops are absent: their
+#: answer is an ordering, not an edge set, so the question does not apply.
+#: ``pattern`` and ``node`` are absent for the same reason they carry no
+#: objective -- unclassified, never guessed.
+CODE_OP_MATCH_KINDS: dict[str, str] = {
+    "callers": MATCH_NAME,
+    "callees": MATCH_NAME,
+    "usages": MATCH_NAME,
+}
+
+
 def with_objective(payload: dict[str, Any], objective: str) -> dict[str, Any]:
     """Stamp *payload* in place and return it."""
     payload["objective"] = objective
+    return payload
+
+
+def with_match_kind(payload: dict[str, Any], match_kind: str) -> dict[str, Any]:
+    """Stamp *payload* in place and return it."""
+    payload["match_kind"] = match_kind
     return payload
