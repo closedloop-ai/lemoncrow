@@ -129,6 +129,21 @@ def test_a_failed_import_does_not_propagate(cold: list[str], monkeypatch: pytest
     mcp_server._warm_pro_code_modules()  # must not raise
 
 
+def test_serve_warms_before_it_starts_the_reader() -> None:
+    """The daemon half: build the group before anything concurrent exists.
+
+    Once ``_stdin_reader`` is running, request threads and the background index
+    warmer run together. Warming after that point would be warming into the
+    race instead of ahead of it, so the ordering here is the whole point.
+    """
+    import inspect
+
+    source = inspect.getsource(mcp_server.serve)
+    warm_at = source.index("_warm_pro_code_modules()")
+    reader_at = source.index("reader.start()")
+    assert warm_at < reader_at
+
+
 def test_the_engine_helper_warms_before_it_imports(monkeypatch: pytest.MonkeyPatch) -> None:
     """Wiring check: the guard is worthless if the entry points skip it."""
     calls: list[str] = []

@@ -13491,6 +13491,14 @@ def serve() -> None:
             executor = io_executor if _classify_cost(req) != _COST_CPU else cpu_executor
             executor.submit(_handle_and_write, req)
 
+    # Initialise the pro mypyc group here, on the main thread, before anything
+    # concurrent exists. `_warm_pro_code_modules` already makes concurrent entry
+    # safe wherever it is called from -- that lock is the correctness property
+    # and this does not replace it. What this adds is the daemon-shaped half:
+    # once the reader starts, request threads and the background index warmer
+    # run together, and every one of them then finds the group already built.
+    # It also moves the import cost off whichever request happened to be first.
+    _warm_pro_code_modules()
     _start_dormant_refresher()
     reader = threading.Thread(target=_stdin_reader, daemon=True, name="mcp-stdin-reader")
     reader.start()
