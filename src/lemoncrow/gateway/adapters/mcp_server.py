@@ -154,6 +154,11 @@ from lemoncrow.gateway.adapters.mcp.tools_commodity import (  # noqa: F401  (reg
     tool_web_fetch,
 )
 from lemoncrow.gateway.adapters.mcp_branding import icon_metadata
+from lemoncrow.infra.code_intel.freshness import (  # noqa: F401  (IndexRebuilding re-exported for handlers/tests)
+    FRESHNESS_REBUILT,
+    IndexRebuilding,
+    VersionedEngineCache,
+)
 from lemoncrow.infra.runtime.run_ledger import (
     RunLedger,
     outcomes_path,
@@ -8323,12 +8328,22 @@ def _memory_summary(session_id: str) -> dict[str, Any]:
 # for cold-start bootstrap-note injection without touching every return branch.
 _code_engine_for_current_call: threading.local = threading.local()
 
+# Freshness of the engine serving the current call ("fresh" | "rebuilt"), so a
+# response can say the index moved underneath it instead of silently differing
+# from the one before it.
+_code_index_freshness_for_current_call: threading.local = threading.local()
+
 # Process-level engine cache keyed by resolved repo path.
 # Reusing the same engine across tool calls avoids re-opening the SQLite DB
 # and restarting autosync threads on every invocation — critical for both
 # MCP server performance (persistent process) and benchmark correctness.
-_code_engine_cache: dict[str, Any] = {}
-_code_engine_cache_lock: threading.Lock = threading.Lock()
+#
+# The reuse is bounded by the index generation the engine was built against.
+# It used to be unbounded: a daemon built one engine at index_version 1 and was
+# still serving it at version 23, returning empty results for every query with
+# no error of any kind. VersionedEngineCache stamps each entry and rebuilds on a
+# bump, and raises IndexRebuilding mid-reindex rather than answering with [].
+_code_engine_cache = VersionedEngineCache("code_engine")
 _scoped_context_cache: dict[str, Any] = {}
 _scoped_context_cache_lock: threading.Lock = threading.Lock()
 
@@ -8344,19 +8359,27 @@ def _code_repo_root(repo_root: str | None) -> Path:
 
 
 def _code_context_engine(repo_root: str = ".") -> Any:
+    """The process-cached engine for *repo_root*, rebuilt when the index moves.
+
+    Raises :class:`IndexRebuilding` while the index is mid-write. That is the
+    point: during a reindex every query comes back with zero results, and an
+    empty result set is indistinguishable from a true negative, so a caller
+    acts on it with full confidence. An exception it can catch is strictly
+    better than a wrong answer delivered as a right one.
+    """
     from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
     workspace = str(_workspace_root())
     root = Path(repo_root)
     resolved = (root if root.is_absolute() else Path(workspace) / root).resolve()
     cache_key = str(resolved)
-    engine = _code_engine_cache.get(cache_key)
-    if engine is None:
-        with _code_engine_cache_lock:
-            engine = _code_engine_cache.get(cache_key)  # re-check under lock
-            if engine is None:
-                engine = CodeContextEngine(resolved)
-                _code_engine_cache[cache_key] = engine
+    engine, freshness = _code_engine_cache.get(cache_key, resolved, lambda: CodeContextEngine(resolved))
+    if freshness == FRESHNESS_REBUILT:
+        # ScopedContextCapability captures the engine it was constructed with,
+        # so leaving it cached would hand back the object just evicted.
+        with _scoped_context_cache_lock:
+            _scoped_context_cache.pop(cache_key, None)
+    _code_index_freshness_for_current_call.value = freshness
     return engine
 
 
@@ -8747,6 +8770,16 @@ def _finish_code_result(result: dict[str, Any]) -> dict[str, Any]:
                 )
         except Exception:
             logging.exception("Recovered from broad exception handler")
+    # Say so when this call's engine was rebuilt under a new index generation:
+    # results that differ from the previous call then have a stated cause
+    # instead of looking like nondeterminism.
+    if getattr(_code_index_freshness_for_current_call, "value", None) == FRESHNESS_REBUILT and isinstance(result, dict):
+        result["index_state"] = FRESHNESS_REBUILT
+        result.setdefault(
+            "hint",
+            "the code index was rebuilt since the previous call; results reflect the new generation",
+        )
+    _code_index_freshness_for_current_call.value = None
     return result
 
 
