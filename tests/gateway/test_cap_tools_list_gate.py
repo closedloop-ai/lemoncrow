@@ -160,6 +160,27 @@ def test_relations_is_advertised_under_every_profile(monkeypatch: pytest.MonkeyP
     assert "code_coverage_check" in advertised, "a negative result must stay auditable under both profiles"
 
 
+@pytest.mark.parametrize("profile", ["core", "full"])
+@pytest.mark.parametrize("name", ["code_changes", "code_query"])
+def test_the_review_surface_is_advertised_under_every_profile(
+    monkeypatch: pytest.MonkeyPatch, profile: str, name: str
+) -> None:
+    """Both were registered-but-hidden under `core`, reachable only via broker.
+
+    "they are in the full profile" was not an answer. The profile is read from
+    the *daemon's* environment, so a long-lived daemon started without
+    LEMONCROW_MCP_TOOL_PROFILE serves core to every client no matter what the
+    caller exports -- which is why both profiles looked identical from outside.
+
+    Nor is the broker an acceptable substitute here. Its purpose is calling
+    arbitrary registered tools by exact name, so routing a review agent through
+    it to analyse one diff widens a trust boundary to work around a visibility
+    list.
+    """
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", profile)
+    assert name in {tool["name"] for tool in _list()}
+
+
 def test_advertised_relations_is_not_also_broker_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
     """One route per tool: the broker exists for what tools/list does not show."""
     from lemoncrow.gateway.adapters import mcp_server

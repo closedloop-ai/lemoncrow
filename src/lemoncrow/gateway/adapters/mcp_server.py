@@ -289,6 +289,25 @@ _CORE_MCP_TOOLS = frozenset(
         # F3: turns "I searched and found nothing" from a claim into a checkable
         # fact. Cheap, and no other tool in the core set can audit a negative.
         "code_coverage_check",
+        # F2/F5. Both were reachable only through the broker under this profile,
+        # and the profile is not something a client can change: it is read from
+        # the *daemon's* environment, so a long-lived daemon started without
+        # LEMONCROW_MCP_TOOL_PROFILE serves core to everyone regardless of what
+        # the caller exports. "it's in full" was therefore not an answer.
+        #
+        # Leaving them out also had a cost beyond the extra hop. The broker's
+        # whole purpose is calling arbitrary registered tools by exact name, so
+        # "reach code_changes through the broker" means handing a review agent
+        # that capability to get one diff analysed -- widening a trust boundary
+        # to route around a visibility list.
+        #
+        # `code_changes` is diff -> impacted callers in a single call, which is
+        # an impact reviewer's entire job. `code_query` is the only surface that
+        # reports a pre-limit count with `truncated` on caller enumeration --
+        # `relations kind=callers` does not -- so it is the one route on which a
+        # completeness predicate can actually be evaluated.
+        "code_changes",
+        "code_query",
     }
 )
 
