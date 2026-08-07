@@ -109,12 +109,17 @@ class ImportResult:
     restored: tuple[str, ...]
     manifest: dict[str, Any]
     verified_against: str
+    #: Databases cleared from the workspace that the archive did not replace.
+    #: Reported rather than silently dropped: their absence changes what the
+    #: workspace can answer until the engine's next pass rebuilds them.
+    removed: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "archive": str(self.archive),
             "workspace": str(self.workspace),
             "restored": list(self.restored),
+            "removed": list(self.removed),
             "verified_against": self.verified_against,
             "manifest": self.manifest,
         }
@@ -484,8 +489,16 @@ def import_index(
             if name not in members:
                 raise PortableIndexError(f"{MANIFEST_NAME} lists {name!r} but the archive does not contain it")
             expected = str(meta.get("sha256", ""))
+            if not expected:
+                # The manifest travels inside the archive it vouches for, so a
+                # missing digest is not a gap in the check -- it IS the attack,
+                # and bit-rot looks identical. Export always writes one, so an
+                # absent digest is never a legitimate archive from this codebase.
+                raise PortableIndexError(
+                    f"{name} has no recorded digest in {MANIFEST_NAME}; refusing to import it unverified"
+                )
             actual = _sha256(staging / name)
-            if expected and actual != expected:
+            if actual != expected:
                 raise PortableIndexError(
                     f"{name} failed its digest check (expected {expected[:12]}, got {actual[:12]}); "
                     "the archive is corrupt or was modified"
@@ -509,13 +522,27 @@ def import_index(
 
         workspace.mkdir(parents=True, exist_ok=True)
         restored: list[str] = []
+        removed: list[str] = []
         for name in EXPORTABLE_DBS:
-            if name not in databases:
-                continue
             target = workspace / name
+            # Clear every database first, including ones the archive does not
+            # carry. A source that never built embeddings or never ran the
+            # call-graph pass exports without vectors.sqlite / intel.sqlite, and
+            # leaving the local copies behind pairs a fresh code_context.sqlite
+            # with sidecars keyed to a superseded generation's symbol ids --
+            # edges that mean something else, which is the exact failure the
+            # semantics check exists to prevent. It cannot catch this one: it
+            # reads only code_context.sqlite, and that file *is* replaced.
+            #
             # WAL/SHM siblings describe the file being replaced, not the new one.
             for sibling in (f"{name}-wal", f"{name}-shm"):
                 (workspace / sibling).unlink(missing_ok=True)
+            if name not in databases:
+                if target.exists():
+                    target.unlink()
+                    removed.append(name)
+                continue
+            target.unlink(missing_ok=True)
             shutil.move(str(staging / name), str(target))
             restored.append(name)
 
@@ -523,6 +550,7 @@ def import_index(
         archive=path,
         workspace=workspace,
         restored=tuple(restored),
+        removed=tuple(removed),
         manifest=manifest,
         verified_against=verified_against,
     )

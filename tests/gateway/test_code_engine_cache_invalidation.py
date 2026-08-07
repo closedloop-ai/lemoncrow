@@ -12,6 +12,7 @@ no rebuild churn on a stable index, and one rebuild under concurrency.
 from __future__ import annotations
 
 import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -88,10 +89,15 @@ def _bump(root: Path, version: int) -> None:
 
 
 def _tear(root: Path) -> None:
-    """Reproduce the drop/rebuild window: symbols gone, files still present."""
+    """Reproduce the drop/rebuild window: files gone, symbols still present.
+
+    This direction and not the other. Symbols with no files cannot be a resting
+    state -- every symbol row references a file row -- whereas files with no
+    symbols is exactly what a docs-only repo looks like.
+    """
     conn = sqlite3.connect(workspace_dir(root) / CODE_CONTEXT_DB)
     try:
-        conn.execute("DELETE FROM symbols")
+        conn.execute("DELETE FROM files")
         conn.commit()
     finally:
         conn.close()
@@ -134,28 +140,100 @@ def test_index_version_bump_rebuilds_the_engine(indexed_repo: Path) -> None:
     assert mcp_server._code_index_freshness_for_current_call.value == FRESHNESS_REBUILT
 
 
-def test_rebuild_evicts_the_scoped_context_capability(indexed_repo: Path) -> None:
-    """ScopedContextCapability captures its engine, so it goes stale in step."""
-    mcp_server._code_context_engine(str(indexed_repo))
-    cache_key = str(indexed_repo.resolve())
-    sentinel = object()
-    mcp_server._scoped_context_cache[cache_key] = sentinel
+class _FakeScoped:
+    """Stands in for the compiled ScopedContextCapability."""
 
-    _bump(indexed_repo, 2)
-    mcp_server._code_context_engine(str(indexed_repo))
-
-    assert cache_key not in mcp_server._scoped_context_cache
+    def __init__(self, engine: object) -> None:
+        self.engine = engine
 
 
-def test_scoped_capability_survives_a_stable_index(indexed_repo: Path) -> None:
-    mcp_server._code_context_engine(str(indexed_repo))
-    cache_key = str(indexed_repo.resolve())
-    sentinel = object()
-    mcp_server._scoped_context_cache[cache_key] = sentinel
+@pytest.fixture
+def fake_scoped(monkeypatch: pytest.MonkeyPatch) -> None:
+    import lemoncrow.pro.capabilities.scoped_context as scoped_context
 
-    mcp_server._code_context_engine(str(indexed_repo))
+    monkeypatch.setattr(scoped_context, "ScopedContextCapability", _FakeScoped)
 
-    assert mcp_server._scoped_context_cache[cache_key] is sentinel
+
+def test_scoped_capability_is_rebuilt_when_its_engine_is(
+    indexed_repo: Path,
+    fake_scoped: None,
+) -> None:
+    """The capability captures its engine, so it goes stale in step with it."""
+    first = mcp_server._scoped_context_capability(str(indexed_repo))
+    _bump(indexed_repo, 23)
+    second = mcp_server._scoped_context_capability(str(indexed_repo))
+
+    assert second is not first
+    assert second.engine is not first.engine
+
+
+def test_scoped_capability_survives_a_stable_index(
+    indexed_repo: Path,
+    fake_scoped: None,
+) -> None:
+    first = mcp_server._scoped_context_capability(str(indexed_repo))
+    assert mcp_server._scoped_context_capability(str(indexed_repo)) is first
+    assert _FakeEngine.instances == 1
+
+
+def test_scoped_capability_does_not_self_deadlock_on_a_rebuild(
+    indexed_repo: Path,
+    fake_scoped: None,
+) -> None:
+    """Regression: one thread, one non-reentrant lock, taken twice.
+
+    `_scoped_context_capability` held `_scoped_context_cache_lock` while it
+    built, and called `_code_context_engine` from inside that block. When the
+    engine cache evicted on a version bump it reached for the same lock on the
+    same thread -- a plain `threading.Lock`, no timeout -- and hung forever,
+    taking every later caller with it.
+
+    The original test for this exercised `_code_context_engine` directly and so
+    never entered the deadlocking path at all. This one drives the real entry
+    point, on a worker thread, and fails by timing out rather than by hanging
+    the suite.
+    """
+    mcp_server._scoped_context_capability(str(indexed_repo))
+    _bump(indexed_repo, 23)
+
+    done = threading.Event()
+    box: list[object] = []
+
+    def call() -> None:
+        box.append(mcp_server._scoped_context_capability(str(indexed_repo)))
+        done.set()
+
+    worker = threading.Thread(target=call, daemon=True)
+    worker.start()
+
+    assert done.wait(timeout=10), "_scoped_context_capability deadlocked on a rebuilt engine"
+    assert box and box[0] is not None
+
+
+def test_scoped_capability_never_holds_the_lock_across_the_engine_call(
+    indexed_repo: Path,
+    fake_scoped: None,
+) -> None:
+    """Pin the ordering rule, not just its absence of symptoms.
+
+    Resolving the engine while holding the scoped-cache lock is what made the
+    deadlock possible. Assert it directly so a future refactor that moves the
+    call back inside the lock fails here instead of in production.
+    """
+    held: list[bool] = []
+    original = mcp_server._code_context_engine
+
+    def probe(repo_root: str = ".") -> object:
+        held.append(mcp_server._scoped_context_cache_lock.locked())
+        return original(repo_root)
+
+    mcp_server._code_context_engine = probe  # type: ignore[assignment]
+    try:
+        mcp_server._scoped_context_capability(str(indexed_repo))
+    finally:
+        mcp_server._code_context_engine = original  # type: ignore[assignment]
+
+    assert held == [False], "the engine was resolved while the scoped-cache lock was held"
 
 
 def test_mid_rebuild_index_raises_instead_of_serving_empty(indexed_repo: Path) -> None:

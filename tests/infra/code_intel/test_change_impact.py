@@ -468,6 +468,55 @@ def test_depth_two_expands_through_the_caller_chain(
     assert deep.changed_symbols[0].callers == 1
 
 
+def test_a_site_reaching_two_changed_symbols_is_attributed_to_both(
+    workspace_root: Path,
+    make_workspace: WorkspaceFactory,
+) -> None:
+    """A global site dedupe let whichever symbol arrived first own the anchor.
+
+    ``alpha`` is processed before ``beta`` (pending is ordered by start_line).
+    At depth 2 ``alpha`` reaches ``c.py:1`` via ``beta``, and a location-only
+    dedupe then blocked ``beta`` -- whose *direct* caller that is -- from ever
+    recording it. The report showed a direct caller as a remote one and dropped
+    it from the symbol it actually calls.
+    """
+    _init_repo(workspace_root, {"a.py": _ALPHA})
+    edited = _ALPHA.replace("return 1", "return 2").replace("return alpha()", "return alpha() + 1")
+    (workspace_root / "a.py").write_text(edited, encoding="utf-8")
+
+    make_workspace(
+        files=[{"file_path": "a.py"}],
+        symbols=[
+            {"file_path": "a.py", "symbol_name": "alpha", "start_line": 1, "end_line": 2},
+            {"file_path": "a.py", "symbol_name": "beta", "start_line": 5, "end_line": 6},
+        ],
+        call_edges=[
+            {
+                "caller_symbol_name": "beta",
+                "caller_file_path": "b.py",
+                "caller_start_line": 1,
+                "caller_end_line": 2,
+                "callee_name": "alpha",
+                "call_line": 1,
+            },
+            {
+                "caller_symbol_name": "gamma",
+                "caller_file_path": "c.py",
+                "caller_start_line": 1,
+                "caller_end_line": 2,
+                "callee_name": "beta",
+                "call_line": 1,
+            },
+        ],
+    )
+
+    report = analyze_changes(repo_root=workspace_root, depth=2)
+    by_symbol = {(c.changed_symbol, c.file_path): c.depth for c in report.impacted}
+
+    assert by_symbol[("beta", "c.py")] == 1, "c.py directly calls beta and must be reported as depth 1"
+    assert by_symbol[("alpha", "c.py")] == 2, "c.py also reaches alpha, two hops out"
+
+
 def test_a_caller_cycle_terminates(
     workspace_root: Path,
     make_workspace: WorkspaceFactory,

@@ -27,7 +27,12 @@ from lemoncrow.infra.code_intel.portable import (
     import_index,
     read_manifest,
 )
-from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, CodeIntelStore, workspace_dir
+from lemoncrow.infra.code_intel.store import (
+    CODE_CONTEXT_DB,
+    INTEL_DB,
+    CodeIntelStore,
+    workspace_dir,
+)
 
 WorkspaceFactory = Callable[..., Path]
 
@@ -302,6 +307,30 @@ def test_manifest_listing_an_absent_database_is_refused(tmp_path: Path) -> None:
         import_index(archive=archive, repo_root=tmp_path / "clone")
 
 
+def test_manifest_without_a_digest_is_refused(tmp_path: Path) -> None:
+    """The manifest travels inside the archive it vouches for.
+
+    A missing digest is not a gap in the check, it IS the attack -- and bit-rot
+    looks identical. Export always writes one, so an absent digest is never a
+    legitimate archive from this codebase.
+    """
+    for meta in ({"bytes": 32}, {"sha256": ""}):
+        manifest = json.dumps(
+            {
+                "format_version": ARCHIVE_FORMAT_VERSION,
+                "indexer_semantics_version": 2,
+                "databases": {CODE_CONTEXT_DB: meta},
+            }
+        ).encode()
+        archive = _archive_with(
+            tmp_path,
+            {MANIFEST_NAME: manifest, CODE_CONTEXT_DB: b"\x00" * 32},
+            name=f"nodigest{len(str(meta))}.tar.xz",
+        )
+        with pytest.raises(PortableIndexError, match="no recorded digest"):
+            import_index(archive=archive, repo_root=tmp_path / "clone")
+
+
 def test_tampered_database_fails_its_digest(tmp_path: Path) -> None:
     payload = b"\x00" * 32
     manifest = json.dumps(
@@ -346,6 +375,46 @@ def test_symlink_members_are_refused(tmp_path: Path) -> None:
 
     with pytest.raises(PortableIndexError, match="not a regular file"):
         import_index(archive=archive, repo_root=tmp_path / "clone")
+
+
+def test_force_import_clears_databases_the_archive_does_not_carry(
+    make_workspace: WorkspaceFactory,
+    tmp_path: Path,
+) -> None:
+    """A surviving sidecar is keyed to the generation it was built against.
+
+    A source that never ran the call-graph pass exports without intel.sqlite.
+    Leaving the local copy behind pairs a fresh code_context.sqlite with call
+    edges pointing at another index's symbol ids -- edges that mean something
+    else, which is the failure the semantics check exists to prevent and cannot
+    catch here, because it reads only code_context.sqlite and that file IS
+    replaced.
+    """
+    source = make_workspace(
+        files=_FILES,
+        symbols=_SYMBOLS,
+        indexer_semantics_version=2,
+        with_intel=False,
+        name="nointel",
+    )
+    archive = export_index(repo_root=source, out=tmp_path / "nointel.tar.xz").path
+    assert INTEL_DB not in read_manifest(archive)["databases"]
+
+    target = make_workspace(
+        files=_FILES,
+        symbols=_SYMBOLS,
+        call_edges=_EDGES,
+        indexer_semantics_version=2,
+        name="target",
+    )
+    stale = workspace_dir(target) / INTEL_DB
+    assert stale.exists()
+
+    result = import_index(archive=archive, repo_root=target, force=True)
+
+    assert not stale.exists(), "a superseded sidecar survived the import"
+    assert INTEL_DB in result.removed
+    assert CODE_CONTEXT_DB in result.restored
 
 
 def test_a_refused_import_leaves_the_target_untouched(

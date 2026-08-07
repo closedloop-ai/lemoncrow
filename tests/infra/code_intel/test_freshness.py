@@ -87,12 +87,34 @@ def test_empty_index_is_absent_not_ready(make_workspace: WorkspaceFactory) -> No
     assert state.index_version == 4
 
 
-def test_partially_populated_index_reads_as_rebuilding(make_workspace: WorkspaceFactory) -> None:
-    """Files but no symbols is a torn view -- the drop/rebuild window."""
-    root = make_workspace(files=_FILES, index_version=9)
+def test_symbols_without_files_reads_as_rebuilding(make_workspace: WorkspaceFactory) -> None:
+    """A torn view: every symbol row references a file row, so this cannot rest."""
+    root = make_workspace(symbols=_SYMBOLS, index_version=9)
     state = index_state(root)
     assert state.status == STATUS_REBUILDING
     assert "partially populated" in state.detail
+
+
+def test_files_without_symbols_is_a_resting_state_not_a_rebuild(
+    make_workspace: WorkspaceFactory,
+) -> None:
+    """A docs-only repo indexes files and extracts nothing. That is not a fault.
+
+    The check used to be symmetric, which made this permanent: nothing about a
+    symbol-less index ever changes, so every code tool would raise
+    ``IndexRebuilding`` forever on a workspace that is merely empty of symbols.
+    Same wrong answer as the silent-empty bug, delivered louder. A workspace
+    without the optional tree-sitter ``parsers`` extra lands here too.
+    """
+    root = make_workspace(files=_FILES, index_version=9)
+    state = index_state(root)
+    assert state.status == STATUS_READY
+    assert state.rebuilding is False
+
+    cache = VersionedEngineCache("test", recheck_seconds=0.0)
+    value, freshness = cache.get("k", root, object)
+    assert value is not None, "a symbol-less index must still serve"
+    assert freshness == FRESHNESS_FRESH
 
 
 def test_missing_table_reads_as_rebuilding(make_workspace: WorkspaceFactory) -> None:
@@ -252,7 +274,7 @@ def test_rebuilding_index_raises_instead_of_serving(make_workspace: WorkspaceFac
 
 
 def test_rebuilding_index_raises_even_on_a_cold_cache(make_workspace: WorkspaceFactory) -> None:
-    root = make_workspace(files=_FILES, index_version=1)  # torn: files, no symbols
+    root = make_workspace(symbols=_SYMBOLS, index_version=1)  # torn: symbols, no files
     cache = VersionedEngineCache("test", recheck_seconds=0.0)
     with pytest.raises(IndexRebuilding):
         cache.get("k", root, object)

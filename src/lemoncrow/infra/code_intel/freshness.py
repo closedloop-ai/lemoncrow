@@ -187,10 +187,19 @@ def index_state(repo_root: Path | str = ".") -> IndexState:
 
     1. the database file is missing -> ``absent``
     2. a required table is missing -> ``rebuilding`` (caught mid-DDL)
-    3. ``files`` and ``symbols`` disagree about being empty -> ``rebuilding``
-       (a torn index; a genuinely empty one has neither)
+    3. symbols without files -> ``rebuilding`` (a torn index)
     4. the index-write lock is held -> ``rebuilding``
     5. no rows at all -> ``absent``; otherwise ``ready``
+
+    Check 3 is deliberately one-directional. Symbols with no files cannot be a
+    resting state -- every symbol row references a file row. Files with no
+    symbols very much can: a docs-or-config-only repository, or any workspace
+    where the optional tree-sitter ``parsers`` extra is absent, indexes files
+    and extracts nothing. Treating that as a rebuild made it permanent, because
+    nothing about it ever changes: every code tool would raise
+    :class:`IndexRebuilding` forever on a workspace that is merely empty of
+    symbols. That is a worse failure than the silent-empty one this module
+    exists to remove -- it is the same wrong answer, delivered louder.
     """
     db = workspace_dir(repo_root) / CODE_CONTEXT_DB
     lock = _probe_lock(Path(str(db) + INDEX_LOCK_SUFFIX))
@@ -210,7 +219,7 @@ def index_state(repo_root: Path | str = ".") -> IndexState:
         counts = conn.execute("SELECT (SELECT COUNT(*) FROM files), (SELECT COUNT(*) FROM symbols)").fetchone()
         files = int(counts[0])
         symbols = int(counts[1])
-        if bool(files) != bool(symbols):
+        if symbols and not files:
             return IndexState(
                 version,
                 STATUS_REBUILDING,

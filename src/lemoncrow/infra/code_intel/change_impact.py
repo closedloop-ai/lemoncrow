@@ -466,6 +466,10 @@ def analyze_changes(
     *limit* bounds the returned caller list only. ``impacted_total`` reports
     what was found before truncation, so a clipped list is never mistaken for a
     complete one.
+
+    A site that reaches two changed symbols is reported once per symbol. That is
+    not double counting: "who calls what" has two answers there, and collapsing
+    them would silently drop one.
     """
     root = Path(repo_root).resolve()
     depth = max(1, int(depth))
@@ -487,8 +491,13 @@ def analyze_changes(
         # Walk the name-keyed graph outwards, one hop at a time. `visited`
         # holds names already expanded so a cycle terminates; `sites` dedupes
         # by location so the same call reached two ways is reported once.
+        # Keyed by the changed symbol as well as the location: one site can be a
+        # direct caller of one changed symbol and a two-hop caller of another,
+        # and a global key would let whichever symbol arrived first fix `depth`
+        # and `changed_symbol` for both -- reporting a direct caller as remote
+        # and dropping it from the symbol it actually calls.
         impacted: list[ImpactedCaller] = []
-        sites: set[tuple[str, int]] = set()
+        sites: set[tuple[str, str, int]] = set()
         caller_counts: dict[str, int] = {}
         test_caller_counts: dict[str, int] = {}
 
@@ -511,7 +520,7 @@ def analyze_changes(
                             direct += 1
                             if is_test:
                                 direct_tests += 1
-                        site = (path, line)
+                        site = (row.qualified_name, path, line)
                         if site not in sites:
                             sites.add(site)
                             impacted.append(

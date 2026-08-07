@@ -8374,7 +8374,17 @@ _code_index_freshness_for_current_call: threading.local = threading.local()
 # no error of any kind. VersionedEngineCache stamps each entry and rebuilds on a
 # bump, and raises IndexRebuilding mid-reindex rather than answering with [].
 _code_engine_cache = VersionedEngineCache("code_engine")
-_scoped_context_cache: dict[str, Any] = {}
+
+# ``cache_key -> (capability, engine_it_was_built_from)``.
+#
+# The engine is carried alongside so staleness is decided by identity on read
+# rather than by an eviction pushed from the engine path. Eviction was the first
+# shape and it self-deadlocked: `_scoped_context_capability` holds this lock
+# while it builds, calls `_code_context_engine` under it, and that in turn tried
+# to take the same non-reentrant lock whenever the index had moved -- one thread,
+# same lock, no timeout, hung forever. Validating on read needs no second
+# acquisition and cannot miss an eviction either.
+_scoped_context_cache: dict[str, tuple[Any, Any]] = {}
 _scoped_context_cache_lock: threading.Lock = threading.Lock()
 
 
@@ -8404,30 +8414,40 @@ def _code_context_engine(repo_root: str = ".") -> Any:
     resolved = (root if root.is_absolute() else Path(workspace) / root).resolve()
     cache_key = str(resolved)
     engine, freshness = _code_engine_cache.get(cache_key, resolved, lambda: CodeContextEngine(resolved))
-    if freshness == FRESHNESS_REBUILT:
-        # ScopedContextCapability captures the engine it was constructed with,
-        # so leaving it cached would hand back the object just evicted.
-        with _scoped_context_cache_lock:
-            _scoped_context_cache.pop(cache_key, None)
     _code_index_freshness_for_current_call.value = freshness
     return engine
 
 
 def _scoped_context_capability(repo_root: str = ".") -> Any:
+    """Process-cached ScopedContextCapability, rebuilt when its engine changes.
+
+    ``ScopedContextCapability`` captures the engine it was constructed with, so a
+    cached one outlives the generation it was built against exactly the way the
+    engine cache used to. Freshness is decided by comparing the stored engine to
+    the current one by identity -- the engine cache has already done the version
+    check by the time this runs.
+
+    ``_code_context_engine`` is called *outside* the lock deliberately. Calling
+    it under the lock is what allowed a self-deadlock when the engine path also
+    reached for the same non-reentrant lock.
+    """
     from lemoncrow.pro.capabilities.scoped_context import ScopedContextCapability
 
     workspace = str(_workspace_root())
     root = Path(repo_root)
     resolved = (root if root.is_absolute() else Path(workspace) / root).resolve()
     cache_key = str(resolved)
-    capability = _scoped_context_cache.get(cache_key)
-    if capability is None:
-        with _scoped_context_cache_lock:
-            capability = _scoped_context_cache.get(cache_key)
-            if capability is None:
-                capability = ScopedContextCapability(_code_context_engine(str(resolved)))
-                _scoped_context_cache[cache_key] = capability
-    return capability
+    engine = _code_context_engine(str(resolved))
+    entry = _scoped_context_cache.get(cache_key)
+    if entry is not None and entry[1] is engine:
+        return entry[0]
+    with _scoped_context_cache_lock:
+        entry = _scoped_context_cache.get(cache_key)
+        if entry is not None and entry[1] is engine:
+            return entry[0]
+        capability = ScopedContextCapability(engine)
+        _scoped_context_cache[cache_key] = (capability, engine)
+        return capability
 
 
 def _workspace_code_router(repo_root: str = ".") -> Any:

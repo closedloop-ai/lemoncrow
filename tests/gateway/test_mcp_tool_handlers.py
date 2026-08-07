@@ -656,7 +656,13 @@ def test_context_pull_reuses_cached_scoped_context(monkeypatch: pytest.MonkeyPat
             return [record for record in records if record.file_path == file_glob]
 
     mcp_server._reset_runtime_cache_for_testing()
-    monkeypatch.setattr(mcp_server, "_code_context_engine", lambda repo_root=".": _FakePullEngine())
+    # One instance, returned every call -- the real `_code_context_engine` is a
+    # memoizing cache and hands back the same object until the index generation
+    # moves. A stub that minted a fresh engine per call modelled a permanently
+    # rebuilding index, and the scoped-context cache now (correctly) rebuilds
+    # its capability whenever its engine changes identity.
+    pull_engine = _FakePullEngine()
+    monkeypatch.setattr(mcp_server, "_code_context_engine", lambda repo_root=".": pull_engine)
 
     first = mcp_server.tool_get_context(
         {"task": "fix auth flow", "mode": "pull", "files": ["src/auth.py"], "token_budget": 400}
