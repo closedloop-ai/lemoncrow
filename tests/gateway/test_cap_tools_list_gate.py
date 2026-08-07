@@ -121,14 +121,19 @@ def _stub_handler(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     monkeypatch.setitem(mcp_server.TOOLS, name, spec)
 
 
-@pytest.mark.parametrize("name", ["relations", "graph"])
+@pytest.mark.parametrize("name", ["graph", "blame"])
 def test_broker_calls_tools_that_are_hidden_under_the_core_profile(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
-    """Regression: `relations` is in BOTH _CORE_MCP_TOOLS and HIDDEN_LLM_TOOLS.
+    """A tool hidden from tools/list must still be reachable through the broker.
 
-    The old guard refused it as "already exposed" because it is in the core
-    profile, while HIDDEN_LLM_TOOLS meant nothing ever advertised it -- so it
-    was unreachable by every route. That left `statusline_segment` as the only
-    tool the broker could reach.
+    The old guard refused a tool as "already exposed" whenever it sat in
+    _CORE_MCP_TOOLS, even when HIDDEN_LLM_TOOLS meant nothing ever advertised
+    it -- so it was unreachable by every route, leaving `statusline_segment` as
+    the only tool the broker could reach.
+
+    `relations` used to be the headline case here. It is now advertised outright
+    (see ``_FORCE_VISIBLE_TOOLS``), so it has moved to
+    :func:`test_relations_is_advertised_under_every_profile` and the guard is
+    pinned with tools that are still hidden.
     """
     monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
     assert name not in {tool["name"] for tool in _list()}
@@ -138,6 +143,50 @@ def test_broker_calls_tools_that_are_hidden_under_the_core_profile(monkeypatch: 
         "called": name,
         "args": {"op": "callers"},
     }
+
+
+@pytest.mark.parametrize("profile", ["core", "full"])
+def test_relations_is_advertised_under_every_profile(monkeypatch: pytest.MonkeyPatch, profile: str) -> None:
+    """The only enumerative symbol tool has to be visible to be routed to.
+
+    Hidden, an agent sees one code-intel tool under the core profile --
+    `code_search`, which ranks -- and reads its top-N as the complete caller
+    set. `code_changes` does not substitute: a builder about to edit a symbol
+    has a symbol, not a diff.
+    """
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", profile)
+    advertised = {tool["name"] for tool in _list()}
+    assert "relations" in advertised
+    assert "code_coverage_check" in advertised, "a negative result must stay auditable under both profiles"
+
+
+@pytest.mark.parametrize("profile", ["core", "full"])
+@pytest.mark.parametrize("name", ["code_changes", "code_query"])
+def test_the_review_surface_is_advertised_under_every_profile(
+    monkeypatch: pytest.MonkeyPatch, profile: str, name: str
+) -> None:
+    """Both were registered-but-hidden under `core`, reachable only via broker.
+
+    "they are in the full profile" was not an answer. The profile is read from
+    the *daemon's* environment, so a long-lived daemon started without
+    LEMONCROW_MCP_TOOL_PROFILE serves core to every client no matter what the
+    caller exports -- which is why both profiles looked identical from outside.
+
+    Nor is the broker an acceptable substitute here. Its purpose is calling
+    arbitrary registered tools by exact name, so routing a review agent through
+    it to analyse one diff widens a trust boundary to work around a visibility
+    list.
+    """
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", profile)
+    assert name in {tool["name"] for tool in _list()}
+
+
+def test_advertised_relations_is_not_also_broker_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One route per tool: the broker exists for what tools/list does not show."""
+    from lemoncrow.gateway.adapters import mcp_server
+
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    assert not mcp_server._broker_reachable("relations", mcp_server.TOOLS["relations"])
 
 
 def test_broker_search_returns_hidden_tools(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -155,13 +204,35 @@ def test_broker_search_never_returns_an_advertised_tool(monkeypatch: pytest.Monk
     assert not (found & advertised)
 
 
-def test_broker_refuses_an_already_advertised_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    from lemoncrow.gateway.adapters import mcp_server
+def test_broker_runs_an_already_advertised_tool_and_points_at_the_direct_route(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The broker must not dead-end a caller whose tool list predates the tool.
 
+    This used to raise "already exposed; call it directly" -- advice the caller
+    could not act on. A host captures tools/list once at connect time, so a tool
+    added since (``relations``, as it happens) is advertised by the server and
+    absent from a live session's list; refusing left it reachable by no route,
+    and the reviewer that hit this had to hand-drive raw JSON-RPC.
+    """
     monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
     assert "read" in {tool["name"] for tool in _list()}
-    with pytest.raises(mcp_server._ToolArgumentError, match="already exposed"):
-        _broker({"action": "call", "name": "read", "arguments": {}})
+    _stub_handler(monkeypatch, "read")
+
+    result = _broker({"action": "call", "name": "read", "arguments": {"files": ["x.py"]}})
+
+    assert result["called"] == "read"
+    assert result["args"] == {"files": ["x.py"]}
+    assert "reconnect" in result["broker_note"]
+
+
+def test_broker_note_is_absent_when_the_tool_is_genuinely_hidden(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The note is a nudge toward a route that exists -- not boilerplate."""
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    assert "blame" not in {tool["name"] for tool in _list()}
+    _stub_handler(monkeypatch, "blame")
+
+    assert "broker_note" not in _broker({"action": "call", "name": "blame", "arguments": {}})
 
 
 @pytest.mark.parametrize("name", sorted({"agent", "codemod", "mcp", "sql", "tool", "workflow"}))

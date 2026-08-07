@@ -992,7 +992,12 @@ def test_tool_code_deleted_search_stays_on_additive_code_surface(
         budget_tokens=220,
     )
 
-    assert sorted(payload.keys()) == ["items"]
+    # Still a lock, one key wider. `objective` is the completeness contract:
+    # every retrieval response says whether it ranked or enumerated, and a
+    # graveyard search is ranked like any other. Anything BEYOND these two is
+    # payload growth on the model-facing surface and should still fail here.
+    assert sorted(payload.keys()) == ["items", "objective"]
+    assert payload["objective"] == "ranked"
     assert payload["items"][0]["deleted_at_sha"] == "abc123"
     assert payload["items"][0]["rename_target"] == "modern.py"
     fake_engine.tool_search.assert_called_once_with(

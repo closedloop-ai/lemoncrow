@@ -38,6 +38,12 @@ def _preindex(repo_root: str | Path) -> None:
 EXPECTED_TOOLS = {
     # F3 -- see tests/gateway/test_mcp_tool_handlers.py for why it is advertised.
     "code_coverage_check",
+    # F2 -- diff -> changed symbols -> impacted callers.
+    "code_changes",
+    # F5 -- whitelisted predicate queries over the index.
+    "code_query",
+    # The one enumerative symbol tool -- advertised so an agent can route to it.
+    "relations",
     "read",
     "edit",
     "code_search",

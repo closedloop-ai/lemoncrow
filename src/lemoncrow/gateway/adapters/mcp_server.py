@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
 import json
 import logging
 import os
@@ -154,6 +155,12 @@ from lemoncrow.gateway.adapters.mcp.tools_commodity import (  # noqa: F401  (reg
     tool_web_fetch,
 )
 from lemoncrow.gateway.adapters.mcp_branding import icon_metadata
+from lemoncrow.infra.code_intel.completeness import CODE_OP_MATCH_KINDS, CODE_OP_OBJECTIVES, OBJECTIVE_RANKED
+from lemoncrow.infra.code_intel.freshness import (  # noqa: F401  (IndexRebuilding re-exported for handlers/tests)
+    FRESHNESS_REBUILT,
+    IndexRebuilding,
+    VersionedEngineCache,
+)
 from lemoncrow.infra.runtime.run_ledger import (
     RunLedger,
     outcomes_path,
@@ -279,8 +286,46 @@ _CORE_MCP_TOOLS = frozenset(
         "tool",
         "verify",
         "web_fetch",
+        # F3: turns "I searched and found nothing" from a claim into a checkable
+        # fact. Cheap, and no other tool in the core set can audit a negative.
+        "code_coverage_check",
+        # F2/F5. Both were reachable only through the broker under this profile,
+        # and the profile is not something a client can change: it is read from
+        # the *daemon's* environment, so a long-lived daemon started without
+        # LEMONCROW_MCP_TOOL_PROFILE serves core to everyone regardless of what
+        # the caller exports. "it's in full" was therefore not an answer.
+        #
+        # Leaving them out also had a cost beyond the extra hop. The broker's
+        # whole purpose is calling arbitrary registered tools by exact name, so
+        # "reach code_changes through the broker" means handing a review agent
+        # that capability to get one diff analysed -- widening a trust boundary
+        # to route around a visibility list.
+        #
+        # `code_changes` is diff -> impacted callers in a single call, which is
+        # an impact reviewer's entire job. `code_query` is the only surface that
+        # reports a pre-limit count with `truncated` on caller enumeration --
+        # `relations kind=callers` does not -- so it is the one route on which a
+        # completeness predicate can actually be evaluated.
+        "code_changes",
+        "code_query",
     }
 )
+
+# Tools the shadowed ``core/environment.py`` hides that we advertise anyway.
+#
+# `relations` is the only *enumerative* symbol tool. Hidden, an agent under the
+# core profile sees exactly one code-intel tool -- `code_search` -- which ranks;
+# it then reads a ranked top-N as the complete caller set and is wrong. Measured
+# in production: `merge_telemetry` has seven call sites, `code_search` returned
+# the one that mattered most, and the review built on it was incomplete.
+#
+# `code_changes` does not close this gap. A builder about to edit a symbol has a
+# symbol, not a diff -- it would have to make the edit first and then ask what
+# broke, which is backwards.
+#
+# HIDDEN_LLM_TOOLS lives in a module that resolves from a compiled `.so` when an
+# engine is vendored, so the override belongs here, in live source.
+_FORCE_VISIBLE_TOOLS: frozenset[str] = frozenset({"relations"})
 
 # --------------------------------------------------------------------------- #
 # Tool Registry Decorator                                                     #
@@ -308,6 +353,8 @@ def _tool_description(spec: dict[str, Any]) -> str:
 
 
 def _tool_visible_to_llm(tool_name: str, spec: dict[str, Any]) -> bool:
+    if tool_name in _FORCE_VISIBLE_TOOLS:
+        return True
     return mcp_tool_visible_to_llm(tool_name)
 
 
@@ -328,14 +375,22 @@ def _tool_advertised_now(tool_name: str, spec: dict[str, Any]) -> bool:
 
     The single predicate behind both the tools/list build and the broker's
     "already exposed" guard. Membership in ``_CORE_MCP_TOOLS`` is NOT the same
-    question: `relations` and `grep` are in both ``_CORE_MCP_TOOLS`` and
-    ``HIDDEN_LLM_TOOLS``, so they are never advertised under any profile.
+    question: `grep` is in ``_CORE_MCP_TOOLS`` and in ``HIDDEN_LLM_TOOLS``, so
+    it is never advertised under any profile. `relations` was in exactly that
+    position until ``_FORCE_VISIBLE_TOOLS`` lifted it -- see the note there for
+    why an enumerative symbol tool has to be visible.
     """
     return _tool_profile_exposes(tool_name) and _tool_visible_to_llm(tool_name, spec)
 
 
 def _tool_mode(spec: dict[str, Any]) -> str:
-    return mcp_tool_mode(str(spec.get("name", "") or ""))
+    name = str(spec.get("name", "") or "")
+    if name in _FORCE_VISIBLE_TOOLS:
+        # Visibility and mode are two views of one fact. Overriding only the
+        # first would let /mcp/status report a tool as advertised *and* hidden,
+        # which is not a state anything downstream knows how to read.
+        return "active"
+    return mcp_tool_mode(name)
 
 
 # _COERCE_UNCHANGED, the argument-coercion helpers, _ToolArgumentError and the
@@ -8323,13 +8378,33 @@ def _memory_summary(session_id: str) -> dict[str, Any]:
 # for cold-start bootstrap-note injection without touching every return branch.
 _code_engine_for_current_call: threading.local = threading.local()
 
+# Freshness of the engine serving the current call ("fresh" | "rebuilt"), so a
+# response can say the index moved underneath it instead of silently differing
+# from the one before it.
+_code_index_freshness_for_current_call: threading.local = threading.local()
+
 # Process-level engine cache keyed by resolved repo path.
 # Reusing the same engine across tool calls avoids re-opening the SQLite DB
 # and restarting autosync threads on every invocation — critical for both
 # MCP server performance (persistent process) and benchmark correctness.
-_code_engine_cache: dict[str, Any] = {}
-_code_engine_cache_lock: threading.Lock = threading.Lock()
-_scoped_context_cache: dict[str, Any] = {}
+#
+# The reuse is bounded by the index generation the engine was built against.
+# It used to be unbounded: a daemon built one engine at index_version 1 and was
+# still serving it at version 23, returning empty results for every query with
+# no error of any kind. VersionedEngineCache stamps each entry and rebuilds on a
+# bump, and raises IndexRebuilding mid-reindex rather than answering with [].
+_code_engine_cache = VersionedEngineCache("code_engine")
+
+# ``cache_key -> (capability, engine_it_was_built_from)``.
+#
+# The engine is carried alongside so staleness is decided by identity on read
+# rather than by an eviction pushed from the engine path. Eviction was the first
+# shape and it self-deadlocked: `_scoped_context_capability` holds this lock
+# while it builds, calls `_code_context_engine` under it, and that in turn tried
+# to take the same non-reentrant lock whenever the index had moved -- one thread,
+# same lock, no timeout, hung forever. Validating on read needs no second
+# acquisition and cannot miss an eviction either.
+_scoped_context_cache: dict[str, tuple[Any, Any]] = {}
 _scoped_context_cache_lock: threading.Lock = threading.Lock()
 
 
@@ -8343,41 +8418,113 @@ def _code_repo_root(repo_root: str | None) -> Path:
     return (root if root.is_absolute() else _workspace_root() / root).resolve()
 
 
+# Every lazy `from lemoncrow.pro...` on the code path lands in one mypyc group
+# whose modules initialise one another. Two threads entering that group at
+# different points can each observe the other's half-built module and fail with
+# `AttributeError: module 'X' has no attribute 'Y'` -- a hard error on the first
+# cold call, from an import that then succeeds forever, which is why it reads as
+# a phantom. Two barrier-synchronised imports of `code_context` and
+# `scoped_context` in a fresh interpreter reproduce it 40 times out of 40.
+#
+# The daemon builds exactly that shape on its own: `_warm_stdio_code_index`
+# constructs the engine on a background thread while the first request is being
+# served on another, so the collision needs no unlucky client at all -- only a
+# request that arrives during startup.
+#
+# So the group is initialised once, by whichever thread gets there first, with
+# everyone else waiting on the lock. The fast path is a bool read and the warm
+# is idempotent, so steady-state cost is nil.
+_PRO_CODE_PATH_MODULES: tuple[str, ...] = (
+    "lemoncrow.pro.capabilities.code_context",
+    "lemoncrow.pro.capabilities.code_context.renderer",
+    "lemoncrow.pro.capabilities.code_context.workspace_router",
+    "lemoncrow.pro.capabilities.scoped_context",
+    "lemoncrow.pro.capabilities.lesson_promotion",
+    "lemoncrow.pro.capabilities.tool_supervision.tool_output_spill",
+)
+_pro_import_lock: threading.RLock = threading.RLock()
+_pro_modules_warmed = False
+
+
+def _warm_pro_code_modules() -> None:
+    """Initialise the pro code-path modules once, on a single thread.
+
+    Re-entrant on purpose: these helpers call one another, and a plain lock
+    would deadlock the first thread against itself.
+    """
+    global _pro_modules_warmed
+    if _pro_modules_warmed:
+        return
+    with _pro_import_lock:
+        if _pro_modules_warmed:
+            return
+        for name in _PRO_CODE_PATH_MODULES:
+            try:
+                importlib.import_module(name)
+            except Exception:
+                # Reporting a genuinely broken import is not this function's
+                # job -- the caller's own import raises it with the right
+                # context a moment later. Swallowing costs only the warm.
+                _log.debug("pro warm: %s did not import", name, exc_info=True)
+        _pro_modules_warmed = True
+
+
 def _code_context_engine(repo_root: str = ".") -> Any:
+    """The process-cached engine for *repo_root*, rebuilt when the index moves.
+
+    Raises :class:`IndexRebuilding` while the index is mid-write. That is the
+    point: during a reindex every query comes back with zero results, and an
+    empty result set is indistinguishable from a true negative, so a caller
+    acts on it with full confidence. An exception it can catch is strictly
+    better than a wrong answer delivered as a right one.
+    """
+    _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
     workspace = str(_workspace_root())
     root = Path(repo_root)
     resolved = (root if root.is_absolute() else Path(workspace) / root).resolve()
     cache_key = str(resolved)
-    engine = _code_engine_cache.get(cache_key)
-    if engine is None:
-        with _code_engine_cache_lock:
-            engine = _code_engine_cache.get(cache_key)  # re-check under lock
-            if engine is None:
-                engine = CodeContextEngine(resolved)
-                _code_engine_cache[cache_key] = engine
+    engine, freshness = _code_engine_cache.get(cache_key, resolved, lambda: CodeContextEngine(resolved))
+    _code_index_freshness_for_current_call.value = freshness
     return engine
 
 
 def _scoped_context_capability(repo_root: str = ".") -> Any:
+    """Process-cached ScopedContextCapability, rebuilt when its engine changes.
+
+    ``ScopedContextCapability`` captures the engine it was constructed with, so a
+    cached one outlives the generation it was built against exactly the way the
+    engine cache used to. Freshness is decided by comparing the stored engine to
+    the current one by identity -- the engine cache has already done the version
+    check by the time this runs.
+
+    ``_code_context_engine`` is called *outside* the lock deliberately. Calling
+    it under the lock is what allowed a self-deadlock when the engine path also
+    reached for the same non-reentrant lock.
+    """
+    _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.scoped_context import ScopedContextCapability
 
     workspace = str(_workspace_root())
     root = Path(repo_root)
     resolved = (root if root.is_absolute() else Path(workspace) / root).resolve()
     cache_key = str(resolved)
-    capability = _scoped_context_cache.get(cache_key)
-    if capability is None:
-        with _scoped_context_cache_lock:
-            capability = _scoped_context_cache.get(cache_key)
-            if capability is None:
-                capability = ScopedContextCapability(_code_context_engine(str(resolved)))
-                _scoped_context_cache[cache_key] = capability
-    return capability
+    engine = _code_context_engine(str(resolved))
+    entry = _scoped_context_cache.get(cache_key)
+    if entry is not None and entry[1] is engine:
+        return entry[0]
+    with _scoped_context_cache_lock:
+        entry = _scoped_context_cache.get(cache_key)
+        if entry is not None and entry[1] is engine:
+            return entry[0]
+        capability = ScopedContextCapability(engine)
+        _scoped_context_cache[cache_key] = (capability, engine)
+        return capability
 
 
 def _workspace_code_router(repo_root: str = ".") -> Any:
+    _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.code_context.workspace_router import WorkspaceCodeRouter
 
     workspace = str(_workspace_root())
@@ -8501,6 +8648,7 @@ def _strip_code_op_response(op: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 def _maybe_attach_code_rendered(op: str, payload: dict[str, Any], *, render_compact: bool) -> dict[str, Any]:
     # Render first so the markdown uses all original fields (e.g. repo_id for cache_status heading).
+    _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.code_context.renderer import render_code_payload
 
     rendered = render_code_payload(op, payload)
@@ -8525,6 +8673,23 @@ def _maybe_attach_code_rendered(op: str, payload: dict[str, Any], *, render_comp
                 "Repository not yet indexed — results may be incomplete. "
                 "Run `lc code index` (or `lc project init`) to bootstrap the index."
             )
+
+    # Say whether this op ranked or enumerated. Without it a consumer has to
+    # infer completeness from the tool name it happened to call, and a ranked
+    # top-N read as a complete set is how a confident wrong finding gets filed.
+    objective = CODE_OP_OBJECTIVES.get(op)
+    if objective is not None:
+        result.setdefault("objective", objective)
+
+    # ...and say how the edges were matched. Exhaustive is necessary, not
+    # sufficient: both edge stores are name-keyed, so a complete enumeration of
+    # a method called `open` is every `open()` in the repo. Those rows are real
+    # lines, so replaying them through grep confirms rather than catches them.
+    # A consumer that shows callsites to a human needs to know that before it
+    # decides whether to trust the set or validate it.
+    match_kind = CODE_OP_MATCH_KINDS.get(op)
+    if match_kind is not None:
+        result.setdefault("match_kind", match_kind)
 
     return result
 
@@ -8747,6 +8912,16 @@ def _finish_code_result(result: dict[str, Any]) -> dict[str, Any]:
                 )
         except Exception:
             logging.exception("Recovered from broad exception handler")
+    # Say so when this call's engine was rebuilt under a new index generation:
+    # results that differ from the previous call then have a stated cause
+    # instead of looking like nondeterminism.
+    if getattr(_code_index_freshness_for_current_call, "value", None) == FRESHNESS_REBUILT and isinstance(result, dict):
+        result["index_state"] = FRESHNESS_REBUILT
+        result.setdefault(
+            "hint",
+            "the code index was rebuilt since the previous call; results reflect the new generation",
+        )
+    _code_index_freshness_for_current_call.value = None
     return result
 
 
@@ -8838,6 +9013,9 @@ def _op_graph(
         engine = _code_engine_at(repo_root)
         result = cast(dict[str, Any], engine.call_graph_centrality(limit=limit))
         result["kind"] = "centrality"
+        # Top-N by score: the ordering is the answer, so this is not the
+        # complete set of central symbols and must not read as one.
+        result.setdefault("objective", OBJECTIVE_RANKED)
         if synthesize and paths:
             result["synthesized_edges"] = _synthesize_edges_for_paths(paths)
         return _finish_code_result(result)
@@ -8852,7 +9030,7 @@ def _op_graph(
         if kind == "blast_radius":
             if not path:
                 raise ValueError("path is required for kind='blast_radius'")
-            result = graph.blast_radius(path)
+            result = graph.blast_radius(path, limit=limit)
         elif kind == "dead_code":
             result = graph.dead_code(limit=limit, paths=paths)
         elif kind == "cycles":
@@ -9521,6 +9699,62 @@ def tool_code_coverage_check(
     from lemoncrow.infra.code_intel.coverage import check_coverage
 
     return check_coverage(paths=paths, repo_root=_code_repo_root(repo_root)).to_dict()
+
+
+@mcp_tool(name="code_changes")
+def tool_code_changes(
+    base_ref: str = "HEAD",
+    paths: list[str] | None = None,
+    depth: int = 1,
+    limit: int = 100,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Diff since `base_ref`, mapped to changed symbols and the callers they reach.
+
+    Carries "what does this change touch?" past the file boundary. `depth`
+    expands callers by that many hops. The call graph is name-keyed, so every
+    edge carries `match_kind: "name"` and over-reports rather than missing
+    callers; `impacted_total` gives the count before `limit` truncation.
+    """
+    from lemoncrow.infra.code_intel.change_impact import analyze_changes
+
+    return analyze_changes(
+        base_ref=base_ref,
+        paths=paths,
+        depth=depth,
+        limit=limit,
+        repo_root=_code_repo_root(repo_root),
+    ).to_dict()
+
+
+@mcp_tool(name="code_query")
+def tool_code_query(
+    select: str = "symbols",
+    where: dict[str, Any] | None = None,
+    order_by: str | None = None,
+    limit: int = 50,
+    describe: bool = False,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Filter the code index: symbols / callers / callees / importers / references.
+
+    `where` is flat: `{"kind": "function", "file_path_like": "src/%",
+    "name_regex": "^_"}`. Operator suffixes: `_like _regex _in _not _gt _gte
+    _lt _lte`. `order_by` is `name`, `centrality`, or `callers`. Pass
+    `describe=true` for the exact field whitelist. Unknown fields are rejected,
+    never ignored. No raw SQL.
+    """
+    from lemoncrow.infra.code_intel.query import code_query, describe_schema
+
+    if describe:
+        return describe_schema()
+    return code_query(
+        select=select,
+        where=where,
+        order_by=order_by,
+        limit=limit,
+        repo_root=_code_repo_root(repo_root),
+    ).to_dict()
 
 
 @mcp_tool(name="blame")
@@ -10855,13 +11089,25 @@ def _tool_broker_handler(args: dict[str, Any]) -> dict[str, Any] | Any:
         call_spec = TOOLS.get(target)
         if call_spec is None:
             raise _ToolArgumentError(f"unknown tool: {target}")
-        if _tool_advertised_now(target, call_spec):
-            raise _ToolArgumentError(f"{target!r} is already exposed; call it directly")
         arguments = args.get("arguments") or {}
         if not isinstance(arguments, dict):
             raise _ToolArgumentError("tool arguments must be an object")
         handler = cast(Callable[[dict[str, Any]], Any], call_spec["handler"])
-        return handler(arguments)
+        result = handler(arguments)
+        # An advertised tool used to be refused here as "call it directly" --
+        # advice the caller may be unable to take. A host captures its tool list
+        # when the session connects, so any tool added since then is advertised
+        # by the server and absent from the caller's list, and the refusal left
+        # that caller with no route at all. `search` still hides advertised
+        # tools (one route per tool, no wasted hop); `call` runs them and says
+        # where the direct route is.
+        if _tool_advertised_now(target, call_spec) and isinstance(result, dict):
+            result.setdefault(
+                "broker_note",
+                f"{target!r} is advertised directly -- call it by name. If it is missing from "
+                "your tool list, that list predates the tool; reconnect to refresh it.",
+            )
+        return result
 
     raise _ToolArgumentError(f"unknown broker action: {action}")
 
@@ -13264,6 +13510,14 @@ def serve() -> None:
             executor = io_executor if _classify_cost(req) != _COST_CPU else cpu_executor
             executor.submit(_handle_and_write, req)
 
+    # Initialise the pro mypyc group here, on the main thread, before anything
+    # concurrent exists. `_warm_pro_code_modules` already makes concurrent entry
+    # safe wherever it is called from -- that lock is the correctness property
+    # and this does not replace it. What this adds is the daemon-shaped half:
+    # once the reader starts, request threads and the background index warmer
+    # run together, and every one of them then finds the group already built.
+    # It also moves the import cost off whichever request happened to be first.
+    _warm_pro_code_modules()
     _start_dormant_refresher()
     reader = threading.Thread(target=_stdin_reader, daemon=True, name="mcp-stdin-reader")
     reader.start()

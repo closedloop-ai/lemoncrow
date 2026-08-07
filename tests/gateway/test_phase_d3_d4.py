@@ -32,6 +32,10 @@ EXPECTED_TOOLS = {
     "cache",
     # F3: index coverage -- advertised, not hidden.
     "code_coverage_check",
+    # F2: change impact -- advertised, not hidden.
+    "code_changes",
+    # F5: whitelisted graph query -- advertised, not hidden.
+    "code_query",
 }
 
 

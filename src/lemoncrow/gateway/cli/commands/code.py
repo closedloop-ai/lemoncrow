@@ -13,6 +13,7 @@ import click
 
 from lemoncrow.gateway.cli.commands._shared import _emit, require_pro
 from lemoncrow.gateway.integrations.openmemory_lifecycle import project_root as _project_root
+from lemoncrow.infra.code_intel.portable import TIERS as _PORTABLE_TIERS
 
 
 @click.group("zoekt")
@@ -783,6 +784,76 @@ def _entry_age_days(entry: Path, now: float) -> float:
     if newest <= 0:
         return 0.0
     return max(0.0, (now - newest) / 86_400.0)
+
+
+def _portable_repo_root(repo_root: str | None) -> Path:
+    if repo_root is not None:
+        return Path(repo_root).expanduser().resolve()
+    from lemoncrow.core.foundation.paths import resolve_workspace_root
+
+    return Path(resolve_workspace_root()).resolve()
+
+
+@code_group.command("export")
+@click.option(
+    "--out", default=None, type=click.Path(path_type=Path), help="Archive path (default: .lemoncrow/index.tar.*)."
+)
+@click.option(
+    "--tier",
+    type=click.Choice(sorted(_PORTABLE_TIERS)),
+    default="best",
+    show_default=True,
+    help="best: smaller archive, slower. fast: quicker, for incremental refresh.",
+)
+@click.option("--repo-root", default=None, help="Repository root (default: the resolved workspace root).")
+@click.option("--json", "as_json", is_flag=True)
+def code_export_cmd(out: Path | None, tier: str, repo_root: str | None, as_json: bool) -> None:
+    """Pack this workspace's code index into a portable archive.
+
+    Compacts each database, records the engine's index and semantics versions
+    in a manifest, and compresses the bundle. The archive is deliberately not
+    committed anywhere by default -- it is a build artifact, not source.
+    """
+    from lemoncrow.infra.code_intel.portable import PortableIndexError, export_index
+
+    try:
+        result = export_index(repo_root=_portable_repo_root(repo_root), out=out, tier=tier)
+    except PortableIndexError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if as_json:
+        _emit(result.to_dict(), as_json=True)
+        return
+    click.echo(f"Wrote {result.path} ({result.size_bytes:,} bytes, {result.codec}, tier={result.tier})")
+    click.echo(f"  databases: {', '.join(result.databases)}")
+    click.echo(f"  engine index_version: {result.manifest['engine_index_version']}")
+
+
+@code_group.command("import")
+@click.option("--from", "source", required=True, type=click.Path(path_type=Path), help="Archive to import.")
+@click.option("--repo-root", default=None, help="Repository root (default: the resolved workspace root).")
+@click.option("--force", is_flag=True, help="Replace an index this workspace already holds.")
+@click.option("--json", "as_json", is_flag=True)
+def code_import_cmd(source: Path, repo_root: str | None, force: bool, as_json: bool) -> None:
+    """Restore a code index from an archive built by `lc code export`.
+
+    Refuses on an indexer-semantics mismatch. The engine owns that number and
+    open code cannot migrate its data, so importing across it would produce a
+    graph whose edges mean something else -- confident and wrong. Re-index
+    instead. --force overrides only the already-populated check.
+    """
+    from lemoncrow.infra.code_intel.portable import PortableIndexError, import_index
+
+    try:
+        result = import_index(archive=source, repo_root=_portable_repo_root(repo_root), force=force)
+    except PortableIndexError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if as_json:
+        _emit(result.to_dict(), as_json=True)
+        return
+    click.echo(f"Restored {len(result.restored)} database(s) into {result.workspace}")
+    click.echo(f"  from: {result.archive}")
+    click.echo(f"  verified against: {result.verified_against}")
+    click.echo("Run `lc code index` to fill in the local diff.")
 
 
 @code_group.command("prune")

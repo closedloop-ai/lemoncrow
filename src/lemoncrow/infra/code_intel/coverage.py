@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.languages import language_for_path
 from lemoncrow.infra.code_intel.store import CodeIntelStore, FileRow
 
@@ -81,6 +82,9 @@ class CoverageReport:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            # An audit reports on every path it was asked about, or it is not
+            # an audit.
+            "objective": OBJECTIVE_EXHAUSTIVE,
             "repo_root": self.repo_root,
             "engine_index_version": self.engine_index_version,
             "exclusion_source": self.exclusion_source,
