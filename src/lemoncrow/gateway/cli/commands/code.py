@@ -856,6 +856,68 @@ def code_import_cmd(source: Path, repo_root: str | None, force: bool, as_json: b
     click.echo("Run `lc code index` to fill in the local diff.")
 
 
+@code_group.command("clones")
+@click.option(
+    "--threshold",
+    type=float,
+    default=None,
+    help="Minimum estimated Jaccard similarity to record (default: 0.8).",
+)
+@click.option(
+    "--min-tokens",
+    type=int,
+    default=None,
+    help="Skip symbols with fewer normalised tokens than this (default: 40).",
+)
+@click.option("--limit", type=int, default=20, show_default=True, help="Pairs to print.")
+@click.option("--repo-root", default=None, help="Repository root (default: the resolved workspace root).")
+@click.option("--json", "as_json", is_flag=True)
+def code_clones_cmd(
+    threshold: float | None,
+    min_tokens: int | None,
+    limit: int,
+    repo_root: str | None,
+    as_json: bool,
+) -> None:
+    """Find near-duplicate symbols and store them in the sidecar.
+
+    Reads every indexed symbol's source, normalises it, and compares MinHash
+    signatures under LSH banding. Results are stamped with the engine index
+    generation they were built from, so `code_query(select="clones")` can tell a
+    stale table from a current one instead of serving superseded pairs.
+
+    This is a full pass over the repository, so it is a command rather than
+    something a tool call triggers implicitly.
+    """
+    from lemoncrow.infra.code_intel.clones import DEFAULT_THRESHOLD, MIN_TOKENS, build_clones
+
+    report = build_clones(
+        repo_root=_portable_repo_root(repo_root),
+        threshold=DEFAULT_THRESHOLD if threshold is None else threshold,
+        min_tokens=MIN_TOKENS if min_tokens is None else min_tokens,
+    )
+    if as_json:
+        _emit(report.as_dict(), as_json=True)
+        return
+    click.echo(
+        f"{len(report.pairs)} clone pair(s) at threshold {report.threshold} "
+        f"(engine index_version {report.engine_index_version})"
+    )
+    click.echo(
+        f"  symbols compared: {report.symbols_considered}"
+        f"  |  skipped as too short: {report.symbols_skipped_short}"
+        f"  |  unreadable: {report.symbols_unreadable}"
+    )
+    click.echo(f"  candidate pairs from banding: {report.candidate_pairs}")
+    for pair in report.pairs[:limit]:
+        click.echo(
+            f"  {pair.jaccard:.3f}  {pair.qualified_name_a} ({pair.file_path_a})"
+            f"  <->  {pair.qualified_name_b} ({pair.file_path_b})"
+        )
+    if len(report.pairs) > limit:
+        click.echo(f"  ... {len(report.pairs) - limit} more (--limit to show)")
+
+
 @code_group.command("prune")
 @click.option(
     "--store-root",

@@ -5,7 +5,7 @@ answer are narrow and repetitive -- "functions matching X with no callers",
 "files importing Y ordered by centrality" -- and a query language would be a
 parser to maintain plus an injection surface to defend, for the same answers.
 
-So: a whitelist. ``select`` names one of five row sources, ``where`` is a flat
+So: a whitelist. ``select`` names one of six row sources, ``where`` is a flat
 mapping of ``field`` or ``field_<operator>`` to a value, and both sides are
 checked against a table declared in this module before any SQL is built.
 
@@ -20,18 +20,28 @@ for, and a caller reading a filtered list has no way to tell.
 The call-graph sources (``callers``, ``callees``, ``references``) are name-keyed
 in the engine's schema, so results there carry ``match_kind: "name"`` for the
 same reason :mod:`lemoncrow.infra.code_intel.change_impact` does.
+
+``clones`` is the one source backed by the sidecar rather than the engine, and
+therefore the one that can be *absent* rather than merely empty: nothing builds
+it until ``lc code clones`` runs. It raises
+:class:`~lemoncrow.infra.code_intel.clones.ClonesStale` in that case, and when
+the engine has reindexed past it, instead of returning the zero rows that would
+read as "this code has no duplicates".
 """
 
 from __future__ import annotations
 
 import re
+import sqlite3
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from lemoncrow.infra.code_intel.clones import CLONES_TABLE, ClonesStale
 from lemoncrow.infra.code_intel.completeness import MATCH_NAME, OBJECTIVE_EXHAUSTIVE
+from lemoncrow.infra.code_intel.sidecar import is_stale, open_sidecar, stamp_of
 from lemoncrow.infra.code_intel.store import CodeIntelStore
 
 __all__ = [
@@ -218,8 +228,40 @@ _REFERENCES = _Select(
     name_keyed=True,
 )
 
+# F6. The only select backed by the sidecar rather than the engine, and the only
+# one whose rows we produced ourselves -- so it is the only one that can be
+# *absent* rather than merely empty. `code_query` raises for that case instead of
+# returning zero rows, because "no clones recorded" and "nobody has looked" are
+# different answers and only one of them is about the code.
+_CLONES = _Select(
+    name="clones",
+    database="sidecar",
+    table="symbol_clones",
+    columns=(
+        "qualified_name_a",
+        "qualified_name_b",
+        "file_path_a",
+        "file_path_b",
+        "token_count_a",
+        "token_count_b",
+        "jaccard",
+    ),
+    fields={
+        "name": "qualified_name_a",
+        "qualified_name_a": "qualified_name_a",
+        "qualified_name_b": "qualified_name_b",
+        "file_path_a": "file_path_a",
+        "file_path_b": "file_path_b",
+        "jaccard": "jaccard",
+        "token_count_a": "token_count_a",
+        "token_count_b": "token_count_b",
+    },
+    numeric=frozenset({"jaccard", "token_count_a", "token_count_b"}),
+    name_column="qualified_name_a",
+)
+
 SELECTS: dict[str, _Select] = {
-    select.name: select for select in (_SYMBOLS, _CALLERS, _CALLEES, _IMPORTERS, _REFERENCES)
+    select.name: select for select in (_SYMBOLS, _CALLERS, _CALLEES, _IMPORTERS, _REFERENCES, _CLONES)
 }
 
 
@@ -410,6 +452,26 @@ def _caller_counts(store: CodeIntelStore) -> dict[str, int]:
     return counts
 
 
+def _open_sidecar_checked(repo_root: Path | str, index_version: int) -> sqlite3.Connection:
+    """Open the sidecar for reading, or raise if its table cannot be trusted.
+
+    The staleness check runs *before* any rows are read, so a superseded table
+    can never contribute a single row to a result a caller might act on.
+    """
+    conn = open_sidecar(repo_root)
+    recorded = stamp_of(conn, CLONES_TABLE)
+    if recorded is None:
+        conn.close()
+        raise ClonesStale("the clone table has never been built")
+    if is_stale(conn, CLONES_TABLE, index_version):
+        conn.close()
+        raise ClonesStale(
+            f"the clone table was built from index_version {recorded.engine_index_version}, "
+            f"the index is now at {index_version}"
+        )
+    return conn
+
+
 def code_query(
     select: str = "symbols",
     where: Mapping[str, Any] | None = None,
@@ -440,9 +502,22 @@ def code_query(
 
     with CodeIntelStore(repo_root) as store:
         index_version = store.engine_state("index_version")
-        conn = store.code if spec.database == "code" else store.intel
+        sidecar_conn: sqlite3.Connection | None = None
+        conn: sqlite3.Connection | None
+        if spec.database == "sidecar":
+            # Raises when the table was never built or the engine index has moved
+            # past it. Returning zero rows here would answer "does this code have
+            # duplicates" with "no" on the strength of never having looked.
+            sidecar_conn = _open_sidecar_checked(repo_root, index_version)
+            conn = sidecar_conn
+        elif spec.database == "code":
+            conn = store.code
+        else:
+            conn = store.intel
         repo_id = store.repo_id_or_none()
         if conn is None or repo_id is None:
+            if sidecar_conn is not None:
+                sidecar_conn.close()
             return QueryResult(
                 select=select,
                 where=dict(where or {}),
@@ -456,35 +531,39 @@ def code_query(
                 engine_index_version=index_version,
             )
 
-        conn.create_function("regexp", 2, _regexp, deterministic=True)
-        clause, params = _where_clause(predicates)
-        sql = f"SELECT {', '.join(spec.columns)} FROM {spec.quoted_table} WHERE repo_id = ?"
-        bound: list[Any] = [repo_id]
-        if clause:
-            sql += f" AND {clause}"
-            bound.extend(params)
-        sql += f" ORDER BY {spec.name_column} LIMIT ?"
-        bound.append(MAX_SCAN)
+        try:
+            conn.create_function("regexp", 2, _regexp, deterministic=True)
+            clause, params = _where_clause(predicates)
+            sql = f"SELECT {', '.join(spec.columns)} FROM {spec.quoted_table} WHERE repo_id = ?"
+            bound: list[Any] = [repo_id]
+            if clause:
+                sql += f" AND {clause}"
+                bound.extend(params)
+            sql += f" ORDER BY {spec.name_column} LIMIT ?"
+            bound.append(MAX_SCAN)
 
-        rows = [dict(row) for row in conn.execute(sql, bound)]
-        scanned = len(rows)
+            rows = [dict(row) for row in conn.execute(sql, bound)]
+            scanned = len(rows)
 
-        if order_by == "centrality":
-            scores = _centrality_scores(store)
-            rows.sort(
-                key=lambda row: (
-                    -scores.get(str(row.get(spec.name_column) or ""), 0.0),
-                    str(row.get(spec.name_column) or ""),
+            if order_by == "centrality":
+                scores = _centrality_scores(store)
+                rows.sort(
+                    key=lambda row: (
+                        -scores.get(str(row.get(spec.name_column) or ""), 0.0),
+                        str(row.get(spec.name_column) or ""),
+                    )
                 )
-            )
-        elif order_by == "callers":
-            counts = _caller_counts(store)
-            rows.sort(
-                key=lambda row: (
-                    -counts.get(str(row.get(spec.name_column) or ""), 0),
-                    str(row.get(spec.name_column) or ""),
+            elif order_by == "callers":
+                counts = _caller_counts(store)
+                rows.sort(
+                    key=lambda row: (
+                        -counts.get(str(row.get(spec.name_column) or ""), 0),
+                        str(row.get(spec.name_column) or ""),
+                    )
                 )
-            )
+        finally:
+            if sidecar_conn is not None:
+                sidecar_conn.close()
 
     return QueryResult(
         select=select,

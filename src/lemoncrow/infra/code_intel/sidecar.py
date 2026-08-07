@@ -35,7 +35,7 @@ __all__ = [
 SIDECAR_DB = "sidecar.sqlite"
 
 #: Bump when adding a migration below. Never renumber an existing one.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _BUSY_TIMEOUT_MS = 5_000
 
@@ -53,6 +53,38 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 engine_index_version INTEGER NOT NULL,
                 built_at             TEXT    NOT NULL
             )
+            """,
+        ),
+    ),
+    (
+        2,
+        (
+            # F6. `repo_id` is carried even though the sidecar is already
+            # per-repo, so `code_query` can reach this table through the same
+            # `WHERE repo_id = ?` shape it uses for every engine table -- one
+            # query builder rather than a sidecar-shaped special case in it.
+            #
+            # The pair is stored once, with `symbol_a < symbol_b` enforced by the
+            # writer. Storing both directions would double the table and let a
+            # reader that forgets to deduplicate report every clone twice.
+            """
+            CREATE TABLE IF NOT EXISTS symbol_clones (
+                repo_id          TEXT    NOT NULL,
+                symbol_a         TEXT    NOT NULL,
+                symbol_b         TEXT    NOT NULL,
+                qualified_name_a TEXT    NOT NULL,
+                qualified_name_b TEXT    NOT NULL,
+                file_path_a      TEXT    NOT NULL,
+                file_path_b      TEXT    NOT NULL,
+                token_count_a    INTEGER NOT NULL,
+                token_count_b    INTEGER NOT NULL,
+                jaccard          REAL    NOT NULL,
+                PRIMARY KEY (repo_id, symbol_a, symbol_b)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_symbol_clones_score
+                ON symbol_clones(repo_id, jaccard DESC)
             """,
         ),
     ),

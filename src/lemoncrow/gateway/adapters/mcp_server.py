@@ -9736,25 +9736,34 @@ def tool_code_query(
     describe: bool = False,
     repo_root: str | None = None,
 ) -> dict[str, Any]:
-    """Filter the code index: symbols / callers / callees / importers / references.
+    """Filter the code index: symbols / callers / callees / importers / references / clones.
 
     `where` is flat: `{"kind": "function", "file_path_like": "src/%",
     "name_regex": "^_"}`. Operator suffixes: `_like _regex _in _not _gt _gte
     _lt _lte`. `order_by` is `name`, `centrality`, or `callers`. Pass
     `describe=true` for the exact field whitelist. Unknown fields are rejected,
-    never ignored. No raw SQL.
+    never ignored. No raw SQL. `select="clones"` needs `lc code clones` to have
+    been run and errors rather than returning nothing if it has not.
     """
+    from lemoncrow.infra.code_intel.clones import ClonesStale
     from lemoncrow.infra.code_intel.query import code_query, describe_schema
 
     if describe:
         return describe_schema()
-    return code_query(
-        select=select,
-        where=where,
-        order_by=order_by,
-        limit=limit,
-        repo_root=_code_repo_root(repo_root),
-    ).to_dict()
+    try:
+        return code_query(
+            select=select,
+            where=where,
+            order_by=order_by,
+            limit=limit,
+            repo_root=_code_repo_root(repo_root),
+        ).to_dict()
+    except ClonesStale as exc:
+        # Surfaced as an argument error so the model reads it as "your call could
+        # not be answered" rather than a transport failure. It is the same
+        # fail-loud contract IndexRebuilding uses: the empty list this replaces
+        # would have been read as "no duplicates found".
+        raise _ToolArgumentError(str(exc)) from exc
 
 
 @mcp_tool(name="blame")

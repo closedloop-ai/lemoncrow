@@ -100,10 +100,33 @@ def _names(result: object, column: str = "symbol_name") -> set[str]:
 
 
 def test_every_declared_select_is_queryable(repo: Path) -> None:
+    """Every select answers, including the sidecar-backed one once it is built.
+
+    ``clones`` is derived rather than read straight from the engine, so it has a
+    state the others do not: not yet built. It raises there instead of returning
+    an empty list (see :func:`test_clones_select_refuses_before_it_is_built`),
+    which is why the fixture builds it before the sweep rather than the sweep
+    skipping it.
+    """
+    from lemoncrow.infra.code_intel.clones import build_clones
+
+    build_clones(repo)
     for name in SELECTS:
         result = code_query(select=name, repo_root=repo)
         assert result.select == name
         assert result.engine_index_version == 17
+
+
+def test_clones_select_refuses_before_it_is_built(repo: Path) -> None:
+    """The one select that can be *absent* rather than merely empty.
+
+    Zero rows from an unbuilt clone table reads as "this code has no
+    duplicates", which is a claim about the code that nothing has checked.
+    """
+    from lemoncrow.infra.code_intel.clones import ClonesStale
+
+    with pytest.raises(ClonesStale, match="never been built"):
+        code_query(select="clones", repo_root=repo)
 
 
 def test_symbols_select_returns_the_whitelisted_columns(repo: Path) -> None:
