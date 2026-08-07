@@ -377,6 +377,38 @@ a brute-force baseline on a small fixture.
 
 **Effort:** 8-12 days. **Risk:** medium — LSH tuning. Depends on F0, F5.
 
+### Shipped — `461ec349`
+
+`lc code clones` builds it; `code_query(select="clones")` reads it. Measured on
+this repo: 12,066 symbols compared in 33s, 3,409 LSH candidates, 1,909 pairs at
+threshold 0.8. Banding is 16 bands x 8 rows.
+
+Three deviations, all forced by what the repository actually contains:
+
+1. **`_MINHASH_PERMUTATIONS` and `_MIN_DEDUP_TOKENS` do not exist.** The plan
+   cites them as constants to match; neither appears anywhere in the tree, and
+   `_minhash.py` has no open-source importers at all. `clones.py` declares its
+   own `NUM_PERM = 128` (the `MinHash` default) and `MIN_TOKENS = 40`.
+2. **Normalisation had to placeholder identifiers, not merely strip comments and
+   whitespace.** As specified, a copied function whose locals were all renamed
+   scored **0.039** — at k=5 nearly every shingle contains at least one renamed
+   identifier, so nearly every shingle differs. That fails the section's own
+   acceptance criterion ("rename-only clone scores high"), so identifiers and
+   numeric literals are replaced by placeholders before shingling. Keywords
+   survive, which is what keeps control-flow shape in the signature.
+3. **String literals are kept; only docstrings are stripped.** Stripping every
+   string, as "strip comments/whitespace" implies, produced 2,968 pairs whose
+   top scorers were every `to_dict` in the codebase matching every other at
+   1.000 — once identifiers are placeholdered, a `to_dict`'s dict keys are the
+   only thing distinguishing it. Keeping literals cut that to 1,909 and put real
+   duplication at the top.
+
+One addition the plan did not call for: the clone table is the first sidecar-
+backed `code_query` select, so it is the first that can be *absent* rather than
+empty. `load_clones` and `code_query` raise `ClonesStale` when it was never
+built or the engine has reindexed past it, rather than returning the zero rows
+that would read as "this code has no duplicates".
+
 ---
 
 ## F7. Index export / import
@@ -570,6 +602,25 @@ vector-space mismatch refusal, cosine ranking against a known-good ordering with
 a deterministic fake embedder, and the visibility gate in both states.
 
 **Effort:** 10-15 days. **Risk:** medium — mostly dependency weight.
+
+### Not built — deliberately, and the reason is a precondition this plan missed
+
+Every part of F10 downstream of the backfill is gated on an embedder existing.
+`LEMONCROW_CODE_EMBEDDER` is unset in the target environment, `factory.py`
+returns `NullEmbedder`, and there is no `ollama` binary — so a shipped
+`code_semantic_search` would advertise a tool that returns nothing, and its
+acceptance could only ever have been exercised against a fake embedder in
+tests. The requester declined it on exactly that basis: do not build something
+that cannot be verified or that will not function.
+
+What F10 needs before it is worth building is therefore not engineering time but
+a decision about the embedding backend — `ollama` (no API key, no torch) or the
+`semantic` extra (BGE-Code-v1, ~2GB of torch). Note also that **`numpy` is not a
+base dependency**, only a member of the `vector` and `semantic` extras, so
+step 2's "brute-force cosine in numpy" cannot be written against the base
+install as the plan assumes.
+
+F10 stays open. It is unblocked the moment an embedder is chosen.
 
 ---
 
@@ -795,6 +846,12 @@ visible the agent can route on its own.
 
 **Effort:** ~1 day. **Risk:** low, but it moved three surface-lock tests — each
 narrowed to the new contract, none loosened.
+
+**Phase C partially shipped** — F6 landed on `worktree-pln-1633-phase-c`
+(`461ec349`). F10 was not built: it is gated on an embedder that does not exist
+in the target environment, so it would have shipped a tool that cannot function.
+See its section for what unblocks it. Phase C is therefore not closed, and
+"remaining work" is F10, F9, F8.
 
 If the plan gets cut, cut from D.
 
