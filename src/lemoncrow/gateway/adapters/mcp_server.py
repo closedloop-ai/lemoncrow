@@ -323,6 +323,17 @@ def _tool_profile_exposes(tool_name: str) -> bool:
     return tool_name != "tool"
 
 
+def _tool_advertised_now(tool_name: str, spec: dict[str, Any]) -> bool:
+    """True when *tool_name* appears in the tools/list response a client sees.
+
+    The single predicate behind both the tools/list build and the broker's
+    "already exposed" guard. Membership in ``_CORE_MCP_TOOLS`` is NOT the same
+    question: `relations` and `grep` are in both ``_CORE_MCP_TOOLS`` and
+    ``HIDDEN_LLM_TOOLS``, so they are never advertised under any profile.
+    """
+    return _tool_profile_exposes(tool_name) and _tool_visible_to_llm(tool_name, spec)
+
+
 def _tool_mode(spec: dict[str, Any]) -> str:
     return mcp_tool_mode(str(spec.get("name", "") or ""))
 
@@ -9519,9 +9530,10 @@ def tool_statusline_segment(format: str = "segment") -> str:
       that render chat markdown and have no shell to run the CLI.
     - ``format="json"``: the raw savings report payload, JSON-encoded.
 
-    Hidden from tools/list (see HIDDEN_LLM_TOOLS) but callable by exact name
-    through the `tool` broker (see _BROKER_HIDDEN_CALLABLE), which is how the
-    lemoncrow skill answers "what are my savings?" without a shell.
+    Hidden from tools/list (see HIDDEN_LLM_TOOLS) but reachable by exact name
+    through the `tool` broker (anything not currently advertised is, unless it
+    is in _BROKER_DENIED), which is how the lemoncrow skill answers "what are
+    my savings?" without a shell.
     """
     fmt = (format or "segment").strip().lower()
     if fmt in {"markdown", "md", "json"}:
@@ -10748,29 +10760,46 @@ def tool_compact(
 
 
 _TOOL_BROKER_DESCRIPTION = (
-    "Deterministic fallback for rare LemonCrow tools hidden by the core profile. "
+    "Deterministic fallback for LemonCrow tools that are not currently advertised. "
     "Normal code_search/read/edit/bash/web_fetch calls are already exposed: never "
     "search for those. Use search once for a rare capability, then call its exact name."
 )
 
-# Hidden tools (HIDDEN_LLM_TOOLS) reachable by EXACT name via the broker's
-# `call` action. `search` still never lists them, so the advertised surface is
-# unchanged -- only a caller that already knows the name and arguments (a skill
-# that documents the exact call) can reach one. Keep this set tiny.
-_BROKER_HIDDEN_CALLABLE = frozenset({"statusline_segment"})
+# Tools the broker must never reach, whatever the advertised surface says.
+# `tool` itself would recurse; the other four spawn subagents, proxy arbitrary
+# external servers, run arbitrary SQL, or rewrite the tree en masse -- reaching
+# any of those through a generic escape hatch is not a fallback, it is a
+# footgun. Everything else that is merely unadvertised is fair game: the broker
+# exists precisely so a hidden tool is still reachable by exact name.
+_BROKER_DENIED = frozenset({"agent", "codemod", "mcp", "sql", "tool", "workflow"})
+
+
+def _broker_reachable(tool_name: str, spec: dict[str, Any]) -> bool:
+    """True when the broker may search for, and call, *tool_name*.
+
+    The guard is "is it advertised right now", not "is it in the core profile".
+    The two are not the same question, and conflating them is what limited this
+    broker to a single reachable tool: `relations` and `grep` are in both
+    ``_CORE_MCP_TOOLS`` and ``HIDDEN_LLM_TOOLS``, so the old code refused them
+    as "already exposed" while nothing ever advertised them.
+
+    search and call share this predicate on purpose -- search must never return
+    a tool that call would then refuse.
+    """
+    if tool_name in _BROKER_DENIED:
+        return False
+    return not _tool_advertised_now(tool_name, spec)
 
 
 def _tool_broker_handler(args: dict[str, Any]) -> dict[str, Any] | Any:
-    """Search or invoke the rare-tool registry without global registration."""
+    """Search or invoke the unadvertised-tool registry without global registration."""
     action = str(args.get("action") or "")
     if action == "search":
         normalized = " ".join(str(args.get("query") or "").lower().split())
         terms = tuple(term for term in re.split(r"\W+", normalized) if term)
         matches: list[tuple[int, str, str]] = []
         for tool_name, spec in TOOLS.items():
-            if tool_name in _CORE_MCP_TOOLS:
-                continue
-            if not _tool_visible_to_llm(tool_name, spec):
+            if not _broker_reachable(tool_name, spec):
                 continue
             description = _tool_description(spec)
             haystack = f"{tool_name} {description}".lower()
@@ -10789,11 +10818,15 @@ def _tool_broker_handler(args: dict[str, Any]) -> dict[str, Any] | Any:
         target = str(args.get("name") or "").strip()
         if not target:
             raise _ToolArgumentError("tool call requires an exact name")
-        if target in _CORE_MCP_TOOLS:
-            raise _ToolArgumentError(f"{target!r} is already exposed; call it directly")
+        # Deny first: the answer must not depend on whether the name happens to
+        # be registered. `tool` itself is not in TOOLS at all.
+        if target in _BROKER_DENIED:
+            raise _ToolArgumentError(f"{target!r} is not reachable through the broker")
         call_spec = TOOLS.get(target)
-        if call_spec is None or not (_tool_visible_to_llm(target, call_spec) or target in _BROKER_HIDDEN_CALLABLE):
-            raise _ToolArgumentError(f"unknown or unavailable tool: {target}")
+        if call_spec is None:
+            raise _ToolArgumentError(f"unknown tool: {target}")
+        if _tool_advertised_now(target, call_spec):
+            raise _ToolArgumentError(f"{target!r} is already exposed; call it directly")
         arguments = args.get("arguments") or {}
         if not isinstance(arguments, dict):
             raise _ToolArgumentError("tool arguments must be an object")
@@ -11649,7 +11682,7 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
                 "inputSchema": s.get("inputSchema", {}),
             }
             for n, s in sorted(TOOLS.items())
-            if _tool_profile_exposes(n) and _tool_visible_to_llm(n, s)
+            if _tool_advertised_now(n, s)
         ]
         if _mcp_tool_profile() == "core":
             broker = _TOOL_BROKER_SPEC
