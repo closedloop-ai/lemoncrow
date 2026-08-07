@@ -8812,11 +8812,12 @@ def _op_graph(
 ) -> dict[str, Any]:
     """Agent-facing graph analytics (G3/G6) dispatched by ``kind``.
 
-    * ``blast_radius`` (default) -- reverse-dependency closure + affected tests +
-      risk tier for ``path`` (file-level; uses the existing change_impact).
-    * ``dead_code`` / ``cycles`` / ``coupling`` -- repo-wide file-graph analytics
-      over the semantic file index. Pass ``paths`` to fold those files into the
-      index first; otherwise analyses whatever the index already holds.
+    * ``blast_radius`` (default) -- reverse-import closure + affected tests +
+      risk tier for ``path``.
+    * ``dead_code`` / ``cycles`` / ``coupling`` / ``topology`` -- repo-wide
+      file-graph analytics over ``code_context.imports``. Pass ``paths`` to
+      restrict which files are reported; the graph itself is always the whole
+      repo, because narrowing it would change the answers rather than the view.
     * ``centrality`` -- symbol-level call-graph centrality from the code-intel engine.
       Pass ``synthesize=true`` with ``paths`` to additionally return
       heuristic (route/event) edges as a SEPARATE ``synthesized_edges`` list
@@ -8841,25 +8842,25 @@ def _op_graph(
             result["synthesized_edges"] = _synthesize_edges_for_paths(paths)
         return _finish_code_result(result)
 
-    cap = _semantic_file_memory(_lemoncrow_root())
-    if paths:
-        for raw in paths:
-            candidate = Path(raw)
-            if candidate.is_file():
-                cap.summarize_file(candidate)
-    analytics = cap.graph_analytics()
-    if kind == "blast_radius":
-        if not path:
-            raise ValueError("path is required for kind='blast_radius'")
-        result = analytics.blast_radius(str(Path(path)))
-    elif kind == "dead_code":
-        result = analytics.dead_code(limit=limit)
-    elif kind == "cycles":
-        result = analytics.cycles(limit=limit)
-    elif kind == "topology":
-        result = analytics.topology(limit=limit)
-    else:  # coupling
-        result = analytics.coupling(limit=limit)
+    # F1: these read the repo's own `imports` table. They used to read
+    # ~/.lemoncrow/semantic_file_index.json -- a machine-global, cross-repo,
+    # LRU-bounded cache -- which reported files from unrelated projects and
+    # returned an empty blast radius for files that plainly had importers.
+    from lemoncrow.infra.code_intel.file_graph import open_file_graph
+
+    with open_file_graph(_code_repo_root(repo_root)) as graph:
+        if kind == "blast_radius":
+            if not path:
+                raise ValueError("path is required for kind='blast_radius'")
+            result = graph.blast_radius(path)
+        elif kind == "dead_code":
+            result = graph.dead_code(limit=limit, paths=paths)
+        elif kind == "cycles":
+            result = graph.cycles(limit=limit, paths=paths)
+        elif kind == "topology":
+            result = graph.topology(limit=limit, paths=paths)
+        else:  # coupling
+            result = graph.coupling(limit=limit, paths=paths)
     result["kind"] = kind
     _ = render_compact  # file-graph analytics render as JSON; no markdown view
     return result
@@ -9407,8 +9408,8 @@ def tool_graph(
     coupling, centrality, doc/code drift, PR risk, commit provenance, design-doc recall.
 
     kind:
-      - blast_radius (default): reverse-dependency closure + affected tests + risk tier for `path`.
-      - dead_code: files with no inbound importers (likely removable), ranked by complexity.
+      - blast_radius (default): reverse-import closure + affected tests + risk tier for `path`.
+      - dead_code: files with no inbound importers, excluding entry points.
       - cycles: import cycles (strongly-connected components, size >= 2).
       - coupling: per-file afferent/efferent coupling + Martin instability.
       - centrality: top symbols by call-graph centrality (degree + eigenvector).
@@ -9421,8 +9422,11 @@ def tool_graph(
       - index_docs (N17): opt-in heading-tree indexing of Markdown design docs into a SEPARATE
         retrieval store (`enable=true` or LEMONCROW_DOC_INDEXING=1; off by default).
       - recall_docs (N17): design-doc chunks for `query` from the separate doc store.
-    `paths` = fold files into the index first (dead_code/cycles/coupling/pr_risk); for
-    design_gaps/verify_design/index_docs it selects the docs/dirs to scan.
+    `paths` = restrict which files are reported (dead_code/cycles/coupling/topology) or
+    which changed (pr_risk); for design_gaps/verify_design/index_docs it selects the
+    docs/dirs to scan. File-graph kinds also return resolved_edges/unresolved_edges:
+    only intra-repo imports resolve, so a small answer may be a small footprint OR an
+    unresolved one.
     `synthesize=true` (with `paths`, kind=centrality) → heuristic route/event edges as a
     SEPARATE `synthesized_edges` list (never merged into the static call graph).
     """

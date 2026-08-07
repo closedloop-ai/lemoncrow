@@ -36,6 +36,8 @@ def _preindex(repo_root: str | Path) -> None:
 # `grep`, `relations`, `search`, `memory`, `sql`, `codemod` are registered but
 # hidden from agents (grep/relations stay callable as escape hatch / drill-in).
 EXPECTED_TOOLS = {
+    # F3 -- see tests/gateway/test_mcp_tool_handlers.py for why it is advertised.
+    "code_coverage_check",
     "read",
     "edit",
     "code_search",
