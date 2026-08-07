@@ -30,6 +30,7 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any
 
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.store import CodeIntelStore, IndexSnapshot
 
 __all__ = ["FileGraph", "open_file_graph"]
@@ -237,8 +238,13 @@ class FileGraph:
         ``unresolved_edges`` is the honest caveat: a small answer may mean a
         small dependency footprint or an unresolved one, and only this number
         tells them apart.
+
+        Every operation here enumerates rather than ranks -- the import graph is
+        walked exhaustively and only the *returned list* is ever cut -- so the
+        objective is stamped once, for all five.
         """
         return {
+            "objective": OBJECTIVE_EXHAUSTIVE,
             "analyzed_files": len(self._files),
             "resolved_edges": self._edges.resolved,
             "unresolved_edges": self._edges.unresolved,
@@ -268,8 +274,16 @@ class FileGraph:
 
     # -- operations --------------------------------------------------------
 
-    def blast_radius(self, path: str) -> dict[str, Any]:
-        """Reverse-import transitive closure of *path*, plus affected tests."""
+    def blast_radius(self, path: str, limit: int = 100) -> dict[str, Any]:
+        """Reverse-import transitive closure of *path*, plus affected tests.
+
+        Bounded, per list. It used to return every importer inline -- 390 paths
+        for a well-connected module -- which drowns a planning agent and hands a
+        reviewer a blob it cannot audit. The *counts* are always exact and
+        computed before the cut, so truncation costs detail and never changes
+        the answer to "how big is this change". ``risk_level`` is derived from
+        the full closure for the same reason.
+        """
         target = self._normalise(path)
         direct = sorted(self._edges.reverse.get(target, set()))
 
@@ -284,14 +298,19 @@ class FileGraph:
 
         transitive = sorted(seen - set(direct))
         affected_tests = sorted(candidate for candidate in seen if _is_test_path(candidate))
+        cap = max(int(limit), 0)
         result = self._envelope()
         result.update(
             {
                 "modified_file": target,
                 "indexed": target in self._files,
-                "direct_importers": direct,
-                "transitive_importers": transitive,
-                "affected_tests": affected_tests,
+                "direct_importer_count": len(direct),
+                "direct_importers": direct[:cap],
+                "transitive_importer_count": len(transitive),
+                "transitive_importers": transitive[:cap],
+                "affected_test_count": len(affected_tests),
+                "affected_tests": affected_tests[:cap],
+                "truncated": max(len(direct), len(transitive), len(affected_tests)) > cap,
                 "risk_level": _risk_for(len(seen)),
             }
         )

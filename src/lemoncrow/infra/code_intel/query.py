@@ -31,6 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.store import CodeIntelStore
 
 __all__ = [
@@ -239,6 +240,10 @@ class QueryResult:
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
+            # A filter, not a ranker. `order_by=centrality` sorts what matched;
+            # it does not decide what matched, and `scanned` / `scan_capped`
+            # bound the claim.
+            "objective": OBJECTIVE_EXHAUSTIVE,
             "select": self.select,
             "where": self.where,
             "order_by": self.order_by,

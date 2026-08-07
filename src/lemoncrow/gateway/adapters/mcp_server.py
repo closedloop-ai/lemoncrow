@@ -154,6 +154,7 @@ from lemoncrow.gateway.adapters.mcp.tools_commodity import (  # noqa: F401  (reg
     tool_web_fetch,
 )
 from lemoncrow.gateway.adapters.mcp_branding import icon_metadata
+from lemoncrow.infra.code_intel.completeness import CODE_OP_OBJECTIVES, OBJECTIVE_RANKED
 from lemoncrow.infra.code_intel.freshness import (  # noqa: F401  (IndexRebuilding re-exported for handlers/tests)
     FRESHNESS_REBUILT,
     IndexRebuilding,
@@ -284,8 +285,27 @@ _CORE_MCP_TOOLS = frozenset(
         "tool",
         "verify",
         "web_fetch",
+        # F3: turns "I searched and found nothing" from a claim into a checkable
+        # fact. Cheap, and no other tool in the core set can audit a negative.
+        "code_coverage_check",
     }
 )
+
+# Tools the shadowed ``core/environment.py`` hides that we advertise anyway.
+#
+# `relations` is the only *enumerative* symbol tool. Hidden, an agent under the
+# core profile sees exactly one code-intel tool -- `code_search` -- which ranks;
+# it then reads a ranked top-N as the complete caller set and is wrong. Measured
+# in production: `merge_telemetry` has seven call sites, `code_search` returned
+# the one that mattered most, and the review built on it was incomplete.
+#
+# `code_changes` does not close this gap. A builder about to edit a symbol has a
+# symbol, not a diff -- it would have to make the edit first and then ask what
+# broke, which is backwards.
+#
+# HIDDEN_LLM_TOOLS lives in a module that resolves from a compiled `.so` when an
+# engine is vendored, so the override belongs here, in live source.
+_FORCE_VISIBLE_TOOLS: frozenset[str] = frozenset({"relations"})
 
 # --------------------------------------------------------------------------- #
 # Tool Registry Decorator                                                     #
@@ -313,6 +333,8 @@ def _tool_description(spec: dict[str, Any]) -> str:
 
 
 def _tool_visible_to_llm(tool_name: str, spec: dict[str, Any]) -> bool:
+    if tool_name in _FORCE_VISIBLE_TOOLS:
+        return True
     return mcp_tool_visible_to_llm(tool_name)
 
 
@@ -333,14 +355,22 @@ def _tool_advertised_now(tool_name: str, spec: dict[str, Any]) -> bool:
 
     The single predicate behind both the tools/list build and the broker's
     "already exposed" guard. Membership in ``_CORE_MCP_TOOLS`` is NOT the same
-    question: `relations` and `grep` are in both ``_CORE_MCP_TOOLS`` and
-    ``HIDDEN_LLM_TOOLS``, so they are never advertised under any profile.
+    question: `grep` is in ``_CORE_MCP_TOOLS`` and in ``HIDDEN_LLM_TOOLS``, so
+    it is never advertised under any profile. `relations` was in exactly that
+    position until ``_FORCE_VISIBLE_TOOLS`` lifted it -- see the note there for
+    why an enumerative symbol tool has to be visible.
     """
     return _tool_profile_exposes(tool_name) and _tool_visible_to_llm(tool_name, spec)
 
 
 def _tool_mode(spec: dict[str, Any]) -> str:
-    return mcp_tool_mode(str(spec.get("name", "") or ""))
+    name = str(spec.get("name", "") or "")
+    if name in _FORCE_VISIBLE_TOOLS:
+        # Visibility and mode are two views of one fact. Overriding only the
+        # first would let /mcp/status report a tool as advertised *and* hidden,
+        # which is not a state anything downstream knows how to read.
+        return "active"
+    return mcp_tool_mode(name)
 
 
 # _COERCE_UNCHANGED, the argument-coercion helpers, _ToolArgumentError and the
@@ -8549,6 +8579,13 @@ def _maybe_attach_code_rendered(op: str, payload: dict[str, Any], *, render_comp
                 "Run `lc code index` (or `lc project init`) to bootstrap the index."
             )
 
+    # Say whether this op ranked or enumerated. Without it a consumer has to
+    # infer completeness from the tool name it happened to call, and a ranked
+    # top-N read as a complete set is how a confident wrong finding gets filed.
+    objective = CODE_OP_OBJECTIVES.get(op)
+    if objective is not None:
+        result.setdefault("objective", objective)
+
     return result
 
 
@@ -8871,6 +8908,9 @@ def _op_graph(
         engine = _code_engine_at(repo_root)
         result = cast(dict[str, Any], engine.call_graph_centrality(limit=limit))
         result["kind"] = "centrality"
+        # Top-N by score: the ordering is the answer, so this is not the
+        # complete set of central symbols and must not read as one.
+        result.setdefault("objective", OBJECTIVE_RANKED)
         if synthesize and paths:
             result["synthesized_edges"] = _synthesize_edges_for_paths(paths)
         return _finish_code_result(result)
@@ -8885,7 +8925,7 @@ def _op_graph(
         if kind == "blast_radius":
             if not path:
                 raise ValueError("path is required for kind='blast_radius'")
-            result = graph.blast_radius(path)
+            result = graph.blast_radius(path, limit=limit)
         elif kind == "dead_code":
             result = graph.dead_code(limit=limit, paths=paths)
         elif kind == "cycles":

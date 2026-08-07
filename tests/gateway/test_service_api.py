@@ -205,7 +205,13 @@ def test_mcp_status_matches_non_dev_tool_visibility(store: StoreBundle, monkeypa
     tools = route.endpoint()
 
     names = {tool["tool_name"] for tool in tools}
-    assert not (names & HIDDEN_LLM_TOOLS)
+    # `relations` is hidden by HIDDEN_LLM_TOOLS and advertised anyway, through
+    # the live-source override -- it is the only enumerative symbol tool, and an
+    # agent cannot route to a tool it cannot see. Assert the leak set equals
+    # that override exactly, so an unintended leak still fails.
+    from lemoncrow.gateway.adapters.mcp_server import _FORCE_VISIBLE_TOOLS
+
+    assert names & HIDDEN_LLM_TOOLS == set(_FORCE_VISIBLE_TOOLS)
     assert {tool["tool_name"] for tool in tools if tool["mode"] == "active"} == names
     assert not {tool["tool_name"] for tool in tools if tool["mode"] == "passive"}
     assert "read" in names

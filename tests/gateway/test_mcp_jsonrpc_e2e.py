@@ -42,6 +42,8 @@ EXPECTED_TOOLS = {
     "code_changes",
     # F5 -- whitelisted predicate queries over the index.
     "code_query",
+    # The one enumerative symbol tool -- advertised so an agent can route to it.
+    "relations",
     "read",
     "edit",
     "code_search",

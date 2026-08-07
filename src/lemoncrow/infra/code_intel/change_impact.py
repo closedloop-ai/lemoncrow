@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.store import CodeIntelStore, SymbolRow
 
 __all__ = [
@@ -197,6 +198,10 @@ class ChangeImpactReport:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            # Name-keyed matching over-reports and never misses, so the caller
+            # list is a superset of the truth -- exhaustive in the sense that
+            # matters for impact analysis.
+            "objective": OBJECTIVE_EXHAUSTIVE,
             "repo_root": self.repo_root,
             "base_ref": self.base_ref,
             "diff_ref": self.diff_ref,

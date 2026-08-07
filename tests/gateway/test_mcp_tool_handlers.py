@@ -33,14 +33,18 @@ from tests.helpers import grant_oauth_pro, init_store_at
 
 # Single-primary retrieval surface: `explore` (ranked source + call-graph
 # relations + blast-radius in one call) + `read`, plus edit/bash/web_fetch.
-# `grep`, `relations`, `search`, `memory`, `sql`, `codemod` are registered but
-# hidden from agents (grep/relations stay callable as escape hatch / drill-in).
+# `grep`, `search`, `memory`, `sql`, `codemod` are registered but hidden from
+# agents (grep stays callable as an escape hatch through the broker).
 EXPECTED_TOOLS = {
     "read",
     "edit",
     "code_search",
     "bash",
     "web_fetch",
+    # The one enumerative symbol tool. `code_search` ranks; a ranked top-N read
+    # as a complete caller set is how a confident wrong finding gets filed, and
+    # an agent cannot route to a tool it cannot see. See _FORCE_VISIBLE_TOOLS.
+    "relations",
     # F3: tells an empty search result apart from an unindexed file. Advertised
     # rather than hidden because a caller has to know it exists to audit a
     # negative result -- the whole point of it.
@@ -237,7 +241,11 @@ def test_tools_list_hides_internal_tools(
     tools = resp["result"]["tools"]
     names = {tool["name"] for tool in tools}
     assert names == EXPECTED_TOOLS
-    assert not (names & HIDDEN_LLM_TOOLS)
+    # HIDDEN_LLM_TOOLS lives in a module that resolves from a compiled .so when
+    # an engine is vendored, so a tool can only be un-hidden through the
+    # live-source override. Assert the leak set equals that override exactly --
+    # not that it is empty, and not merely that it is a subset.
+    assert names & HIDDEN_LLM_TOOLS == set(mcp_server._FORCE_VISIBLE_TOOLS)
     assert "read" in names
     assert all("passive" not in tool["description"] for tool in tools if tool["name"] in EXPECTED_TOOLS)
 
