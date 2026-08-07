@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import importlib
 import json
 import logging
 import os
@@ -8398,6 +8399,57 @@ def _code_repo_root(repo_root: str | None) -> Path:
     return (root if root.is_absolute() else _workspace_root() / root).resolve()
 
 
+# Every lazy `from lemoncrow.pro...` on the code path lands in one mypyc group
+# whose modules initialise one another. Two threads entering that group at
+# different points can each observe the other's half-built module and fail with
+# `AttributeError: module 'X' has no attribute 'Y'` -- a hard error on the first
+# cold call, from an import that then succeeds forever, which is why it reads as
+# a phantom. Two barrier-synchronised imports of `code_context` and
+# `scoped_context` in a fresh interpreter reproduce it 40 times out of 40.
+#
+# The daemon builds exactly that shape on its own: `_warm_stdio_code_index`
+# constructs the engine on a background thread while the first request is being
+# served on another, so the collision needs no unlucky client at all -- only a
+# request that arrives during startup.
+#
+# So the group is initialised once, by whichever thread gets there first, with
+# everyone else waiting on the lock. The fast path is a bool read and the warm
+# is idempotent, so steady-state cost is nil.
+_PRO_CODE_PATH_MODULES: tuple[str, ...] = (
+    "lemoncrow.pro.capabilities.code_context",
+    "lemoncrow.pro.capabilities.code_context.renderer",
+    "lemoncrow.pro.capabilities.code_context.workspace_router",
+    "lemoncrow.pro.capabilities.scoped_context",
+    "lemoncrow.pro.capabilities.lesson_promotion",
+    "lemoncrow.pro.capabilities.tool_supervision.tool_output_spill",
+)
+_pro_import_lock: threading.RLock = threading.RLock()
+_pro_modules_warmed = False
+
+
+def _warm_pro_code_modules() -> None:
+    """Initialise the pro code-path modules once, on a single thread.
+
+    Re-entrant on purpose: these helpers call one another, and a plain lock
+    would deadlock the first thread against itself.
+    """
+    global _pro_modules_warmed
+    if _pro_modules_warmed:
+        return
+    with _pro_import_lock:
+        if _pro_modules_warmed:
+            return
+        for name in _PRO_CODE_PATH_MODULES:
+            try:
+                importlib.import_module(name)
+            except Exception:
+                # Reporting a genuinely broken import is not this function's
+                # job -- the caller's own import raises it with the right
+                # context a moment later. Swallowing costs only the warm.
+                _log.debug("pro warm: %s did not import", name, exc_info=True)
+        _pro_modules_warmed = True
+
+
 def _code_context_engine(repo_root: str = ".") -> Any:
     """The process-cached engine for *repo_root*, rebuilt when the index moves.
 
@@ -8407,6 +8459,7 @@ def _code_context_engine(repo_root: str = ".") -> Any:
     acts on it with full confidence. An exception it can catch is strictly
     better than a wrong answer delivered as a right one.
     """
+    _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
     workspace = str(_workspace_root())
@@ -8431,6 +8484,7 @@ def _scoped_context_capability(repo_root: str = ".") -> Any:
     it under the lock is what allowed a self-deadlock when the engine path also
     reached for the same non-reentrant lock.
     """
+    _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.scoped_context import ScopedContextCapability
 
     workspace = str(_workspace_root())
@@ -8451,6 +8505,7 @@ def _scoped_context_capability(repo_root: str = ".") -> Any:
 
 
 def _workspace_code_router(repo_root: str = ".") -> Any:
+    _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.code_context.workspace_router import WorkspaceCodeRouter
 
     workspace = str(_workspace_root())
@@ -8574,6 +8629,7 @@ def _strip_code_op_response(op: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 def _maybe_attach_code_rendered(op: str, payload: dict[str, Any], *, render_compact: bool) -> dict[str, Any]:
     # Render first so the markdown uses all original fields (e.g. repo_id for cache_status heading).
+    _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.code_context.renderer import render_code_payload
 
     rendered = render_code_payload(op, payload)
