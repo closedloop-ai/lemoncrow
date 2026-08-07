@@ -96,6 +96,10 @@ semantic = [
 parsers = [
     "tree-sitter-languages>=1.10; python_version < '3.13'",
 ]
+# Portable code-index archives (`lc code export` / `import`). zstd beats the
+# stdlib codecs on both ratio and speed; without it export/import still work and
+# fall back to lzma, so this is an accelerator, not a requirement.
+portable = ["zstandard>=0.22"]
 rename = ["rope>=0.23"]
 ortools = ["ortools>=9.10"]
 litellm = ["litellm>=1.83.14"]
