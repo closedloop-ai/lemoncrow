@@ -9582,6 +9582,36 @@ def tool_code_changes(
     ).to_dict()
 
 
+@mcp_tool(name="code_query")
+def tool_code_query(
+    select: str = "symbols",
+    where: dict[str, Any] | None = None,
+    order_by: str | None = None,
+    limit: int = 50,
+    describe: bool = False,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Filter the code index: symbols / callers / callees / importers / references.
+
+    `where` is flat: `{"kind": "function", "file_path_like": "src/%",
+    "name_regex": "^_"}`. Operator suffixes: `_like _regex _in _not _gt _gte
+    _lt _lte`. `order_by` is `name`, `centrality`, or `callers`. Pass
+    `describe=true` for the exact field whitelist. Unknown fields are rejected,
+    never ignored. No raw SQL.
+    """
+    from lemoncrow.infra.code_intel.query import code_query, describe_schema
+
+    if describe:
+        return describe_schema()
+    return code_query(
+        select=select,
+        where=where,
+        order_by=order_by,
+        limit=limit,
+        repo_root=_code_repo_root(repo_root),
+    ).to_dict()
+
+
 @mcp_tool(name="blame")
 def tool_blame(
     query: str | None = None,

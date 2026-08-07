@@ -49,6 +49,9 @@ EXPECTED_TOOLS = {
     # reason: a review that cannot ask what a change touches falls back to
     # reading the diff and stopping at the file boundary.
     "code_changes",
+    # F5: whitelisted predicate queries over the index. Advertised because it
+    # is the surface that replaces asking for raw SQL.
+    "code_query",
 }
 
 

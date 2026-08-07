@@ -40,6 +40,8 @@ EXPECTED_TOOLS = {
     "code_coverage_check",
     # F2 -- diff -> changed symbols -> impacted callers.
     "code_changes",
+    # F5 -- whitelisted predicate queries over the index.
+    "code_query",
     "read",
     "edit",
     "code_search",
