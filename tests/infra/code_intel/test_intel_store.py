@@ -88,6 +88,22 @@ def test_empty_index_raises_rather_than_returning_nothing(make_workspace: Worksp
         store.repo_id  # noqa: B018 -- property access is the call under test
 
 
+def test_empty_index_reads_as_empty_rather_than_failing(make_workspace: WorkspaceFactory) -> None:
+    """ "Nothing is indexed" is an answer; only asking for the repo id is an error."""
+    root = make_workspace(index_version=8)
+    with CodeIntelStore(root) as store:
+        assert store.repo_id_or_none() is None
+        assert store.files() == []
+        assert store.symbols() == []
+        assert store.imports() == []
+        assert store.symbol_counts_by_file() == {}
+        snapshot = store.snapshot()
+    assert snapshot.repo_id == ""
+    assert snapshot.files == 0
+    # The engine generation is still readable -- it does not depend on any rows.
+    assert snapshot.index_version == 8
+
+
 def test_files_accessor(make_workspace: WorkspaceFactory) -> None:
     root = _populated(make_workspace)
     with CodeIntelStore(root) as store:

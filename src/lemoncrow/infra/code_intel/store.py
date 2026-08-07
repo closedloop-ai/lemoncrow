@@ -271,9 +271,14 @@ class CodeIntelStore:
     def intel_available(self) -> bool:
         return self.intel is not None
 
-    @property
-    def repo_id(self) -> str:
-        """The single repo id this workspace's databases are keyed by."""
+    def repo_id_or_none(self) -> str | None:
+        """The repo id, or ``None`` when the databases exist but hold no rows.
+
+        An empty index is a legitimate state -- a fresh workspace, or one whose
+        index was just dropped -- and the accessors below degrade to empty
+        rather than raising, so a caller can still report "nothing is indexed"
+        instead of failing.
+        """
         cached = self._repo_id
         if cached is not None:
             return cached
@@ -281,20 +286,35 @@ class CodeIntelStore:
         if row is None:
             row = self.code.execute("SELECT repo_id FROM symbols LIMIT 1").fetchone()
         if row is None:
+            return None
+        resolved = str(row["repo_id"])
+        self._repo_id = resolved
+        return resolved
+
+    @property
+    def repo_id(self) -> str:
+        """The single repo id this workspace's databases are keyed by.
+
+        Raises when the index is empty; use :meth:`repo_id_or_none` to treat
+        that as data rather than an error.
+        """
+        resolved = self.repo_id_or_none()
+        if resolved is None:
             raise CodeIntelUnavailable(
                 f"{workspace_dir(self.repo_root) / CODE_CONTEXT_DB} has no indexed files (empty index)"
             )
-        resolved = str(row["repo_id"])
-        self._repo_id = resolved
         return resolved
 
     # -- code_context accessors -------------------------------------------
 
     def files(self, paths: list[str] | None = None) -> list[FileRow]:
+        repo_id = self.repo_id_or_none()
+        if repo_id is None:
+            return []
         sql = (
             "SELECT file_path, language, content_hash, size_bytes, mtime_ns, indexed_at " "FROM files WHERE repo_id = ?"
         )
-        params: list[object] = [self.repo_id]
+        params: list[object] = [repo_id]
         if paths is not None:
             if not paths:
                 return []
@@ -318,12 +338,15 @@ class CodeIntelStore:
         kind: str | None = None,
         limit: int | None = None,
     ) -> list[SymbolRow]:
+        repo_id = self.repo_id_or_none()
+        if repo_id is None:
+            return []
         sql = (
             "SELECT symbol_id, file_path, language, symbol_name, qualified_name, kind, signature, "
             "start_byte, end_byte, start_line, end_line, parent_symbol, content_hash "
             "FROM symbols WHERE repo_id = ?"
         )
-        params: list[object] = [self.repo_id]
+        params: list[object] = [repo_id]
         if file_path is not None:
             sql += " AND file_path = ?"
             params.append(file_path)
@@ -355,13 +378,19 @@ class CodeIntelStore:
 
     def symbol_counts_by_file(self) -> dict[str, int]:
         """``file_path -> symbol count``. A file with zero symbols is absent here."""
+        repo_id = self.repo_id_or_none()
+        if repo_id is None:
+            return {}
         rows = self.code.execute(
             "SELECT file_path, COUNT(*) AS n FROM symbols WHERE repo_id = ? GROUP BY file_path",
-            (self.repo_id,),
+            (repo_id,),
         )
         return {str(row["file_path"]): int(row["n"]) for row in rows}
 
     def imports(self, resolved_only: bool = False) -> list[ImportRow]:
+        repo_id = self.repo_id_or_none()
+        if repo_id is None:
+            return []
         sql = "SELECT source_file, raw_import, target_file FROM imports WHERE repo_id = ?"
         if resolved_only:
             sql += " AND target_file IS NOT NULL"
@@ -371,7 +400,7 @@ class CodeIntelStore:
                 raw_import=str(row["raw_import"]),
                 target_file=_opt_str(row["target_file"]),
             )
-            for row in self.code.execute(sql, (self.repo_id,))
+            for row in self.code.execute(sql, (repo_id,))
         ]
 
     # -- intel accessors ---------------------------------------------------
@@ -383,14 +412,15 @@ class CodeIntelStore:
         limit: int | None = None,
     ) -> list[CallEdgeRow]:
         conn = self.intel
-        if conn is None:
+        repo_id = self.repo_id_or_none()
+        if conn is None or repo_id is None:
             return []
         sql = (
             "SELECT caller_symbol_name, caller_qualified_name, caller_file_path, caller_start_line, "
             "caller_end_line, callee_name, callee_short_name, call_line, call_column "
             "FROM call_edges WHERE repo_id = ?"
         )
-        params: list[object] = [self.repo_id]
+        params: list[object] = [repo_id]
         if callee_name is not None:
             sql += " AND (callee_name = ? OR callee_short_name = ?)"
             params.extend((callee_name, callee_name))
@@ -422,13 +452,14 @@ class CodeIntelStore:
         limit: int | None = None,
     ) -> list[ReferenceRow]:
         conn = self.intel
-        if conn is None:
+        repo_id = self.repo_id_or_none()
+        if conn is None or repo_id is None:
             return []
         sql = (
             "SELECT symbol_name, file_path, line, column, end_column, enclosing_symbol_name, "
             'enclosing_qualified_name, snippet FROM "references" WHERE repo_id = ?'
         )
-        params: list[object] = [self.repo_id]
+        params: list[object] = [repo_id]
         if symbol_name is not None:
             sql += " AND symbol_name = ?"
             params.append(symbol_name)
@@ -454,10 +485,11 @@ class CodeIntelStore:
 
     def centrality(self, limit: int | None = None) -> list[CentralityRow]:
         conn = self.intel
-        if conn is None:
+        repo_id = self.repo_id_or_none()
+        if conn is None or repo_id is None:
             return []
         sql = "SELECT name_key, score, index_version FROM centrality_map WHERE repo_id = ? ORDER BY score DESC"
-        params: list[object] = [self.repo_id]
+        params: list[object] = [repo_id]
         if limit is not None:
             sql += " LIMIT ?"
             params.append(int(limit))
@@ -482,28 +514,47 @@ class CodeIntelStore:
             return default
 
     def snapshot(self) -> IndexSnapshot:
-        """Row counts plus the engine generation they were read at."""
+        """Row counts plus the engine generation they were read at.
+
+        An empty index yields zero counts and an empty ``repo_id`` rather than
+        raising -- "nothing is indexed" is an answer, not a failure.
+        """
+        repo_id = self.repo_id_or_none()
+        conn = self.intel
+        if repo_id is None:
+            return IndexSnapshot(
+                repo_id="",
+                index_version=self.engine_state("index_version"),
+                indexer_semantics_version=self.engine_state("indexer_semantics_version"),
+                files=0,
+                symbols=0,
+                imports=0,
+                imports_resolved=0,
+                intel_available=conn is not None,
+                call_edges=0,
+                references=0,
+                centrality=0,
+            )
         counts = self.code.execute(
             "SELECT (SELECT COUNT(*) FROM files WHERE repo_id = ?1) AS files, "
             "(SELECT COUNT(*) FROM symbols WHERE repo_id = ?1) AS symbols, "
             "(SELECT COUNT(*) FROM imports WHERE repo_id = ?1) AS imports, "
             "(SELECT COUNT(*) FROM imports WHERE repo_id = ?1 AND target_file IS NOT NULL) AS resolved",
-            (self.repo_id,),
+            (repo_id,),
         ).fetchone()
-        conn = self.intel
         call_edges = references = centrality = 0
         if conn is not None:
             intel_counts = conn.execute(
                 "SELECT (SELECT COUNT(*) FROM call_edges WHERE repo_id = ?1) AS call_edges, "
                 '(SELECT COUNT(*) FROM "references" WHERE repo_id = ?1) AS refs, '
                 "(SELECT COUNT(*) FROM centrality_map WHERE repo_id = ?1) AS centrality",
-                (self.repo_id,),
+                (repo_id,),
             ).fetchone()
             call_edges = int(intel_counts["call_edges"])
             references = int(intel_counts["refs"])
             centrality = int(intel_counts["centrality"])
         return IndexSnapshot(
-            repo_id=self.repo_id,
+            repo_id=repo_id,
             index_version=self.engine_state("index_version"),
             indexer_semantics_version=self.engine_state("indexer_semantics_version"),
             files=int(counts["files"]),

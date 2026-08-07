@@ -8333,6 +8333,16 @@ _scoped_context_cache: dict[str, Any] = {}
 _scoped_context_cache_lock: threading.Lock = threading.Lock()
 
 
+def _code_repo_root(repo_root: str | None) -> Path:
+    """Resolve a caller-supplied repo root the way the code engine does.
+
+    A relative root is taken against the active workspace, not the process cwd,
+    so open code-intel modules address the same repo the engine indexed.
+    """
+    root = Path(repo_root or ".")
+    return (root if root.is_absolute() else _workspace_root() / root).resolve()
+
+
 def _code_context_engine(repo_root: str = ".") -> Any:
     from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
@@ -9491,6 +9501,22 @@ def tool_index(
         repo_root=repo_root,
         render_compact=render_compact,
     )
+
+
+@mcp_tool(name="code_coverage_check")
+def tool_code_coverage_check(
+    paths: list[str] | None = None,
+    repo_root: str | None = None,
+) -> dict[str, Any]:
+    """Index state of paths: indexed / stale / missing / excluded / unparsed.
+
+    Tells an empty search result apart from an unindexed file. Omit `paths` for
+    the whole repo. Every response carries the engine `index_version` it was
+    judged against, and `exclusion_source` names the ignore rules applied.
+    """
+    from lemoncrow.infra.code_intel.coverage import check_coverage
+
+    return check_coverage(paths=paths, repo_root=_code_repo_root(repo_root)).to_dict()
 
 
 @mcp_tool(name="blame")

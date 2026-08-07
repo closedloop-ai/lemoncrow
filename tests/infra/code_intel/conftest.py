@@ -162,6 +162,19 @@ def _insert(conn: sqlite3.Connection, table: str, columns: tuple[str, ...], rows
 
 WorkspaceFactory = Callable[..., Path]
 
+#: The repo root :func:`make_workspace` builds into by default. Exposed as its
+#: own fixture so a test can write real files to disk *before* recording them in
+#: the index -- the order coverage tests need, since a faithful ``files`` row
+#: carries the on-disk hash, size, and mtime.
+DEFAULT_WORKSPACE_NAME = "repo"
+
+
+@pytest.fixture
+def workspace_root(tmp_path: Path) -> Path:
+    root = tmp_path / DEFAULT_WORKSPACE_NAME
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
 
 @pytest.fixture
 def make_workspace(tmp_path: Path) -> WorkspaceFactory:
@@ -182,7 +195,7 @@ def make_workspace(tmp_path: Path) -> WorkspaceFactory:
         indexer_semantics_version: int = 2,
         repo_id: str = REPO_ID,
         with_intel: bool = True,
-        name: str = "repo",
+        name: str = DEFAULT_WORKSPACE_NAME,
     ) -> Path:
         from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, INTEL_DB, workspace_dir
 
