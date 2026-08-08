@@ -25,6 +25,13 @@ instead of inferring completeness from which tool it happened to call. That is
 exactly the difference between a reviewer being able to skip a grep replay and
 having to guess.
 
+**One field stays authoritative.** A surface that answers from stored results
+rather than live ones can be complete about a subject it only partly examined,
+and ``truncated`` cannot express that -- it speaks to the returned list, not to
+what was looked at. Rather than adding a second thing every consumer must
+remember to check, such a response reports :data:`OBJECTIVE_PARTIAL` and fails
+the existing predicate on its own. ``coverage`` then says *how* partial.
+
 An op absent from :data:`CODE_OP_OBJECTIVES` carries no ``objective`` field.
 That is deliberate: the closed engine owns those code paths, and asserting an
 objective we have not verified would manufacture the false confidence this
@@ -68,7 +75,9 @@ __all__ = [
     "MATCH_NAME",
     "MATCH_RESOLVED",
     "OBJECTIVE_EXHAUSTIVE",
+    "OBJECTIVE_PARTIAL",
     "OBJECTIVE_RANKED",
+    "objective_for_coverage",
     "with_match_kind",
     "with_objective",
 ]
@@ -78,6 +87,23 @@ OBJECTIVE_RANKED = "ranked"
 
 #: Everything matching, up to a stated limit, with an exact pre-limit count.
 OBJECTIVE_EXHAUSTIVE = "exhaustive"
+
+#: Exhaustive over what was examined -- but what was examined is not everything.
+#:
+#: Only derived surfaces can be in this state. They answer from stored results,
+#: so the question "was the whole subject looked at" is separate from "was the
+#: whole answer returned", and ``truncated`` only ever spoke to the second.
+#:
+#: This exists because the gap was reachable. A clone query against a table
+#: whose every row had been superseded returned ``count: 0`` with
+#: ``objective: "exhaustive"`` and ``truncated: false`` -- passing the
+#: completeness predicate while reporting that code has no duplicates, on the
+#: strength of an answer where nothing current had been examined. The coverage
+#: number said so, but the contract does not require reading it, and a
+#: consumer honouring the documented predicate got a false negative. So the
+#: field the contract *does* make authoritative carries it: below full
+#: coverage the objective is no longer exhaustive.
+OBJECTIVE_PARTIAL = "partial"
 
 #: Engine-backed ``code`` ops we have evidence for. ``pattern`` and ``node`` are
 #: deliberately absent -- their extraction lives in the closed engine and has
@@ -111,6 +137,28 @@ CODE_OP_MATCH_KINDS: dict[str, str] = {
     "callees": MATCH_NAME,
     "usages": MATCH_NAME,
 }
+
+
+def objective_for_coverage(coverage: float | None, superseded: int | None = None) -> str:
+    """The objective a stored-result surface may claim about this answer.
+
+    ``coverage is None`` means the surface reads live data, where the question
+    does not arise. Otherwise the answer is :data:`OBJECTIVE_PARTIAL` when
+    either the subject was not fully examined (*coverage* below 1.0) or some
+    stored rows were dropped as superseded.
+
+    Both conditions are checked rather than one inferred from the other. In
+    practice they move together -- a row is superseded because its symbol's
+    content changed, which is the same fact that lowers coverage -- but
+    "rows were discarded" and "the subject was under-examined" are separate
+    claims, and an answer that quietly lost rows is not exhaustive whatever the
+    coverage figure says.
+    """
+    if coverage is None:
+        return OBJECTIVE_EXHAUSTIVE
+    if coverage < 1.0 or (superseded or 0) > 0:
+        return OBJECTIVE_PARTIAL
+    return OBJECTIVE_EXHAUSTIVE
 
 
 def with_objective(payload: dict[str, Any], objective: str) -> dict[str, Any]:

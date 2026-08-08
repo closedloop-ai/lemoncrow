@@ -45,6 +45,49 @@ def test_ranked_and_exhaustive_are_distinct_values() -> None:
     assert OBJECTIVE_RANKED != OBJECTIVE_EXHAUSTIVE
 
 
+def test_partial_is_a_third_value_and_fails_the_predicate() -> None:
+    """Consumers gate on `== "exhaustive"`, so a new value fails them by default.
+
+    That is the property that makes adding it safe: nobody has to be told.
+    """
+    from lemoncrow.infra.code_intel.completeness import OBJECTIVE_PARTIAL
+
+    assert OBJECTIVE_PARTIAL not in {OBJECTIVE_RANKED, OBJECTIVE_EXHAUSTIVE}
+    assert OBJECTIVE_PARTIAL != OBJECTIVE_EXHAUSTIVE
+
+
+@pytest.mark.parametrize(
+    ("coverage", "expected"),
+    [
+        (None, "exhaustive"),
+        (1.0, "exhaustive"),
+        (0.9998, "partial"),
+        (0.5, "partial"),
+        (0.0, "partial"),
+    ],
+)
+def test_objective_for_coverage(coverage: float | None, expected: str) -> None:
+    """`None` means the surface reads live data, where the question does not arise."""
+    from lemoncrow.infra.code_intel.completeness import objective_for_coverage
+
+    assert objective_for_coverage(coverage) == expected
+
+
+def test_discarded_rows_downgrade_even_at_full_coverage() -> None:
+    """"Rows were dropped" and "the subject was under-examined" are two claims.
+
+    They normally move together, since a row is superseded because its symbol's
+    content changed -- the same fact that lowers coverage. Checking only one left
+    a representable state where an answer had quietly lost rows and still called
+    itself exhaustive.
+    """
+    from lemoncrow.infra.code_intel.completeness import objective_for_coverage
+
+    assert objective_for_coverage(1.0, 0) == "exhaustive"
+    assert objective_for_coverage(1.0, 3) == "partial"
+    assert objective_for_coverage(None, 3) == "exhaustive", "live surfaces have no stored rows"
+
+
 def test_with_objective_stamps_in_place() -> None:
     payload: dict[str, object] = {"rows": []}
     assert with_objective(payload, OBJECTIVE_EXHAUSTIVE) is payload

@@ -9736,18 +9736,28 @@ def tool_code_query(
     describe: bool = False,
     repo_root: str | None = None,
 ) -> dict[str, Any]:
-    """Filter the code index: symbols / callers / callees / importers / references.
+    """Filter the code index: symbols / callers / callees / importers / references / clones.
 
     `where` is flat: `{"kind": "function", "file_path_like": "src/%",
     "name_regex": "^_"}`. Operator suffixes: `_like _regex _in _not _gt _gte
     _lt _lte`. `order_by` is `name`, `centrality`, or `callers`. Pass
     `describe=true` for the exact field whitelist. Unknown fields are rejected,
-    never ignored. No raw SQL.
+    never ignored. No raw SQL. `select="clones"` needs `lc code clones` to have
+    been run and errors rather than returning nothing if it has not; it excludes
+    markdown/text pairs unless you pass `prose` or a `language_*` predicate, and
+    reports `coverage` for reading an absence.
     """
     from lemoncrow.infra.code_intel.query import code_query, describe_schema
 
     if describe:
         return describe_schema()
+    # ClonesStale propagates deliberately. It reports server-side state -- the
+    # table was never built, or the engine reindexed past it -- not a malformed
+    # argument, so wrapping it in _ToolArgumentError put it on the JSON-RPC
+    # -32602 protocol-fault path while IndexRebuilding, the same kind of
+    # not-ready condition, falls through to the generic handler and returns as an
+    # ordinary isError tool failure. Two contracts for one class of failure is
+    # worse than either contract.
     return code_query(
         select=select,
         where=where,
