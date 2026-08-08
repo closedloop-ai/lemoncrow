@@ -45,7 +45,7 @@ from lemoncrow.infra.code_intel.clones import (
     open_clone_table,
     signature_coverage,
 )
-from lemoncrow.infra.code_intel.completeness import MATCH_NAME, OBJECTIVE_EXHAUSTIVE
+from lemoncrow.infra.code_intel.completeness import MATCH_NAME, objective_for_coverage
 from lemoncrow.infra.code_intel.store import CodeIntelStore
 
 __all__ = [
@@ -321,7 +321,15 @@ class QueryResult:
             # A filter, not a ranker. `order_by=centrality` sorts what matched;
             # it does not decide what matched, and `scanned` / `scan_capped`
             # bound the claim.
-            "objective": OBJECTIVE_EXHAUSTIVE,
+            #
+            # Downgraded below full coverage rather than left at "exhaustive".
+            # A sidecar-backed select answers from stored results, so it can be
+            # complete about a subject it only partly examined -- and a fully
+            # superseded clone table returned `count: 0`, `truncated: false`,
+            # `objective: "exhaustive"`, which passes the completeness predicate
+            # while asserting this code has no duplicates. `coverage` said
+            # otherwise, but the contract does not oblige anyone to read it.
+            "objective": objective_for_coverage(self.coverage),
             "select": self.select,
             "where": self.where,
             "order_by": self.order_by,

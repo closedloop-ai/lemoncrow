@@ -954,6 +954,69 @@ def test_rows_carry_the_language_of_each_side(prose_repo: Path) -> None:
     assert row["language_b"] == "python"
 
 
+# --------------------------------------------------------------------------- #
+# The completeness predicate                                                   #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_fully_superseded_table_does_not_pass_the_completeness_predicate(
+    clone_repo: Path,
+) -> None:
+    """The false negative this whole subsystem exists to prevent.
+
+    Letting stale reads serve fixed a usability blocker and opened this: with
+    every row superseded the response was `count: 0`, `truncated: false`,
+    `objective: "exhaustive"` -- which passes `exhaustive and not truncated` and
+    therefore reads as "searched exhaustively, this code has no duplicates",
+    when in truth nothing current had been examined at all.
+    """
+    from lemoncrow.infra.code_intel.completeness import OBJECTIVE_PARTIAL
+
+    build_clones(clone_repo)
+    for symbol_id in (
+        "src/a.py::compute_average",
+        "src/b.py::compute_average_copy",
+        "src/b.py::compute_mean",
+        "src/b.py::fetch_payload",
+    ):
+        _set_content_hash(clone_repo, symbol_id, f"moved-{symbol_id}")
+
+    payload = code_query(select="clones", repo_root=clone_repo).to_dict()
+
+    assert payload["count"] == 0
+    assert payload["coverage"] == 0.0
+    assert payload["objective"] == OBJECTIVE_PARTIAL
+    assert not (payload["objective"] == "exhaustive" and not payload["truncated"])
+
+
+def test_partial_coverage_downgrades_the_objective(clone_repo: Path) -> None:
+    """One stale symbol is enough: an absent pair no longer proves anything."""
+    from lemoncrow.infra.code_intel.completeness import OBJECTIVE_PARTIAL
+
+    build_clones(clone_repo)
+    _set_content_hash(clone_repo, "src/b.py::fetch_payload", "moved")
+
+    payload = code_query(select="clones", repo_root=clone_repo).to_dict()
+    assert 0.0 < payload["coverage"] < 1.0
+    assert payload["objective"] == OBJECTIVE_PARTIAL
+
+
+def test_full_coverage_still_claims_exhaustive(clone_repo: Path) -> None:
+    build_clones(clone_repo)
+    payload = code_query(select="clones", repo_root=clone_repo).to_dict()
+
+    assert payload["coverage"] == 1.0
+    assert payload["objective"] == "exhaustive"
+
+
+def test_engine_backed_selects_are_unaffected(clone_repo: Path) -> None:
+    """They read the index live, so coverage does not arise and nothing changes."""
+    payload = code_query(select="symbols", repo_root=clone_repo).to_dict()
+
+    assert payload["objective"] == "exhaustive"
+    assert "coverage" not in payload
+
+
 def test_describe_schema_advertises_clones() -> None:
     from lemoncrow.infra.code_intel.query import describe_schema
 

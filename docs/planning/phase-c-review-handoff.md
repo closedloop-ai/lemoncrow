@@ -134,6 +134,19 @@ and were never examined, so absence proves nothing. Verification happens
 *before* `limit` is applied, so a stale top-scoring pair never eats a result
 slot.
 
+> **`objective` stays authoritative — you do not need a per-select patch.**
+> Letting stale reads serve opened a hole: with every row superseded the
+> response was `count: 0`, `truncated: false`, `objective: "exhaustive"`, which
+> passes the Phase B predicate and reads as "searched exhaustively, no
+> duplicates" when nothing current had been examined. A third objective value,
+> **`partial`**, now covers it: below full coverage the response reports
+> `objective: "partial"` and fails `exhaustive and not truncated` on its own.
+>
+> Gate A therefore stays `objective == "exhaustive" && truncated == false`.
+> `coverage` remains, and says *how* partial, but reading it is no longer
+> required for correctness. Engine-backed selects read live data, carry no
+> `coverage`, and are unchanged.
+
 `ClonesStale` propagates as an ordinary tool failure (`isError`), **not** as a
 JSON-RPC `-32602` argument fault — deliberately matching `IndexRebuilding`.
 
@@ -182,8 +195,13 @@ literals, truncating every click option and every URL in the repo.
 ## 4. Known limits — stated, not hidden
 
 - **The table is only as fresh as the last `lc code clones`.** No background
-  rebuild exists. Symbols changed since then are simply not covered, and
-  `coverage` says by how much — never silently served as complete.
+  rebuild exists. Symbols changed since then are simply not covered; the
+  response drops to `objective: "partial"` and `coverage` says by how much —
+  never silently served as complete.
+- **Reindex debounce is longer than 30s for a newly-created file.** Timing a
+  build against a fresh checkout, or against a file you just wrote, can see
+  `stale_symbols` and `engine_index_version` sit unchanged for a while. The
+  engine owns that cadence; it is not the clone table lagging.
 - **Raw pair counts are misleading.** ~1,860 pairs repo-wide, but most are
   outside `src/` and intentional: duplicated benchmark fixtures under
   `benchmarks/codebench/cg_tasks/`, the generated per-host `SKILL.md` set, docs
