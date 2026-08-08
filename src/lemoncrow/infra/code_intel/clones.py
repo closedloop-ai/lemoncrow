@@ -72,6 +72,7 @@ from lemoncrow.infra.code_intel.store import CodeIntelStore, SymbolRow
 __all__ = [
     "BANDS",
     "CLONES_TABLE",
+    "open_clone_table",
     "DEFAULT_THRESHOLD",
     "MIN_TOKENS",
     "NUM_PERM",
@@ -117,40 +118,45 @@ DEFAULT_THRESHOLD = 0.8
 if BANDS * ROWS_PER_BAND != NUM_PERM:  # pragma: no cover - guards a constant edit
     raise AssertionError(f"BANDS*ROWS_PER_BAND ({BANDS * ROWS_PER_BAND}) must equal NUM_PERM ({NUM_PERM})")
 
-# Comments and string bodies are stripped before tokenising. A docstring shared
-# by two otherwise-unrelated functions is not evidence that they are clones, and
-# a copied block whose comments were rewritten is still a copied block -- so both
-# directions of that error point the same way: drop the prose, keep the code.
-_COMMENT_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r"/\*.*?\*/", re.DOTALL),  # c-family block
-    re.compile(r"//[^\n]*"),  # c-family line
-    re.compile(r"#[^\n]*"),  # python / ruby / shell / yaml
-    re.compile(r"--[^\n]*"),  # sql / lua / haskell
+# One left-to-right scan, not a stack of substitutions. Alternation order is the
+# whole point: a docstring is recognised before a plain string, and a string
+# before a comment, so a comment marker *inside* a literal is consumed as part
+# of that literal instead of eating the rest of the line.
+#
+# Regression this shape exists to prevent. Comment patterns previously ran as
+# `re.sub` over raw text before tokenising, with no idea where strings were:
+#
+#     @click.option("--limit", type=int, help="Pairs to print.")
+#         -> ['@', ID, '.', ID, '(', '"']
+#     url = "https://api.example.com/v1/things"
+#         -> [ID, '=', '"', ID, ':']
+#
+# Every single-line click option and every URL literal in the repository was
+# truncated at its first `--` or `//`. That defeated the decision documented
+# above -- keeping string literals is what stops every `to_dict` scoring 1.000 --
+# because option strings are exactly the content distinguishing one CLI command
+# from another.
+#
+# `--` is deliberately absent as a comment marker. It serves only SQL, Lua and
+# Haskell, none of which dominate here, and it is a decrement operator in the
+# C-family languages that do -- so as a comment rule it destroys more real code
+# than it removes prose. SQL comments surviving as tokens is mild noise; a
+# truncated C-family line is a wrong answer.
+_SCANNER = re.compile(
+    r"(?P<doc>\"\"\".*?\"\"\"|'''.*?''')"
+    r"|(?P<string>\"(?:\\.|[^\"\\\n])*\"|'(?:\\.|[^'\\\n])*'|`(?:\\.|[^`\\\n])*`)"
+    r"|(?P<comment>/\*.*?\*/|//[^\n]*|\#[^\n]*)"
+    r"|(?P<word>[A-Za-z_][A-Za-z_0-9]*)"
+    r"|(?P<number>\d+(?:\.\d+)?)"
+    r"|(?P<punct>[^\sA-Za-z_0-9])",
+    re.DOTALL,
 )
 
-# Docstrings and block strings only. Short string literals are deliberately
-# *kept*, and that distinction is load-bearing: stripping every string made all
-# 2,968 top-scoring pairs on this repo boilerplate, because a `to_dict` method's
-# dict keys are its entire content, and with them gone every `to_dict` in the
-# codebase normalised to the same token stream. A docstring is prose about the
-# code; a string literal is data the code is built from.
-_DOCSTRING_PATTERNS: tuple[re.Pattern[str], ...] = (
-    re.compile(r'""".*?"""', re.DOTALL),
-    re.compile(r"'''.*?'''", re.DOTALL),
-)
-
-#: Quoted strings (whole, so content survives as one token), identifiers,
-#: numbers, and single punctuation characters. Whitespace is the separator and
-#: never a token, so reformatting alone cannot change a signature. Strings come
-#: first or their contents would tokenise as bare identifiers.
-_TOKEN = re.compile(
-    r'"(?:\\.|[^"\\\n])*"'
-    r"|'(?:\\.|[^'\\\n])*'"
-    r"|`(?:\\.|[^`\\\n])*`"
-    r"|[A-Za-z_][A-Za-z_0-9]*"
-    r"|\d+(?:\.\d+)?"
-    r"|[^\sA-Za-z_0-9]"
-)
+#: Scanner groups that are prose about the code rather than the code. A
+#: docstring shared by two unrelated functions is not evidence they are clones,
+#: and a copied block whose comments were rewritten is still a copied block --
+#: both directions of that error point the same way.
+_DISCARDED_GROUPS = frozenset({"doc", "comment"})
 
 #: Stands in for any identifier, and any numeric literal, respectively. Single
 #: control characters so they can never collide with a real token.
@@ -273,24 +279,21 @@ def normalise_tokens(source: str, *, rename_blind: bool = True) -> list[str]:
     getting it wrong in the strict direction would mean maintaining a per-language
     lexer beside the one the engine already owns.
     """
-    text = source
-    for pattern in _DOCSTRING_PATTERNS:
-        text = pattern.sub(" ", text)
-    for pattern in _COMMENT_PATTERNS:
-        text = pattern.sub(" ", text)
-    tokens = _TOKEN.findall(text)
-    if not rename_blind:
-        return tokens
-    return [_placeholder(token) for token in tokens]
-
-
-def _placeholder(token: str) -> str:
-    first = token[0]
-    if first.isdigit():
-        return LITERAL_PLACEHOLDER
-    if first.isalpha() or first == "_":
-        return token if token.lower() in _KEYWORDS else IDENTIFIER_PLACEHOLDER
-    return token
+    tokens: list[str] = []
+    for match in _SCANNER.finditer(source):
+        group = match.lastgroup or ""
+        if group in _DISCARDED_GROUPS:
+            continue
+        text = match.group()
+        if not rename_blind:
+            tokens.append(text)
+        elif group == "word":
+            tokens.append(text if text.lower() in _KEYWORDS else IDENTIFIER_PLACEHOLDER)
+        elif group == "number":
+            tokens.append(LITERAL_PLACEHOLDER)
+        else:
+            tokens.append(text)
+    return tokens
 
 
 def shingle(tokens: list[str], k: int = SHINGLE_K) -> set[bytes]:
@@ -357,6 +360,15 @@ def _read_symbol_sources(
     return tokens_by_symbol, unreadable
 
 
+def _encloses(a: SymbolRow, b: SymbolRow) -> bool:
+    """True when one symbol's byte range contains the other's in the same file."""
+    if a.file_path != b.file_path:
+        return False
+    return (a.start_byte <= b.start_byte and b.end_byte <= a.end_byte) or (
+        b.start_byte <= a.start_byte and a.end_byte <= b.end_byte
+    )
+
+
 def _candidate_pairs(signatures: dict[str, MinHash]) -> set[tuple[str, str]]:
     """Symbol pairs sharing at least one exact band, ordered so a pair appears once."""
     buckets: dict[tuple[int, tuple[int, ...]], list[str]] = defaultdict(list)
@@ -406,10 +418,20 @@ def build_clones(
     candidates = _candidate_pairs(signatures)
     pairs: list[ClonePair] = []
     for left, right in candidates:
+        row_a, row_b = by_id[left], by_id[right]
+        if _encloses(row_a, row_b):
+            # A class's byte range spans its methods, so a class whose body is
+            # one long method scores against that method and gets written to the
+            # table as a clone of itself. Observed on this repo:
+            # `HermesImporter` <-> `HermesImporter.import_all` at 0.953 and
+            # `LedgerReconstructor` <-> `LedgerReconstructor.reconstruct` at
+            # 0.961, both in the top eight results. Markdown sections nest the
+            # same way. Containment is the test rather than `parent_symbol`
+            # because it also catches grandchildren.
+            continue
         score = signatures[left].jaccard(signatures[right])
         if score < threshold:
             continue
-        row_a, row_b = by_id[left], by_id[right]
         pairs.append(
             ClonePair(
                 symbol_a=left,
@@ -475,6 +497,33 @@ def _persist(repo_root: Path, repo_id: str, report: CloneReport) -> None:
         conn.close()
 
 
+def open_clone_table(repo_root: Path | str, index_version: int) -> sqlite3.Connection:
+    """Open the sidecar for reading, or raise if the clone table cannot be trusted.
+
+    The single definition of what "stale" means for this table and how it is
+    worded. Both readers -- :func:`load_clones` and ``code_query``'s sidecar
+    branch -- call this, because two copies of the check meant two copies of the
+    message, each pinned by its own test, that had to be edited in lockstep.
+
+    The check runs before any row is read, so a superseded table cannot
+    contribute a single row to a result a caller might act on.
+    """
+    conn = open_sidecar(repo_root)
+    try:
+        recorded = stamp_of(conn, CLONES_TABLE)
+        if recorded is None:
+            raise ClonesStale("the clone table has never been built")
+        if is_stale(conn, CLONES_TABLE, index_version):
+            raise ClonesStale(
+                f"the clone table was built from index_version {recorded.engine_index_version}, "
+                f"the index is now at {index_version}"
+            )
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def load_clones(repo_root: Path | str = ".", limit: int = 50) -> tuple[ClonePair, ...]:
     """Read stored pairs, refusing a table that is absent or superseded.
 
@@ -487,16 +536,8 @@ def load_clones(repo_root: Path | str = ".", limit: int = 50) -> tuple[ClonePair
         engine_index_version = store.engine_state("index_version")
         repo_id = store.repo_id_or_none()
 
-    conn = open_sidecar(root)
+    conn = open_clone_table(root, engine_index_version)
     try:
-        recorded = stamp_of(conn, CLONES_TABLE)
-        if recorded is None:
-            raise ClonesStale("the clone table has never been built")
-        if is_stale(conn, CLONES_TABLE, engine_index_version):
-            raise ClonesStale(
-                f"the clone table was built from index_version {recorded.engine_index_version}, "
-                f"the index is now at {engine_index_version}"
-            )
         rows = conn.execute(
             "SELECT symbol_a, symbol_b, qualified_name_a, qualified_name_b, file_path_a, file_path_b, "
             "token_count_a, token_count_b, jaccard FROM symbol_clones WHERE repo_id = ? "

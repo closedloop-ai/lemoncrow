@@ -9745,25 +9745,24 @@ def tool_code_query(
     never ignored. No raw SQL. `select="clones"` needs `lc code clones` to have
     been run and errors rather than returning nothing if it has not.
     """
-    from lemoncrow.infra.code_intel.clones import ClonesStale
     from lemoncrow.infra.code_intel.query import code_query, describe_schema
 
     if describe:
         return describe_schema()
-    try:
-        return code_query(
-            select=select,
-            where=where,
-            order_by=order_by,
-            limit=limit,
-            repo_root=_code_repo_root(repo_root),
-        ).to_dict()
-    except ClonesStale as exc:
-        # Surfaced as an argument error so the model reads it as "your call could
-        # not be answered" rather than a transport failure. It is the same
-        # fail-loud contract IndexRebuilding uses: the empty list this replaces
-        # would have been read as "no duplicates found".
-        raise _ToolArgumentError(str(exc)) from exc
+    # ClonesStale propagates deliberately. It reports server-side state -- the
+    # table was never built, or the engine reindexed past it -- not a malformed
+    # argument, so wrapping it in _ToolArgumentError put it on the JSON-RPC
+    # -32602 protocol-fault path while IndexRebuilding, the same kind of
+    # not-ready condition, falls through to the generic handler and returns as an
+    # ordinary isError tool failure. Two contracts for one class of failure is
+    # worse than either contract.
+    return code_query(
+        select=select,
+        where=where,
+        order_by=order_by,
+        limit=limit,
+        repo_root=_code_repo_root(repo_root),
+    ).to_dict()
 
 
 @mcp_tool(name="blame")

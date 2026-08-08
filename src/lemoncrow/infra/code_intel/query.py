@@ -39,9 +39,8 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.infra.code_intel.clones import CLONES_TABLE, ClonesStale
+from lemoncrow.infra.code_intel.clones import ClonesStale, open_clone_table
 from lemoncrow.infra.code_intel.completeness import MATCH_NAME, OBJECTIVE_EXHAUSTIVE
-from lemoncrow.infra.code_intel.sidecar import is_stale, open_sidecar, stamp_of
 from lemoncrow.infra.code_intel.store import CodeIntelStore
 
 __all__ = [
@@ -104,6 +103,13 @@ class _Select:
     numeric: frozenset[str] = field(default_factory=frozenset)
     name_column: str = ""
     name_keyed: bool = False
+    #: SQL fragment used to order the scan when the caller names no `order_by`.
+    #: Defaults to `name_column`, which is right for row sources whose interest
+    #: is uniform. It is wrong for any source carrying a score: the scan is
+    #: capped at MAX_SCAN and the result at `limit`, so an alphabetical default
+    #: makes the highest-scoring rows unreachable. Whitelist-owned text, never
+    #: caller input.
+    default_order: str = ""
 
     @property
     def quoted_table(self) -> str:
@@ -258,6 +264,12 @@ _CLONES = _Select(
     },
     numeric=frozenset({"jaccard", "token_count_a", "token_count_b"}),
     name_column="qualified_name_a",
+    # The score is the reason this table exists. Ordering by name instead sent
+    # the default `limit=50` at the alphabetically-first of ~1,900 pairs and
+    # reported `truncated: true`, so the strongest clones were unreachable
+    # unless a caller already knew to pass `jaccard_gte` -- and `idx_symbol_
+    # clones_score` was an index built for an ordering nothing ever issued.
+    default_order="jaccard DESC, qualified_name_a, qualified_name_b",
 )
 
 SELECTS: dict[str, _Select] = {
@@ -452,26 +464,6 @@ def _caller_counts(store: CodeIntelStore) -> dict[str, int]:
     return counts
 
 
-def _open_sidecar_checked(repo_root: Path | str, index_version: int) -> sqlite3.Connection:
-    """Open the sidecar for reading, or raise if its table cannot be trusted.
-
-    The staleness check runs *before* any rows are read, so a superseded table
-    can never contribute a single row to a result a caller might act on.
-    """
-    conn = open_sidecar(repo_root)
-    recorded = stamp_of(conn, CLONES_TABLE)
-    if recorded is None:
-        conn.close()
-        raise ClonesStale("the clone table has never been built")
-    if is_stale(conn, CLONES_TABLE, index_version):
-        conn.close()
-        raise ClonesStale(
-            f"the clone table was built from index_version {recorded.engine_index_version}, "
-            f"the index is now at {index_version}"
-        )
-    return conn
-
-
 def code_query(
     select: str = "symbols",
     where: Mapping[str, Any] | None = None,
@@ -507,8 +499,10 @@ def code_query(
         if spec.database == "sidecar":
             # Raises when the table was never built or the engine index has moved
             # past it. Returning zero rows here would answer "does this code have
-            # duplicates" with "no" on the strength of never having looked.
-            sidecar_conn = _open_sidecar_checked(repo_root, index_version)
+            # duplicates" with "no" on the strength of never having looked. The
+            # guard lives with the producer so both readers share one definition
+            # of stale and one wording for it.
+            sidecar_conn = open_clone_table(repo_root, index_version)
             conn = sidecar_conn
         elif spec.database == "code":
             conn = store.code
@@ -539,10 +533,19 @@ def code_query(
             if clause:
                 sql += f" AND {clause}"
                 bound.extend(params)
-            sql += f" ORDER BY {spec.name_column} LIMIT ?"
+            sql += f" ORDER BY {spec.default_order or spec.name_column} LIMIT ?"
             bound.append(MAX_SCAN)
 
-            rows = [dict(row) for row in conn.execute(sql, bound)]
+            try:
+                rows = [dict(row) for row in conn.execute(sql, bound)]
+            except sqlite3.OperationalError as exc:
+                if sidecar_conn is None:
+                    raise
+                # The sidecar is ours, so an unreadable one is our state to
+                # report, not a transport failure for the caller to decode.
+                # `load_clones` already converted this; the query path reaching
+                # the same table had to as well.
+                raise ClonesStale(f"the clone table is unreadable ({exc})") from exc
             scanned = len(rows)
 
             if order_by == "centrality":

@@ -400,8 +400,22 @@ Three deviations, all forced by what the repository actually contains:
    string, as "strip comments/whitespace" implies, produced 2,968 pairs whose
    top scorers were every `to_dict` in the codebase matching every other at
    1.000 — once identifiers are placeholdered, a `to_dict`'s dict keys are the
-   only thing distinguishing it. Keeping literals cut that to 1,909 and put real
-   duplication at the top.
+   only thing distinguishing it. Keeping literals put real duplication at the
+   top.
+4. **Tokenising is one left-to-right scan, not a stack of regex substitutions.**
+   Found by review (cr-67523) after the first three landed: running the comment
+   patterns over raw text meant they fired *inside* string literals, so
+   `@click.option("--limit", ...)` normalised to six tokens and every URL was
+   truncated at its `//`. That silently undid deviation 3 for exactly the code
+   whose literals matter most. The scanner now recognises docstrings, then
+   strings, then comments, so a marker inside a literal is part of that literal;
+   `--` is no longer a comment marker at all, since it serves only SQL/Lua/
+   Haskell while being a decrement operator in the C-family languages that
+   dominate here.
+
+Current measurement: 12,223 symbols compared, 3,551 LSH candidates, **1,864**
+pairs at threshold 0.8. Symbols are never scored against a symbol whose byte
+range encloses them, so a class no longer clones its own single method.
 
 One addition the plan did not call for: the clone table is the first sidecar-
 backed `code_query` select, so it is the first that can be *absent* rather than

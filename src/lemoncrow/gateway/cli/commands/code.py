@@ -890,12 +890,19 @@ def code_clones_cmd(
     something a tool call triggers implicitly.
     """
     from lemoncrow.infra.code_intel.clones import DEFAULT_THRESHOLD, MIN_TOKENS, build_clones
+    from lemoncrow.infra.code_intel.store import CodeIntelUnavailable
 
-    report = build_clones(
-        repo_root=_portable_repo_root(repo_root),
-        threshold=DEFAULT_THRESHOLD if threshold is None else threshold,
-        min_tokens=MIN_TOKENS if min_tokens is None else min_tokens,
-    )
+    try:
+        report = build_clones(
+            repo_root=_portable_repo_root(repo_root),
+            threshold=DEFAULT_THRESHOLD if threshold is None else threshold,
+            min_tokens=MIN_TOKENS if min_tokens is None else min_tokens,
+        )
+    except CodeIntelUnavailable as exc:
+        # Matches `lc code export` / `import` above: an unindexed workspace is a
+        # thing the user can fix, so it gets a one-line message rather than a
+        # traceback.
+        raise click.ClickException(str(exc)) from exc
     if as_json:
         _emit(report.as_dict(), as_json=True)
         return

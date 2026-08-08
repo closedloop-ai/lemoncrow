@@ -198,6 +198,56 @@ def test_docstrings_are_stripped() -> None:
     assert normalise_tokens('def f():\n    """Doc."""\n    return 1') == normalise_tokens("def f():\n    return 1")
 
 
+def test_comment_markers_inside_string_literals_do_not_truncate(clone_repo: Path) -> None:
+    """Regression: comment stripping used to run over raw text, strings included.
+
+    `re.sub` passes for `//` and `--` fired inside literals, so every
+    single-line click option and every URL in the repository lost everything
+    after its first marker::
+
+        @click.option("--limit", ...)  ->  ['@', ID, '.', ID, '(', '"']
+        url = "https://example.com/x"  ->  [ID, '=', '"', ID, ':']
+
+    That defeated the decision this module calls load-bearing -- keeping string
+    literals is what stops all boilerplate scoring 1.000 -- because option
+    strings are exactly what distinguishes one CLI command from another.
+    """
+    option = normalise_tokens('@click.option("--limit", type=int, help="Pairs to print.")')
+    assert '"--limit"' in option
+    assert '"Pairs to print."' in option
+
+    url = normalise_tokens('url = "https://api.example.com/v1/things"')
+    assert '"https://api.example.com/v1/things"' in url
+
+
+def test_two_click_commands_no_longer_collapse_to_the_same_skeleton() -> None:
+    """The consequence the truncation had, stated as the property that matters."""
+    a = normalise_tokens('@click.option("--limit", type=int, help="Pairs to print.")')
+    b = normalise_tokens('@click.option("--tier", type=str, help="Archive tier.")')
+    assert a != b
+
+
+def test_comments_outside_strings_are_still_stripped() -> None:
+    """Fixing the truncation must not stop comments being removed."""
+    assert normalise_tokens("x = 1  // note") == normalise_tokens("x = 1")
+    assert normalise_tokens("x = 1  # note") == normalise_tokens("x = 1")
+    assert normalise_tokens("x = 1  /* a\nb */") == normalise_tokens("x = 1")
+
+
+def test_double_dash_is_not_treated_as_a_comment() -> None:
+    """It is a decrement operator in the C-family languages that dominate here.
+
+    As a comment rule it served only SQL/Lua/Haskell while destroying real code
+    everywhere else, so the trade runs the other way: SQL comments surviving as
+    tokens is noise, a truncated C-family line is a wrong answer.
+    """
+    assert normalise_tokens("while (i-- > 0) { total += i; }") == normalise_tokens(
+        "while (j-- > 0) { count += j; }"
+    )
+    assert "while" in normalise_tokens("while (i-- > 0) { total += i; }")
+    assert "}" in normalise_tokens("while (i-- > 0) { total += i; }")
+
+
 def test_string_literals_are_kept_as_tokens() -> None:
     """Regression: stripping every string made all boilerplate identical.
 
@@ -332,6 +382,45 @@ def test_short_symbols_are_skipped_rather_than_reported(make_workspace: Workspac
     assert report.symbols_considered == 0
 
 
+def test_a_symbol_is_never_reported_as_a_clone_of_its_own_parent(
+    make_workspace: WorkspaceFactory,
+) -> None:
+    """A class's byte range spans its methods, so containment is self-similarity.
+
+    Observed on the real repository before this filter: `HermesImporter` <->
+    `HermesImporter.import_all` at 0.953 and `LedgerReconstructor` <->
+    `LedgerReconstructor.reconstruct` at 0.961, both inside the top eight
+    results.
+    """
+    root = make_workspace(files=[{"file_path": "src/nested.py"}])
+    rows = _write_module(root, "src/nested.py", [("only_method", _BODY)])
+    method = rows[0]
+    parent = dict(method)
+    parent.update(
+        symbol_id="src/nested.py::Wrapper",
+        symbol_name="Wrapper",
+        qualified_name="Wrapper",
+        kind="class",
+        start_byte=0,
+    )
+    _insert_symbols(root, [method, parent])
+
+    report = build_clones(root)
+    assert report.pairs == (), [
+        (pair.qualified_name_a, pair.qualified_name_b, pair.jaccard) for pair in report.pairs
+    ]
+
+
+def test_enclosure_only_suppresses_within_one_file(make_workspace: WorkspaceFactory) -> None:
+    """Identical byte ranges in *different* files are a real clone, not nesting."""
+    root = make_workspace(files=[{"file_path": "src/x.py"}, {"file_path": "src/y.py"}])
+    rows = _write_module(root, "src/x.py", [("one", _BODY)])
+    rows += _write_module(root, "src/y.py", [("one", _BODY)])
+    _insert_symbols(root, rows)
+
+    assert len(build_clones(root).pairs) == 1
+
+
 def test_a_deleted_file_is_counted_not_raised(clone_repo: Path) -> None:
     """One file removed after indexing must not cost the whole pass."""
     (clone_repo / "src/a.py").unlink()
@@ -417,6 +506,28 @@ def test_code_query_reads_the_clone_table(clone_repo: Path) -> None:
     assert result.rows[0]["jaccard"] >= DEFAULT_THRESHOLD
 
 
+def test_code_query_returns_the_highest_scoring_pairs_first(make_workspace: WorkspaceFactory) -> None:
+    """Ordering by name made the strongest clones unreachable at the default limit.
+
+    With ~1,900 pairs recorded and `limit=50`, an alphabetical scan returned the
+    first fifty by name and reported `truncated: true` -- so the score, the only
+    reason the table exists, could not be acted on unless the caller already knew
+    to pass `jaccard_gte`.
+    """
+    root = make_workspace(files=[{"file_path": f"src/f{i}.py"} for i in range(4)])
+    rows: list[dict[str, object]] = []
+    rows += _write_module(root, "src/f0.py", [("aaa_exact", _BODY)])
+    rows += _write_module(root, "src/f1.py", [("zzz_exact", _BODY)])
+    rows += _write_module(root, "src/f2.py", [("aab_weaker", _BODY)])
+    rows += _write_module(root, "src/f3.py", [("aac_weaker", _RENAMED_BODY)])
+    _insert_symbols(root, rows)
+    build_clones(root)
+
+    scores = [row["jaccard"] for row in code_query(select="clones", limit=3, repo_root=root).rows]
+    assert scores == sorted(scores, reverse=True), scores
+    assert scores[0] == max(pair.jaccard for pair in load_clones(root, limit=1000))
+
+
 def test_code_query_filters_clones_by_score(clone_repo: Path) -> None:
     build_clones(clone_repo)
     assert code_query(select="clones", where={"jaccard_gte": 0.99}, repo_root=clone_repo).rows
@@ -439,6 +550,75 @@ def test_clones_is_not_name_keyed(clone_repo: Path) -> None:
     """Rows are keyed by symbol_id, so no `match_kind: name` caveat applies."""
     build_clones(clone_repo)
     assert code_query(select="clones", repo_root=clone_repo).match_kind is None
+
+
+def test_both_readers_raise_the_same_staleness_message(clone_repo: Path) -> None:
+    """One definition of stale, one wording -- the guard is shared, not copied.
+
+    Two independent copies meant two copies of the prose, each pinned by its own
+    test, that had to be edited in lockstep or diverge silently.
+    """
+    build_clones(clone_repo)
+    _bump_index_version(clone_repo)
+
+    with pytest.raises(ClonesStale) as via_load:
+        load_clones(clone_repo)
+    with pytest.raises(ClonesStale) as via_query:
+        code_query(select="clones", repo_root=clone_repo)
+
+    assert str(via_load.value) == str(via_query.value)
+
+
+def test_an_unreadable_clone_table_is_ClonesStale_not_a_raw_sqlite_error(clone_repo: Path) -> None:
+    """The query path dropped the conversion `load_clones` performs.
+
+    Only `ClonesStale` is expected downstream, so a raw `sqlite3.OperationalError`
+    from the sidecar read surfaced as a transport failure -- the exact outcome
+    the fail-loud handling exists to avoid.
+    """
+    from lemoncrow.infra.code_intel.sidecar import sidecar_path
+
+    build_clones(clone_repo)
+    conn = sqlite3.connect(sidecar_path(clone_repo))
+    try:
+        conn.execute("DROP TABLE symbol_clones")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(ClonesStale, match="unreadable"):
+        code_query(select="clones", repo_root=clone_repo)
+
+
+def test_the_mcp_tool_lets_stale_propagate_rather_than_calling_it_a_bad_argument(
+    clone_repo: Path,
+) -> None:
+    """ClonesStale reports server state, not a malformed call.
+
+    Wrapping it in `_ToolArgumentError` put it on the JSON-RPC -32602
+    protocol-fault path, while `IndexRebuilding` -- the same kind of not-ready
+    condition -- returns as an ordinary tool failure. One class of failure, one
+    contract.
+    """
+    from lemoncrow.gateway.adapters import mcp_server
+
+    with pytest.raises(ClonesStale):
+        mcp_server.TOOLS["code_query"]["handler"]({"select": "clones", "repo_root": str(clone_repo)})
+
+
+def test_the_cli_reports_an_unindexed_workspace_without_a_traceback(tmp_path: Path) -> None:
+    """Matches `lc code export` / `import`, which sit directly above it."""
+    from click.testing import CliRunner
+
+    from lemoncrow.gateway.cli.commands.code import code_group
+
+    bare = tmp_path / "never-indexed"
+    bare.mkdir()
+    result = CliRunner().invoke(code_group, ["clones", "--repo-root", str(bare)])
+
+    assert result.exit_code != 0
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "has this workspace been indexed" in result.output
 
 
 def test_describe_schema_advertises_clones() -> None:
