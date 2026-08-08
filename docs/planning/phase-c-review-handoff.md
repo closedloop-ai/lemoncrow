@@ -80,21 +80,58 @@ select ordered by name, so the default `limit=50` over ~1,900 pairs returned
 the alphabetically-first and reported `truncated: true`, making the score
 unreachable.
 
-**C. A stale or unbuilt table refuses rather than returning nothing**
+**C. Freshness is per pair, and only "never built" refuses**
 
 ```
 code_query select=clones          # on a workspace where lc code clones never ran
 ```
 
 Expect `ClonesStale`, not an empty list: *"the clone table has never been
-built; run `lc code clones` to build it"*. After a reindex, expect *"...was
-built from index_version N, the index is now at M"*. This fired unprompted
-during the session when the engine moved 244 → 260 — it is the F11
-fail-loud-never-empty contract applied to derived data, because an empty clone
-list reads as "this code has no duplicates".
+built; run `lc code clones` to build it"*. That is the one refusal left, and
+it exists because an empty list would read as "this code has no duplicates"
+when the truth is nobody looked.
+
+> **This changed after the first handoff draft, and the change matters.**
+> Freshness was originally keyed on `engine_index_version` — a global counter
+> any file's reindex bumps — so one unrelated edit invalidated an answer still
+> correct for every symbol it described. Measured live: the engine moved
+> 244→260, 274→284, 284→285 inside one session and the table refused within
+> minutes of each build. Each pair now carries the two `symbols.content_hash`
+> values it was measured on, so a reader returns the subset that still holds.
+
+Every response therefore carries coverage:
+
+```
+coverage: 1.0                 # fraction of live symbols the build examined
+stale_symbols: 0              # examined-count complement
+superseded_rows: 0            # pairs dropped because their source moved
+built_from_index_version: 327
+engine_index_version: 327
+```
+
+**Read `coverage` before reading an absence.** At 1.0, "no pair reported for X"
+means measured-and-none. Below it, some symbols changed after the last build
+and were never examined, so absence proves nothing. Verification happens
+*before* `limit` is applied, so a stale top-scoring pair never eats a result
+slot.
 
 `ClonesStale` propagates as an ordinary tool failure (`isError`), **not** as a
 JSON-RPC `-32602` argument fault — deliberately matching `IndexRebuilding`.
+
+**C2. Rebuilds are incremental**
+
+```
+lc code clones      # twice in a row
+```
+
+Cold: `signatures reused: 0 | computed: 11,886 | symbols read from disk: 24,577`
+in **34.4s**. Warm: `reused: 11,886 | computed: 0 | symbols read: 0` in
+**1.07s**, byte-identical output. Signatures are cached against the content
+hash they were taken over, and symbols too short to sign are recorded as
+examined-but-unsigned so they are neither re-read nor counted against coverage.
+
+`build_clones` now refuses a torn index (`IndexRebuilding`) — F11 built that
+probe, and clone detection was reading around it.
 
 **D. The precision properties, on real output**
 
@@ -126,7 +163,8 @@ literals, truncating every click option and every URL in the repo.
 ## 4. Known limits — stated, not hidden
 
 - **The table is only as fresh as the last `lc code clones`.** No background
-  rebuild exists. Staleness is detected and refused, never silently served.
+  rebuild exists. Symbols changed since then are simply not covered, and
+  `coverage` says by how much — never silently served as complete.
 - **Raw pair counts are misleading.** ~1,860 pairs repo-wide, but most are
   outside `src/` and intentional: duplicated benchmark fixtures under
   `benchmarks/codebench/cg_tasks/`, the generated per-host `SKILL.md` set, docs
@@ -178,8 +216,8 @@ remaining stated number as a claim to check, not a given.
 ## 7. Verification already run
 
 ```
-tests/infra/code_intel/test_clones.py            41 passed
-focused suite incl. gateway + mypyc-safety      358 passed
+tests/infra/code_intel/test_clones.py            53 passed
+focused suite incl. gateway + mypyc-safety      372 passed
 mypy --strict src                               257 errors — the pre-existing
                                                 baseline exactly, none in new code
 ruff (touched files)                            All checks passed

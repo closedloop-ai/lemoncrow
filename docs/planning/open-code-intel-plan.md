@@ -413,9 +413,26 @@ Three deviations, all forced by what the repository actually contains:
    Haskell while being a decrement operator in the C-family languages that
    dominate here.
 
-Current measurement: 12,223 symbols compared, 3,551 LSH candidates, **1,864**
-pairs at threshold 0.8. Symbols are never scored against a symbol whose byte
-range encloses them, so a class no longer clones its own single method.
+5. **Freshness is per pair, not per index generation, and rebuilds are
+   incremental.** The first design stamped the whole table with
+   `engine_index_version` and refused on any bump. That made the feature
+   unusable in practice: the counter is global, so one unrelated edit discarded
+   an answer still correct for every symbol it described — measured live, three
+   bumps inside a single session, the table refusing within minutes of each
+   build. Each pair now carries the two `symbols.content_hash` values it was
+   measured on, so a reader returns the subset that still holds plus a
+   `coverage` figure, and only a never-built table refuses. MinHash signatures
+   are cached against the content they were taken over: a full pass is 34.4s,
+   a rebuild after that is **1.07s** reading nothing from disk.
+
+   `build_clones` also honours F11's `index_state` probe now — it was reading
+   the store directly, so a build landing during a reindex would have derived a
+   table from a half-written index and stamped it authoritative.
+
+Current measurement: 11,886 symbols signed of 24,577 examined, 3,073 LSH
+candidates, **1,490** pairs at threshold 0.8. Symbols are never scored against a
+symbol whose byte range encloses them, so a class no longer clones its own
+single method.
 
 One addition the plan did not call for: the clone table is the first sidecar-
 backed `code_query` select, so it is the first that can be *absent* rather than

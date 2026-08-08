@@ -63,18 +63,24 @@ from __future__ import annotations
 import logging
 import re
 import sqlite3
+import struct
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
 from lemoncrow.core.foundation._minhash import MinHash
-from lemoncrow.infra.code_intel.sidecar import is_stale, open_sidecar, stamp, stamp_of
+from lemoncrow.infra.code_intel.freshness import IndexRebuilding, index_state
+from lemoncrow.infra.code_intel.sidecar import open_sidecar, stamp, stamp_of
 from lemoncrow.infra.code_intel.store import CodeIntelStore, SymbolRow
 
 __all__ = [
     "BANDS",
     "CLONES_TABLE",
+    "SIGNATURES_TABLE",
+    "CloneView",
+    "current_symbol_hashes",
     "open_clone_table",
+    "signature_coverage",
     "DEFAULT_THRESHOLD",
     "MIN_TOKENS",
     "NUM_PERM",
@@ -94,6 +100,9 @@ logger = logging.getLogger(__name__)
 
 #: Sidecar table these pairs live in, and the key :func:`stamp` records against.
 CLONES_TABLE = "symbol_clones"
+
+#: Cached MinHash signatures, keyed by the content they were taken over.
+SIGNATURES_TABLE = "symbol_signatures"
 
 #: Signature width. 128 is the ``MinHash`` default and puts the Jaccard estimate
 #: error at ~1/sqrt(128) ~= 0.088 -- fine for ranking candidates, which is all
@@ -197,11 +206,19 @@ _KEYWORDS = frozenset(
 
 
 class ClonesStale(RuntimeError):
-    """The clone table is absent, or was built from a superseded index.
+    """Nothing has ever built the clone table for this workspace.
 
     Not a subclass of anything a caller degrades to an empty result on. An empty
     clone list reads as "this code is unique", which is precisely the wrong
     conclusion to hand back when the truth is "nobody has looked yet".
+
+    Deliberately *not* raised merely because the engine has reindexed. That was
+    the first design and it made the feature unusable: ``index_version`` is a
+    global counter, so one unrelated edit invalidated a table still correct for
+    every symbol it described. Readers now check each pair against the two
+    content hashes it was built from and return the subset that still holds,
+    with explicit coverage -- a verified-current answer beats a refusal, and
+    both beat a silently-superseded one.
     """
 
     def __init__(self, detail: str) -> None:
@@ -215,6 +232,8 @@ class ClonePair:
 
     symbol_a: str
     symbol_b: str
+    content_hash_a: str
+    content_hash_b: str
     qualified_name_a: str
     qualified_name_b: str
     file_path_a: str
@@ -236,6 +255,13 @@ class ClonePair:
             "jaccard": self.jaccard,
         }
 
+    def still_current(self, hashes: dict[str, str]) -> bool:
+        """True when both symbols still hold the content this pair was measured on."""
+        return (
+            hashes.get(self.symbol_a) == self.content_hash_a
+            and hashes.get(self.symbol_b) == self.content_hash_b
+        )
+
 
 @dataclass(frozen=True)
 class CloneReport:
@@ -248,6 +274,12 @@ class CloneReport:
     candidate_pairs: int
     threshold: float
     engine_index_version: int
+    signatures_reused: int = 0
+    signatures_computed: int = 0
+    #: Symbols whose source was read off disk and tokenised this pass. Larger
+    #: than `signatures_computed`, because a symbol under MIN_TOKENS is read and
+    #: tokenised before it can be measured as too short to be worth signing.
+    symbols_read: int = 0
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -258,6 +290,52 @@ class CloneReport:
             "symbols_unreadable": self.symbols_unreadable,
             "candidate_pairs": self.candidate_pairs,
             "threshold": self.threshold,
+            "engine_index_version": self.engine_index_version,
+            "signatures_reused": self.signatures_reused,
+            "signatures_computed": self.signatures_computed,
+            "symbols_read": self.symbols_read,
+        }
+
+
+@dataclass(frozen=True)
+class CloneView:
+    """Stored pairs that are still true, plus how much of the repo they cover.
+
+    Every pair here was re-checked against the live ``symbols.content_hash``, so
+    the list is current by construction rather than by assumption. ``coverage``
+    is what the caller needs in order to read the *absence* of a pair correctly:
+    at 1.0 "no clone reported" means measured-and-none, below it means some
+    symbols have changed since the last build and were not examined.
+    """
+
+    pairs: tuple[ClonePair, ...]
+    recorded: int
+    superseded: int
+    symbols_total: int
+    symbols_unchanged: int
+    built_from_index_version: int
+    engine_index_version: int
+
+    @property
+    def coverage(self) -> float:
+        if self.symbols_total == 0:
+            return 1.0
+        return self.symbols_unchanged / self.symbols_total
+
+    @property
+    def stale_symbols(self) -> int:
+        return self.symbols_total - self.symbols_unchanged
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "pairs": [pair.as_dict() for pair in self.pairs],
+            "pair_count": len(self.pairs),
+            "recorded": self.recorded,
+            "superseded": self.superseded,
+            "coverage": round(self.coverage, 4),
+            "stale_symbols": self.stale_symbols,
+            "symbols_total": self.symbols_total,
+            "built_from_index_version": self.built_from_index_version,
             "engine_index_version": self.engine_index_version,
         }
 
@@ -362,6 +440,77 @@ def _read_symbol_sources(
     return tokens_by_symbol, unreadable
 
 
+@dataclass(frozen=True)
+class _CachedSignature:
+    content_hash: str
+    token_count: int
+    packed: bytes
+
+    @property
+    def signed(self) -> bool:
+        """False for a symbol that was examined and found too short to sign.
+
+        Recorded rather than omitted, so "we looked and it was trivial" stays
+        distinguishable from "we never looked". Without that distinction the
+        coverage figure read 0.48 on a fully-current index, because half this
+        repo's symbols are below MIN_TOKENS.
+        """
+        return len(self.packed) == NUM_PERM * 4
+
+    def minhash(self) -> MinHash:
+        restored = MinHash(num_perm=NUM_PERM)
+        restored.hashvalues = list(struct.unpack(f"<{NUM_PERM}I", self.packed))
+        return restored
+
+
+def _pack(minhash: MinHash) -> bytes:
+    return struct.pack(f"<{NUM_PERM}I", *minhash.hashvalues)
+
+
+def _load_signature_cache(repo_root: Path, repo_id: str) -> dict[str, _CachedSignature]:
+    conn = open_sidecar(repo_root)
+    try:
+        rows = conn.execute(
+            "SELECT symbol_id, content_hash, token_count, signature FROM symbol_signatures WHERE repo_id = ?",
+            (repo_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # The cache is an accelerator, never a source of truth. A missing or
+        # unreadable one costs time, not correctness.
+        return {}
+    finally:
+        conn.close()
+    return {
+        str(row["symbol_id"]): _CachedSignature(
+            content_hash=str(row["content_hash"]),
+            token_count=int(row["token_count"]),
+            packed=bytes(row["signature"]),
+        )
+        for row in rows
+    }
+
+
+def _cache_hit(cached: dict[str, _CachedSignature], row: SymbolRow, min_tokens: int = MIN_TOKENS) -> bool:
+    """True when the cache already covers this symbol's current content.
+
+    Keyed on ``content_hash``, not ``symbol_id``: an edited symbol keeps its id,
+    and reusing a signature across a content change is the one way this cache
+    could produce a wrong answer rather than merely a slow one.
+
+    A symbol recorded as too short counts as covered -- it was read and measured,
+    which is what coverage asks. It stops counting the moment *min_tokens* drops
+    below its token count, because then it would need a signature it never got.
+    A stored signature of the wrong width is a miss, so changing NUM_PERM can
+    never mix two geometries into one comparison.
+    """
+    entry = cached.get(row.symbol_id)
+    if entry is None or entry.content_hash != row.content_hash:
+        return False
+    if entry.token_count < min_tokens:
+        return True
+    return entry.signed
+
+
 def _encloses(a: SymbolRow, b: SymbolRow) -> bool:
     """True when one symbol's byte range contains the other's in the same file."""
     if a.file_path != b.file_path:
@@ -399,19 +548,52 @@ def build_clones(
     The table is rewritten wholesale rather than merged. A symbol that stopped
     being a clone must stop being reported, and an incremental merge cannot know
     that without tracking deletions the engine does not expose.
+
+    Signatures, unlike pairs, *are* reused: they are cached against the content
+    hash they were taken over, so an unchanged symbol is never re-read or
+    re-hashed. Tokenising and hashing was nearly all of a 33s full pass; banding
+    over cached signatures is the cheap part.
+
+    Raises :class:`IndexRebuilding` when the engine's index is mid-write. F11
+    built that probe so nothing derives from a torn index, and a clone table
+    stamped authoritative from a half-populated one is exactly that failure with
+    an extra step.
     """
     root = Path(repo_root).resolve()
+    state = index_state(root)
+    if state.rebuilding:
+        raise IndexRebuilding(root, state.detail)
+
     with CodeIntelStore(root) as store:
         engine_index_version = store.engine_state("index_version")
         repo_id = store.repo_id_or_none()
         symbols = store.symbols() if repo_id is not None else []
 
     by_id = {row.symbol_id: row for row in symbols}
-    tokens_by_symbol, unreadable = _read_symbol_sources(symbols, root)
+    cached = _load_signature_cache(root, repo_id or "")
+
+    # Only symbols whose content the cache does not already cover are read off
+    # disk; everything else skips tokenising entirely.
+    unchanged = {row.symbol_id for row in symbols if _cache_hit(cached, row, min_tokens)}
+    to_read = [row for row in symbols if row.symbol_id not in unchanged]
+    tokens_by_symbol, unreadable = _read_symbol_sources(to_read, root)
 
     signatures: dict[str, MinHash] = {}
+    token_counts: dict[str, int] = {}
     skipped_short = 0
+    reused = 0
+
+    for symbol_id in unchanged:
+        entry = cached[symbol_id]
+        token_counts[symbol_id] = entry.token_count
+        if entry.token_count < min_tokens:
+            skipped_short += 1
+            continue
+        reused += 1
+        signatures[symbol_id] = entry.minhash()
+
     for symbol_id, tokens in tokens_by_symbol.items():
+        token_counts[symbol_id] = len(tokens)
         if len(tokens) < min_tokens:
             skipped_short += 1
             continue
@@ -438,12 +620,14 @@ def build_clones(
             ClonePair(
                 symbol_a=left,
                 symbol_b=right,
+                content_hash_a=row_a.content_hash,
+                content_hash_b=row_b.content_hash,
                 qualified_name_a=row_a.qualified_name,
                 qualified_name_b=row_b.qualified_name,
                 file_path_a=row_a.file_path,
                 file_path_b=row_b.file_path,
-                token_count_a=len(tokens_by_symbol[left]),
-                token_count_b=len(tokens_by_symbol[right]),
+                token_count_a=token_counts[left],
+                token_count_b=token_counts[right],
                 jaccard=score,
             )
         )
@@ -457,31 +641,48 @@ def build_clones(
         candidate_pairs=len(candidates),
         threshold=threshold,
         engine_index_version=engine_index_version,
+        signatures_reused=reused,
+        signatures_computed=len(signatures) - reused,
+        symbols_read=len(tokens_by_symbol),
     )
-    _persist(root, repo_id or "", report)
+    _persist(root, repo_id or "", report, by_id, token_counts, signatures)
     logger.info(
-        "clones: %d pairs from %d candidates over %d symbols (index_version %d)",
+        "clones: %d pairs from %d candidates over %d symbols "
+        "(index_version %d, %d signatures reused, %d computed, %d symbols read)",
         len(pairs),
         len(candidates),
         len(signatures),
         engine_index_version,
+        reused,
+        len(signatures) - reused,
+        len(tokens_by_symbol),
     )
     return report
 
 
-def _persist(repo_root: Path, repo_id: str, report: CloneReport) -> None:
+def _persist(
+    repo_root: Path,
+    repo_id: str,
+    report: CloneReport,
+    by_id: dict[str, SymbolRow],
+    token_counts: dict[str, int],
+    signatures: dict[str, MinHash],
+) -> None:
     conn = open_sidecar(repo_root)
     try:
         conn.execute("DELETE FROM symbol_clones WHERE repo_id = ?", (repo_id,))
         conn.executemany(
-            "INSERT INTO symbol_clones (repo_id, symbol_a, symbol_b, qualified_name_a, qualified_name_b, "
-            "file_path_a, file_path_b, token_count_a, token_count_b, jaccard) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO symbol_clones (repo_id, symbol_a, symbol_b, content_hash_a, content_hash_b, "
+            "qualified_name_a, qualified_name_b, file_path_a, file_path_b, "
+            "token_count_a, token_count_b, jaccard) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     repo_id,
                     pair.symbol_a,
                     pair.symbol_b,
+                    pair.content_hash_a,
+                    pair.content_hash_b,
                     pair.qualified_name_a,
                     pair.qualified_name_b,
                     pair.file_path_a,
@@ -493,75 +694,152 @@ def _persist(repo_root: Path, repo_id: str, report: CloneReport) -> None:
                 for pair in report.pairs
             ],
         )
+
+        # Signatures outlive one build, so the cache is replaced for symbols the
+        # engine still knows about and dropped for the rest. Leaving deleted
+        # symbols behind would grow the table without bound and let a recycled
+        # symbol_id collide with a stale entry.
+        try:
+            conn.execute("DELETE FROM symbol_signatures WHERE repo_id = ?", (repo_id,))
+            conn.executemany(
+                "INSERT INTO symbol_signatures (repo_id, symbol_id, content_hash, token_count, signature) "
+                "VALUES (?, ?, ?, ?, ?)",
+                # Every symbol examined this pass is recorded, signed or not.
+                # A short symbol with an empty signature says "looked at, not
+                # worth signing", which keeps it out of the next pass's reads
+                # *and* keeps the coverage figure honest.
+                [
+                    (
+                        repo_id,
+                        symbol_id,
+                        by_id[symbol_id].content_hash,
+                        token_count,
+                        _pack(signatures[symbol_id]) if symbol_id in signatures else b"",
+                    )
+                    for symbol_id, token_count in token_counts.items()
+                    if symbol_id in by_id
+                ],
+            )
+        except sqlite3.OperationalError:
+            # Symmetrical with the read: the cache is an accelerator, so failing
+            # to write it costs the next build time and costs this one nothing.
+            # The pairs above are already committed-in-transaction and correct.
+            logger.warning("clones: signature cache not written", exc_info=True)
         conn.commit()
         stamp(conn, CLONES_TABLE, report.engine_index_version)
     finally:
         conn.close()
 
 
-def open_clone_table(repo_root: Path | str, index_version: int) -> sqlite3.Connection:
-    """Open the sidecar for reading, or raise if the clone table cannot be trusted.
+def open_clone_table(repo_root: Path | str) -> tuple[sqlite3.Connection, int]:
+    """Open the sidecar for reading; raise only if nothing ever built the table.
 
-    The single definition of what "stale" means for this table and how it is
-    worded. Both readers -- :func:`load_clones` and ``code_query``'s sidecar
-    branch -- call this, because two copies of the check meant two copies of the
-    message, each pinned by its own test, that had to be edited in lockstep.
+    Returns the connection and the index generation the table was built from.
+    The single definition of "never built" and how it is worded -- two copies of
+    that check meant two copies of the message, each pinned by its own test.
 
-    The check runs before any row is read, so a superseded table cannot
-    contribute a single row to a result a caller might act on.
+    A *superseded* table is deliberately not an error here. Validity is decided
+    per pair against ``symbols.content_hash`` by :func:`current_pairs`, so a
+    reindex costs coverage rather than the whole answer.
     """
     conn = open_sidecar(repo_root)
     try:
         recorded = stamp_of(conn, CLONES_TABLE)
         if recorded is None:
             raise ClonesStale("the clone table has never been built")
-        if is_stale(conn, CLONES_TABLE, index_version):
-            raise ClonesStale(
-                f"the clone table was built from index_version {recorded.engine_index_version}, "
-                f"the index is now at {index_version}"
-            )
     except BaseException:
         conn.close()
         raise
-    return conn
+    return conn, recorded.engine_index_version
 
 
-def load_clones(repo_root: Path | str = ".", limit: int = 50) -> tuple[ClonePair, ...]:
-    """Read stored pairs, refusing a table that is absent or superseded.
+def current_symbol_hashes(repo_root: Path | str = ".") -> dict[str, str]:
+    """``symbol_id`` -> ``content_hash`` as the engine holds it right now."""
+    with CodeIntelStore(repo_root) as store:
+        if store.repo_id_or_none() is None:
+            return {}
+        return {row.symbol_id: row.content_hash for row in store.symbols()}
 
-    Raises :class:`ClonesStale` rather than returning what it finds. An empty or
-    outdated clone list is indistinguishable from "this code has no duplicates",
-    and that is a conclusion no caller should reach by accident.
+
+def signature_coverage(repo_root: Path | str = ".") -> tuple[int, int]:
+    """``(symbols examined by the last build, symbols the engine holds now)``.
+
+    The signature cache records every symbol a build looked at, keyed by the
+    content it looked at. So the count of live symbols whose hash the cache still
+    matches is exactly how much of the repository the stored answer covers --
+    which is what makes a *missing* clone pair readable: at full coverage it
+    means measured-and-none, below it means never examined.
+    """
+    with CodeIntelStore(repo_root) as store:
+        repo_id = store.repo_id_or_none()
+        symbols = store.symbols() if repo_id is not None else []
+    if not symbols:
+        return 0, 0
+    cached = _load_signature_cache(Path(repo_root).resolve(), repo_id or "")
+    return sum(1 for row in symbols if _cache_hit(cached, row)), len(symbols)
+
+
+def load_clones(repo_root: Path | str = ".", limit: int = 50) -> CloneView:
+    """Stored pairs that still hold, with the coverage needed to read them.
+
+    Raises :class:`ClonesStale` only when nothing has ever built the table --
+    the one case where an empty list would be indistinguishable from "this code
+    has no duplicates". Once built, every pair is re-checked against the live
+    content hashes and the superseded ones are dropped, so a reindex narrows the
+    answer instead of destroying it.
     """
     root = Path(repo_root).resolve()
     with CodeIntelStore(root) as store:
         engine_index_version = store.engine_state("index_version")
         repo_id = store.repo_id_or_none()
+        symbols = store.symbols() if repo_id is not None else []
+    hashes = {row.symbol_id: row.content_hash for row in symbols}
 
-    conn = open_clone_table(root, engine_index_version)
+    conn, built_from = open_clone_table(root)
     try:
+        # No LIMIT in SQL: superseded rows are dropped after the read, so
+        # limiting first would silently return fewer pairs than asked for
+        # whenever any of the top-scoring ones had gone stale.
         rows = conn.execute(
-            "SELECT symbol_a, symbol_b, qualified_name_a, qualified_name_b, file_path_a, file_path_b, "
-            "token_count_a, token_count_b, jaccard FROM symbol_clones WHERE repo_id = ? "
-            "ORDER BY jaccard DESC, qualified_name_a, qualified_name_b LIMIT ?",
-            (repo_id or "", int(limit)),
+            "SELECT symbol_a, symbol_b, content_hash_a, content_hash_b, qualified_name_a, "
+            "qualified_name_b, file_path_a, file_path_b, token_count_a, token_count_b, jaccard "
+            "FROM symbol_clones WHERE repo_id = ? "
+            "ORDER BY jaccard DESC, qualified_name_a, qualified_name_b",
+            (repo_id or "",),
         ).fetchall()
     except sqlite3.OperationalError as exc:
         raise ClonesStale(f"the clone table is unreadable ({exc})") from exc
     finally:
         conn.close()
 
-    return tuple(
-        ClonePair(
-            symbol_a=str(row["symbol_a"]),
-            symbol_b=str(row["symbol_b"]),
-            qualified_name_a=str(row["qualified_name_a"]),
-            qualified_name_b=str(row["qualified_name_b"]),
-            file_path_a=str(row["file_path_a"]),
-            file_path_b=str(row["file_path_b"]),
-            token_count_a=int(row["token_count_a"]),
-            token_count_b=int(row["token_count_b"]),
-            jaccard=float(row["jaccard"]),
-        )
-        for row in rows
+    recorded = [_row_to_pair(row) for row in rows]
+    current = [pair for pair in recorded if pair.still_current(hashes)]
+
+    cached = _load_signature_cache(root, repo_id or "")
+    examined = sum(1 for row in symbols if _cache_hit(cached, row))
+
+    return CloneView(
+        pairs=tuple(current[: max(0, int(limit))]),
+        recorded=len(recorded),
+        superseded=len(recorded) - len(current),
+        symbols_total=len(hashes),
+        symbols_unchanged=examined,
+        built_from_index_version=built_from,
+        engine_index_version=engine_index_version,
+    )
+
+
+def _row_to_pair(row: sqlite3.Row) -> ClonePair:
+    return ClonePair(
+        symbol_a=str(row["symbol_a"]),
+        symbol_b=str(row["symbol_b"]),
+        content_hash_a=str(row["content_hash_a"]),
+        content_hash_b=str(row["content_hash_b"]),
+        qualified_name_a=str(row["qualified_name_a"]),
+        qualified_name_b=str(row["qualified_name_b"]),
+        file_path_a=str(row["file_path_a"]),
+        file_path_b=str(row["file_path_b"]),
+        token_count_a=int(row["token_count_a"]),
+        token_count_b=int(row["token_count_b"]),
+        jaccard=float(row["jaccard"]),
     )

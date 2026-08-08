@@ -39,7 +39,12 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.infra.code_intel.clones import ClonesStale, open_clone_table
+from lemoncrow.infra.code_intel.clones import (
+    ClonesStale,
+    current_symbol_hashes,
+    open_clone_table,
+    signature_coverage,
+)
 from lemoncrow.infra.code_intel.completeness import MATCH_NAME, OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.store import CodeIntelStore
 
@@ -110,6 +115,11 @@ class _Select:
     #: makes the highest-scoring rows unreachable. Whitelist-owned text, never
     #: caller input.
     default_order: str = ""
+    #: Selected for internal verification and stripped before the rows are
+    #: returned. Sidecar rows carry the content hashes they were derived from so
+    #: each one can be re-checked against the live index; the caller wants the
+    #: verdict, not the bookkeeping.
+    internal_columns: tuple[str, ...] = ()
 
     @property
     def quoted_table(self) -> str:
@@ -270,6 +280,7 @@ _CLONES = _Select(
     # unless a caller already knew to pass `jaccard_gte` -- and `idx_symbol_
     # clones_score` was an index built for an ordering nothing ever issued.
     default_order="jaccard DESC, qualified_name_a, qualified_name_b",
+    internal_columns=("symbol_a", "symbol_b", "content_hash_a", "content_hash_b"),
 )
 
 SELECTS: dict[str, _Select] = {
@@ -291,6 +302,14 @@ class QueryResult:
     scan_capped: bool
     match_kind: str | None
     engine_index_version: int
+    #: Sidecar-backed selects only. What fraction of the repo's symbols the
+    #: stored answer actually examined, and how many rows were dropped because
+    #: their source changed since. Absent for engine-backed selects, which read
+    #: the index live and are current by definition.
+    coverage: float | None = None
+    stale_symbols: int | None = None
+    superseded_rows: int | None = None
+    built_from_index_version: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -311,6 +330,14 @@ class QueryResult:
         }
         if self.match_kind is not None:
             payload["match_kind"] = self.match_kind
+        if self.coverage is not None:
+            # Reading the *absence* of a row correctly needs this: at coverage
+            # 1.0 "not reported" means measured-and-none; below it, some symbols
+            # changed after the last build and were never examined.
+            payload["coverage"] = round(self.coverage, 4)
+            payload["stale_symbols"] = self.stale_symbols
+            payload["superseded_rows"] = self.superseded_rows
+            payload["built_from_index_version"] = self.built_from_index_version
         return payload
 
 
@@ -496,13 +523,17 @@ def code_query(
         index_version = store.engine_state("index_version")
         sidecar_conn: sqlite3.Connection | None = None
         conn: sqlite3.Connection | None
+        built_from: int | None = None
+        coverage: float | None = None
+        stale_symbols: int | None = None
+        superseded_rows: int | None = None
         if spec.database == "sidecar":
-            # Raises when the table was never built or the engine index has moved
-            # past it. Returning zero rows here would answer "does this code have
-            # duplicates" with "no" on the strength of never having looked. The
-            # guard lives with the producer so both readers share one definition
-            # of stale and one wording for it.
-            sidecar_conn = open_clone_table(repo_root, index_version)
+            # Raises only when nothing ever built the table -- the one case where
+            # zero rows would answer "does this code have duplicates" with "no"
+            # on the strength of never having looked. A reindex is *not* an
+            # error: each row is re-checked below against the content it was
+            # measured on, so staleness costs coverage rather than the answer.
+            sidecar_conn, built_from = open_clone_table(repo_root)
             conn = sidecar_conn
         elif spec.database == "code":
             conn = store.code
@@ -528,7 +559,8 @@ def code_query(
         try:
             conn.create_function("regexp", 2, _regexp, deterministic=True)
             clause, params = _where_clause(predicates)
-            sql = f"SELECT {', '.join(spec.columns)} FROM {spec.quoted_table} WHERE repo_id = ?"
+            selected = spec.columns + spec.internal_columns
+            sql = f"SELECT {', '.join(selected)} FROM {spec.quoted_table} WHERE repo_id = ?"
             bound: list[Any] = [repo_id]
             if clause:
                 sql += f" AND {clause}"
@@ -546,6 +578,27 @@ def code_query(
                 # `load_clones` already converted this; the query path reaching
                 # the same table had to as well.
                 raise ClonesStale(f"the clone table is unreadable ({exc})") from exc
+
+            if sidecar_conn is not None:
+                # Every row is re-checked against the content it was measured
+                # on, so what comes back is current by construction rather than
+                # by assumption. Verification happens before `limit` is applied
+                # -- filtering after would quietly return fewer rows than asked
+                # for whenever a top-scoring pair had gone stale.
+                recorded_rows = len(rows)
+                hashes = current_symbol_hashes(repo_root)
+                rows = [
+                    row
+                    for row in rows
+                    if hashes.get(str(row.get("symbol_a"))) == row.get("content_hash_a")
+                    and hashes.get(str(row.get("symbol_b"))) == row.get("content_hash_b")
+                ]
+                superseded_rows = recorded_rows - len(rows)
+                examined, total = signature_coverage(repo_root)
+                coverage = 1.0 if total == 0 else examined / total
+                stale_symbols = total - examined
+                rows = [{k: v for k, v in row.items() if k not in spec.internal_columns} for row in rows]
+
             scanned = len(rows)
 
             if order_by == "centrality":
@@ -579,4 +632,8 @@ def code_query(
         scan_capped=scanned >= MAX_SCAN,
         match_kind=MATCH_NAME if spec.name_keyed else None,
         engine_index_version=index_version,
+        coverage=coverage,
+        stale_symbols=stale_symbols,
+        superseded_rows=superseded_rows,
+        built_from_index_version=built_from,
     )

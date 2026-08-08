@@ -14,6 +14,7 @@ baseline rather than against a number someone once observed.
 
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
@@ -131,6 +132,36 @@ def clone_repo(make_workspace: WorkspaceFactory, tmp_path: Path) -> Path:
     return root
 
 
+def _reindex_file(root: Path, rel_path: str, functions: list[tuple[str, str]]) -> None:
+    """Rewrite a file and replace its symbol rows, the way a reindex would.
+
+    Rewriting the file while leaving the old rows behind is not a state the
+    engine can produce: their byte ranges then point into content that has moved,
+    and the stale slices score against whatever now occupies those offsets.
+    """
+    from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, workspace_dir
+
+    conn = sqlite3.connect(workspace_dir(root) / CODE_CONTEXT_DB)
+    try:
+        conn.execute("DELETE FROM symbols WHERE file_path = ?", (rel_path,))
+        conn.commit()
+    finally:
+        conn.close()
+    _insert_symbols(root, _write_module(root, rel_path, functions))
+
+
+def _content_hash(root: Path, row: dict[str, object]) -> str:
+    """Hash the bytes the symbol actually spans, the way the engine does.
+
+    A constant here would be a fixture that lies. The signature cache is keyed on
+    ``content_hash``, so a fixture that never changes it makes every edit look
+    like a cache hit and lets a stale signature survive a rewrite -- which is
+    exactly the one failure mode the cache is designed to be unable to have.
+    """
+    blob = (root / str(row["file_path"])).read_bytes()
+    return hashlib.sha1(blob[int(row["start_byte"]) : int(row["end_byte"])]).hexdigest()
+
+
 def _insert_symbols(root: Path, rows: list[dict[str, object]]) -> None:
     from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, workspace_dir
 
@@ -141,7 +172,7 @@ def _insert_symbols(root: Path, rows: list[dict[str, object]]) -> None:
             "INSERT OR REPLACE INTO symbols (symbol_id, repo_id, file_path, language, symbol_name, "
             "qualified_name, kind, signature, start_byte, end_byte, start_line, end_line, "
             "parent_symbol, doc_summary, content_hash) "
-            "VALUES (?, ?, ?, 'python', ?, ?, ?, '', ?, ?, 1, 2, NULL, NULL, 'h')",
+            "VALUES (?, ?, ?, 'python', ?, ?, ?, '', ?, ?, 1, 2, NULL, NULL, ?)",
             [
                 (
                     row["symbol_id"],
@@ -152,6 +183,7 @@ def _insert_symbols(root: Path, rows: list[dict[str, object]]) -> None:
                     row["kind"],
                     row["start_byte"],
                     row["end_byte"],
+                    _content_hash(root, row),
                 )
                 for row in rows
             ],
@@ -458,18 +490,10 @@ def test_rebuild_replaces_rather_than_accumulates(clone_repo: Path) -> None:
     first = build_clones(clone_repo)
     assert first.pairs
 
-    (clone_repo / "src/b.py").write_text(
-        "def compute_average_copy(values, factor, offset, ceiling, floor, weights, precision):"
-        + _UNRELATED_BODY
-        + "\n",
-        encoding="utf-8",
-    )
-    _insert_symbols(
-        clone_repo,
-        _write_module(clone_repo, "src/b.py", [("compute_average_copy", _UNRELATED_BODY)]),
-    )
+    _reindex_file(clone_repo, "src/b.py", [("compute_average_copy", _UNRELATED_BODY)])
+
     build_clones(clone_repo)
-    assert load_clones(clone_repo) == ()
+    assert load_clones(clone_repo).pairs == ()
 
 
 def test_the_build_stamps_the_index_generation_it_read(clone_repo: Path) -> None:
@@ -494,14 +518,64 @@ def test_loading_an_unbuilt_table_raises_rather_than_returning_nothing(clone_rep
         load_clones(clone_repo)
 
 
-def test_a_reindex_makes_the_stored_table_refuse_to_load(clone_repo: Path) -> None:
+def test_a_reindex_alone_does_not_invalidate_the_table(clone_repo: Path) -> None:
+    """Freshness is per pair, not per index generation.
+
+    Keying on `engine_index_version` made the feature unusable: it is a global
+    counter, so one unrelated edit discarded an answer still correct for every
+    symbol it described. Measured on the real repo, three bumps landed inside a
+    single session and the table was refusing within minutes of each build.
+    """
     build_clones(clone_repo)
-    assert load_clones(clone_repo)
+    before = load_clones(clone_repo)
+    assert before.pairs
 
     _bump_index_version(clone_repo)
 
-    with pytest.raises(ClonesStale, match="index is now at"):
-        load_clones(clone_repo)
+    after = load_clones(clone_repo)
+    assert after.pairs == before.pairs
+    assert after.coverage == 1.0
+    assert after.superseded == 0
+    assert after.built_from_index_version < after.engine_index_version
+
+
+def test_editing_one_symbol_drops_only_the_pairs_that_touch_it(clone_repo: Path) -> None:
+    """The point of hashing per pair: a change costs coverage, not the answer."""
+    build_clones(clone_repo)
+    assert load_clones(clone_repo).pairs
+
+    # Same symbol id, different content -- exactly what an edit looks like.
+    _set_content_hash(clone_repo, "src/a.py::compute_average", "changed-hash")
+
+    view = load_clones(clone_repo)
+    assert view.superseded >= 1
+    assert all(pair.symbol_a != "src/a.py::compute_average" for pair in view.pairs)
+    assert all(pair.symbol_b != "src/a.py::compute_average" for pair in view.pairs)
+    assert view.coverage < 1.0
+    assert view.stale_symbols == 1
+
+
+def test_coverage_is_one_when_nothing_has_changed(clone_repo: Path) -> None:
+    """Coverage is what makes an absent pair readable.
+
+    At 1.0, "no clone reported for X" means measured-and-none. Below it, some
+    symbols were never examined and absence proves nothing.
+    """
+    build_clones(clone_repo)
+    view = load_clones(clone_repo)
+    assert view.coverage == 1.0
+    assert view.stale_symbols == 0
+
+
+def _set_content_hash(root: Path, symbol_id: str, new_hash: str) -> None:
+    from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, workspace_dir
+
+    conn = sqlite3.connect(workspace_dir(root) / CODE_CONTEXT_DB)
+    try:
+        conn.execute("UPDATE symbols SET content_hash = ? WHERE symbol_id = ?", (new_hash, symbol_id))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _bump_index_version(root: Path) -> None:
@@ -549,7 +623,7 @@ def test_code_query_returns_the_highest_scoring_pairs_first(make_workspace: Work
 
     scores = [row["jaccard"] for row in code_query(select="clones", limit=3, repo_root=root).rows]
     assert scores == sorted(scores, reverse=True), scores
-    assert scores[0] == max(pair.jaccard for pair in load_clones(root, limit=1000))
+    assert scores[0] == max(pair.jaccard for pair in load_clones(root, limit=1000).pairs)
 
 
 def test_code_query_filters_clones_by_score(clone_repo: Path) -> None:
@@ -576,15 +650,12 @@ def test_clones_is_not_name_keyed(clone_repo: Path) -> None:
     assert code_query(select="clones", repo_root=clone_repo).match_kind is None
 
 
-def test_both_readers_raise_the_same_staleness_message(clone_repo: Path) -> None:
-    """One definition of stale, one wording -- the guard is shared, not copied.
+def test_both_readers_raise_the_same_never_built_message(clone_repo: Path) -> None:
+    """One definition of "never built", one wording -- shared, not copied.
 
     Two independent copies meant two copies of the prose, each pinned by its own
     test, that had to be edited in lockstep or diverge silently.
     """
-    build_clones(clone_repo)
-    _bump_index_version(clone_repo)
-
     with pytest.raises(ClonesStale) as via_load:
         load_clones(clone_repo)
     with pytest.raises(ClonesStale) as via_query:
@@ -643,6 +714,162 @@ def test_the_cli_reports_an_unindexed_workspace_without_a_traceback(tmp_path: Pa
     assert result.exit_code != 0
     assert result.exception is None or isinstance(result.exception, SystemExit)
     assert "has this workspace been indexed" in result.output
+
+
+def test_code_query_reports_coverage_alongside_the_rows(clone_repo: Path) -> None:
+    build_clones(clone_repo)
+    payload = code_query(select="clones", repo_root=clone_repo).to_dict()
+
+    assert payload["coverage"] == 1.0
+    assert payload["stale_symbols"] == 0
+    assert payload["superseded_rows"] == 0
+    assert payload["built_from_index_version"] == payload["engine_index_version"]
+
+
+def test_code_query_hides_the_verification_bookkeeping(clone_repo: Path) -> None:
+    """Hashes and symbol ids are read to verify rows, not to ship them."""
+    build_clones(clone_repo)
+    row = code_query(select="clones", repo_root=clone_repo).rows[0]
+
+    for internal in ("symbol_a", "symbol_b", "content_hash_a", "content_hash_b"):
+        assert internal not in row
+    assert "jaccard" in row
+
+
+def test_code_query_verifies_rows_before_applying_the_limit(clone_repo: Path) -> None:
+    """Filtering after the limit would silently return short.
+
+    A stale top-scoring pair would eat a slot in the result and leave the caller
+    with fewer rows than it asked for, with nothing saying why.
+    """
+    build_clones(clone_repo)
+    _set_content_hash(clone_repo, "src/a.py::compute_average", "changed-hash")
+
+    result = code_query(select="clones", limit=50, repo_root=clone_repo)
+    assert result.superseded_rows is not None and result.superseded_rows >= 1
+    assert all(row["qualified_name_a"] != "compute_average" for row in result.rows)
+
+
+# --------------------------------------------------------------------------- #
+# Signature cache                                                             #
+# --------------------------------------------------------------------------- #
+
+
+def test_a_rebuild_reuses_every_signature_when_nothing_changed(clone_repo: Path) -> None:
+    """Signing was nearly all of a full pass: 39.3s cold, 1.3s warm on this repo.
+
+    A symbol under MIN_TOKENS is still read and tokenised on every pass -- it has
+    no cached signature because it never earned one -- which is why
+    `symbols_read` stays non-zero while `signatures_computed` goes to zero.
+    """
+    first = build_clones(clone_repo)
+    assert first.signatures_computed > 0
+    assert first.signatures_reused == 0
+
+    second = build_clones(clone_repo)
+    assert second.signatures_computed == 0
+    assert second.signatures_reused == first.signatures_computed
+    assert second.pairs == first.pairs
+
+
+def test_a_changed_symbol_is_rehashed_and_the_rest_are_not(clone_repo: Path) -> None:
+    build_clones(clone_repo)
+    _set_content_hash(clone_repo, "src/a.py::compute_average", "changed-hash")
+
+    second = build_clones(clone_repo)
+    assert second.signatures_computed == 1
+    assert second.signatures_reused == 3
+    assert second.symbols_read == 1, "only the edited symbol should be re-read"
+
+
+def test_a_cached_signature_is_never_reused_across_a_content_change(clone_repo: Path) -> None:
+    """The one way this cache could be wrong rather than merely slow.
+
+    Keyed on content_hash, not symbol_id: an edited symbol keeps its id.
+    """
+    from lemoncrow.infra.code_intel.clones import _cache_hit, _load_signature_cache
+    from lemoncrow.infra.code_intel.store import CodeIntelStore
+
+    build_clones(clone_repo)
+    _set_content_hash(clone_repo, "src/a.py::compute_average", "changed-hash")
+
+    with CodeIntelStore(clone_repo) as store:
+        rows = {row.symbol_id: row for row in store.symbols()}
+        cached = _load_signature_cache(clone_repo, store.repo_id)
+
+    assert not _cache_hit(cached, rows["src/a.py::compute_average"])
+    assert _cache_hit(cached, rows["src/b.py::compute_average_copy"])
+
+
+def test_a_signature_of_the_wrong_width_is_a_miss(clone_repo: Path) -> None:
+    """Guards a future NUM_PERM change from mixing two signature geometries."""
+    from lemoncrow.infra.code_intel.clones import _cache_hit, _load_signature_cache
+    from lemoncrow.infra.code_intel.sidecar import open_sidecar
+    from lemoncrow.infra.code_intel.store import CodeIntelStore
+
+    build_clones(clone_repo)
+    conn = open_sidecar(clone_repo)
+    try:
+        conn.execute("UPDATE symbol_signatures SET signature = ?", (b"\x00" * 8,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    with CodeIntelStore(clone_repo) as store:
+        rows = list(store.symbols())
+        cached = _load_signature_cache(clone_repo, store.repo_id)
+
+    assert all(not _cache_hit(cached, row) for row in rows)
+
+
+def test_a_deleted_symbol_is_dropped_from_the_signature_cache(clone_repo: Path) -> None:
+    """Otherwise the cache grows without bound and a recycled id collides."""
+    from lemoncrow.infra.code_intel.clones import _load_signature_cache
+    from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, workspace_dir
+
+    build_clones(clone_repo)
+    conn = sqlite3.connect(workspace_dir(clone_repo) / CODE_CONTEXT_DB)
+    try:
+        conn.execute("DELETE FROM symbols WHERE symbol_id = ?", ("src/b.py::fetch_payload",))
+        conn.commit()
+    finally:
+        conn.close()
+
+    build_clones(clone_repo)
+    assert "src/b.py::fetch_payload" not in _load_signature_cache(clone_repo, "testrepo00000001")
+
+
+def test_a_missing_signature_cache_costs_time_not_correctness(clone_repo: Path) -> None:
+    """The cache is an accelerator; losing it must not change the answer."""
+    from lemoncrow.infra.code_intel.sidecar import open_sidecar
+
+    expected = build_clones(clone_repo).pairs
+    conn = open_sidecar(clone_repo)
+    try:
+        conn.execute("DROP TABLE symbol_signatures")
+        conn.commit()
+    finally:
+        conn.close()
+
+    assert build_clones(clone_repo).pairs == expected
+
+
+def test_build_refuses_a_torn_index(clone_repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F11 built this probe so nothing derives from a half-written index.
+
+    A clone table stamped authoritative from a partial index is that failure
+    with an extra step -- and `build_clones` was reading the store directly.
+    """
+    from lemoncrow.infra.code_intel import clones as clones_mod
+    from lemoncrow.infra.code_intel.freshness import STATUS_REBUILDING, IndexRebuilding, IndexState
+
+    monkeypatch.setattr(
+        clones_mod,
+        "index_state",
+        lambda root: IndexState(9, STATUS_REBUILDING, "index-write lock is held", "held"),
+    )
+    with pytest.raises(IndexRebuilding):
+        build_clones(clone_repo)
 
 
 def test_describe_schema_advertises_clones() -> None:

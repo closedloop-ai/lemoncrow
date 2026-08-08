@@ -890,6 +890,7 @@ def code_clones_cmd(
     something a tool call triggers implicitly.
     """
     from lemoncrow.infra.code_intel.clones import DEFAULT_THRESHOLD, MIN_TOKENS, build_clones
+    from lemoncrow.infra.code_intel.freshness import IndexRebuilding
     from lemoncrow.infra.code_intel.store import CodeIntelUnavailable
 
     try:
@@ -898,10 +899,10 @@ def code_clones_cmd(
             threshold=DEFAULT_THRESHOLD if threshold is None else threshold,
             min_tokens=MIN_TOKENS if min_tokens is None else min_tokens,
         )
-    except CodeIntelUnavailable as exc:
-        # Matches `lc code export` / `import` above: an unindexed workspace is a
-        # thing the user can fix, so it gets a one-line message rather than a
-        # traceback.
+    except (CodeIntelUnavailable, IndexRebuilding) as exc:
+        # Matches `lc code export` / `import` above: an unindexed workspace, or
+        # one mid-reindex, is a thing the user can act on, so it gets a one-line
+        # message rather than a traceback.
         raise click.ClickException(str(exc)) from exc
     if as_json:
         _emit(report.as_dict(), as_json=True)
@@ -914,6 +915,11 @@ def code_clones_cmd(
         f"  symbols compared: {report.symbols_considered}"
         f"  |  skipped as too short: {report.symbols_skipped_short}"
         f"  |  unreadable: {report.symbols_unreadable}"
+    )
+    click.echo(
+        f"  signatures reused: {report.signatures_reused}"
+        f"  |  computed: {report.signatures_computed}"
+        f"  |  symbols read from disk: {report.symbols_read}"
     )
     click.echo(f"  candidate pairs from banding: {report.candidate_pairs}")
     for pair in report.pairs[:limit]:
