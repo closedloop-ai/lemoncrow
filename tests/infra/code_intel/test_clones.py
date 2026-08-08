@@ -349,6 +349,30 @@ def test_banding_finds_every_pair_brute_force_would_report(clone_repo: Path) -> 
     assert found == brute
 
 
+def test_banding_recall_curve_matches_the_documented_probabilities() -> None:
+    """The module docstring states this curve; a wrong number there misleads.
+
+    P(some band matches) = 1 - (1 - s**ROWS_PER_BAND)**BANDS. Pinning it means
+    retuning the split without correcting the prose fails here.
+    """
+    from lemoncrow.infra.code_intel.clones import BANDS, ROWS_PER_BAND
+
+    def survives(similarity: float) -> float:
+        return 1 - (1 - similarity**ROWS_PER_BAND) ** BANDS
+
+    assert round(survives(0.9), 4) == 0.9999
+    assert round(survives(0.8), 3) == 0.947
+    assert round(survives(0.7), 3) == 0.613
+    assert round(survives(0.5), 3) == 0.061
+
+
+def test_banding_split_covers_the_whole_signature() -> None:
+    """Leftover rows would be silently excluded from every band."""
+    from lemoncrow.infra.code_intel.clones import BANDS, ROWS_PER_BAND
+
+    assert BANDS * ROWS_PER_BAND == NUM_PERM
+
+
 def test_every_reported_pair_was_actually_scored(clone_repo: Path) -> None:
     """Banding proposes; scoring disposes. No pair is reported on banding alone."""
     report = build_clones(clone_repo)

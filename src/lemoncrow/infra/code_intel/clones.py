@@ -37,9 +37,11 @@ comparisons -- not a tuning problem, a different program. Signatures are banded
 instead: :data:`BANDS` bands of :data:`ROWS_PER_BAND` rows, and two symbols
 become *candidates* only when some band matches exactly. A pair with true
 similarity ``s`` survives banding with probability
-``1 - (1 - s**ROWS_PER_BAND)**BANDS`` -- at the shipped 16x8 split that is
-~99.9% at s=0.9, ~92% at s=0.8, and ~9% at s=0.5. Steep enough to discard
-almost everything while keeping almost every real clone.
+``1 - (1 - s**ROWS_PER_BAND)**BANDS`` -- at the shipped 16x8 split, 99.99% at
+s=0.9, 94.7% at s=0.8, 61.3% at s=0.7 and 6.1% at s=0.5. Steep enough to
+discard almost everything while keeping almost every real clone.
+(``test_banding_recall_curve_matches_the_documented_probabilities`` pins these,
+so the split cannot be retuned without the numbers here being updated.)
 
 Candidates are then scored individually, so banding costs recall and never
 precision: a reported pair was always measured, never assumed.
