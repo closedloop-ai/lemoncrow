@@ -35,7 +35,7 @@ __all__ = [
 SIDECAR_DB = "sidecar.sqlite"
 
 #: Bump when adding a migration below. Never renumber an existing one.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _BUSY_TIMEOUT_MS = 5_000
 
@@ -140,6 +140,42 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 signature    BLOB    NOT NULL,
                 PRIMARY KEY (repo_id, symbol_id)
             )
+            """,
+        ),
+    ),
+    (
+        4,
+        (
+            # Prose swamps the default ranking. Markdown headings are symbols
+            # like any other, and near-identical CHANGELOG sections or generated
+            # doc pages score 1.000 trivially -- on one reviewer's repo the top
+            # twelve pairs were 100% markdown and zero code. Carrying each side's
+            # language lets a caller filter, and lets the default query exclude
+            # prose while *saying* it did.
+            "DROP TABLE IF EXISTS symbol_clones",
+            """
+            CREATE TABLE symbol_clones (
+                repo_id          TEXT    NOT NULL,
+                symbol_a         TEXT    NOT NULL,
+                symbol_b         TEXT    NOT NULL,
+                content_hash_a   TEXT    NOT NULL,
+                content_hash_b   TEXT    NOT NULL,
+                language_a       TEXT    NOT NULL,
+                language_b       TEXT    NOT NULL,
+                prose            INTEGER NOT NULL,
+                qualified_name_a TEXT    NOT NULL,
+                qualified_name_b TEXT    NOT NULL,
+                file_path_a      TEXT    NOT NULL,
+                file_path_b      TEXT    NOT NULL,
+                token_count_a    INTEGER NOT NULL,
+                token_count_b    INTEGER NOT NULL,
+                jaccard          REAL    NOT NULL,
+                PRIMARY KEY (repo_id, symbol_a, symbol_b)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_symbol_clones_score
+                ON symbol_clones(repo_id, prose, jaccard DESC)
             """,
         ),
     ),

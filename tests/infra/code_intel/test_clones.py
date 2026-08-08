@@ -872,6 +872,88 @@ def test_build_refuses_a_torn_index(clone_repo: Path, monkeypatch: pytest.Monkey
         build_clones(clone_repo)
 
 
+# --------------------------------------------------------------------------- #
+# Prose                                                                        #
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def prose_repo(make_workspace: WorkspaceFactory) -> Path:
+    """Two identical doc sections alongside two identical functions."""
+    root = make_workspace(
+        files=[{"file_path": p} for p in ("a.md", "b.md", "src/x.py", "src/y.py")]
+    )
+    rows: list[dict[str, object]] = []
+    for path in ("a.md", "b.md"):
+        rows += _write_module(root, path, [("section", _BODY)])
+    rows += _write_module(root, "src/x.py", [("one", _RENAMED_BODY)])
+    rows += _write_module(root, "src/y.py", [("two", _RENAMED_BODY)])
+    _insert_symbols(root, rows)
+    _set_language(root, "a.md", "markdown")
+    _set_language(root, "b.md", "markdown")
+    return root
+
+
+def _set_language(root: Path, file_path: str, language: str) -> None:
+    from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, workspace_dir
+
+    conn = sqlite3.connect(workspace_dir(root) / CODE_CONTEXT_DB)
+    try:
+        conn.execute("UPDATE symbols SET language = ? WHERE file_path = ?", (language, file_path))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_prose_pairs_are_detected_and_stored(prose_repo: Path) -> None:
+    """Duplicated docs are a real finding -- excluded from a view, not from the data."""
+    build_clones(prose_repo)
+    view = load_clones(prose_repo, include_prose=True)
+    assert any(pair.is_prose for pair in view.pairs)
+
+
+def test_the_default_view_excludes_prose(prose_repo: Path) -> None:
+    """Measured on a reviewer's repo, the whole unfiltered top twelve was markdown."""
+    build_clones(prose_repo)
+    view = load_clones(prose_repo)
+    assert view.pairs
+    assert not any(pair.is_prose for pair in view.pairs)
+
+
+def test_code_query_excludes_prose_by_default_and_says_so(prose_repo: Path) -> None:
+    """An applied default the caller cannot see is indistinguishable from a bug."""
+    build_clones(prose_repo)
+    result = code_query(select="clones", repo_root=prose_repo)
+
+    assert result.where == {"prose": 0}
+    assert result.rows
+    assert all(row["language_a"] != "markdown" for row in result.rows)
+
+
+def test_asking_for_prose_turns_the_default_off(prose_repo: Path) -> None:
+    build_clones(prose_repo)
+    result = code_query(select="clones", where={"prose": 1}, repo_root=prose_repo)
+
+    assert result.rows
+    assert all(row["language_a"] == "markdown" for row in result.rows)
+
+
+def test_a_language_predicate_also_disables_the_default(prose_repo: Path) -> None:
+    """Naming a language means the caller is steering; do not steer over them."""
+    build_clones(prose_repo)
+    result = code_query(select="clones", where={"language_a": "markdown"}, repo_root=prose_repo)
+
+    assert "prose" not in result.where
+    assert result.rows
+
+
+def test_rows_carry_the_language_of_each_side(prose_repo: Path) -> None:
+    build_clones(prose_repo)
+    row = code_query(select="clones", repo_root=prose_repo).rows[0]
+    assert row["language_a"] == "python"
+    assert row["language_b"] == "python"
+
+
 def test_describe_schema_advertises_clones() -> None:
     from lemoncrow.infra.code_intel.query import describe_schema
 

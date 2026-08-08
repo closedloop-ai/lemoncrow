@@ -258,6 +258,8 @@ _CLONES = _Select(
         "qualified_name_b",
         "file_path_a",
         "file_path_b",
+        "language_a",
+        "language_b",
         "token_count_a",
         "token_count_b",
         "jaccard",
@@ -268,11 +270,14 @@ _CLONES = _Select(
         "qualified_name_b": "qualified_name_b",
         "file_path_a": "file_path_a",
         "file_path_b": "file_path_b",
+        "language_a": "language_a",
+        "language_b": "language_b",
+        "prose": "prose",
         "jaccard": "jaccard",
         "token_count_a": "token_count_a",
         "token_count_b": "token_count_b",
     },
-    numeric=frozenset({"jaccard", "token_count_a", "token_count_b"}),
+    numeric=frozenset({"jaccard", "token_count_a", "token_count_b", "prose"}),
     name_column="qualified_name_a",
     # The score is the reason this table exists. Ordering by name instead sent
     # the default `limit=50` at the alphabetically-first of ~1,900 pairs and
@@ -517,7 +522,16 @@ def code_query(
         raise QueryError(f"limit must be an integer, got {limit!r}") from exc
     limit = max(1, min(limit, MAX_LIMIT))
 
-    predicates = _build_predicates(spec, where or {})
+    requested = dict(where or {})
+    if spec.name == "clones" and not any(key.startswith(("prose", "language_")) for key in requested):
+        # Markdown headings are symbols, and two near-identical CHANGELOG
+        # sections reach 1.000 without effort -- measured on one repo, the whole
+        # top twelve was prose and no code. Excluding it by default is what makes
+        # the default query useful, and the applied predicate is echoed back in
+        # `where` so the filtering is visible rather than magic. Say
+        # `prose: 1` (or any language_* predicate) to see it.
+        requested["prose"] = 0
+    predicates = _build_predicates(spec, requested)
 
     with CodeIntelStore(repo_root) as store:
         index_version = store.engine_state("index_version")
@@ -545,7 +559,7 @@ def code_query(
                 sidecar_conn.close()
             return QueryResult(
                 select=select,
-                where=dict(where or {}),
+                where=requested,
                 order_by=order_by,
                 limit=limit,
                 rows=(),
@@ -623,7 +637,7 @@ def code_query(
 
     return QueryResult(
         select=select,
-        where=dict(where or {}),
+        where=requested,
         order_by=order_by,
         limit=limit,
         rows=tuple(rows[:limit]),

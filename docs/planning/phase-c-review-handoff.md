@@ -30,6 +30,24 @@ The six existing selects (`symbols`, `callers`, `callees`, `importers`,
 rather than the engine, which is the only structural difference: it is derived
 data we produce, so it can be *absent* rather than merely empty.
 
+### Row shape — read this before probing
+
+A reviewer probed `symbol_a`, got `None`, and nearly filed "MCP returns null
+symbol names". Symbol *names* are `qualified_name_a` / `qualified_name_b`;
+`symbol_a` / `symbol_b` are engine symbol ids used internally to re-verify each
+row and are stripped before the rows are returned. A row is exactly:
+
+```
+qualified_name_a, qualified_name_b     # the two symbols, by name
+file_path_a, file_path_b
+language_a, language_b
+token_count_a, token_count_b           # normalised tokens, post-placeholdering
+jaccard                                # estimated similarity, 0.0-1.0
+```
+
+`code_query(describe=true)` returns the whitelist as data, including the
+queryable fields (which add `prose`) — use it rather than guessing.
+
 ## 2. How it decides two symbols are clones
 
 Source is sliced from each symbol's `start_byte`/`end_byte`, tokenised,
@@ -61,8 +79,9 @@ lc code clones --limit 12
 ```
 
 Expect a pair count, plus `symbols compared` / `skipped as too short` /
-`unreadable` / `candidate pairs from banding`. Roughly half of all symbols are
-skipped as shorter than `MIN_TOKENS = 40`; that is intended, not a failure.
+`unreadable` / `candidate pairs from banding`. A large share of symbols is
+skipped as shorter than `MIN_TOKENS = 40` — 52% here, 61% on a reviewer's repo
+— and the exact rate is repo-specific. That is intended, not a failure.
 
 > **Numbers drift between runs, and that is expected.** The engine reindexes on
 > its own, so `index_version` and the symbol count move. Across this session's
@@ -173,8 +192,14 @@ literals, truncating every click option and every URL in the repo.
 - **A worktree inside the repo gets indexed.** `.claude/worktrees/…` copies of
   a file pair against their originals at 1.000. That is an engine ignore-rule
   gap, not a detector fault.
-- **Markdown headings are symbols**, so docs sections participate. Useful, but
-  surprising if unexpected.
+- **Markdown headings are symbols**, and they *swamped* the default ranking
+  before this was fixed — on one reviewer's repo the entire unfiltered top
+  twelve was CHANGELOG sections and agent-doc headings, zero code. Prose pairs
+  are still detected and stored (duplicated docs are a real finding) but are
+  excluded from the default view. `code_query` echoes the applied predicate
+  (`where: {"prose": 0}`) so the filtering is visible; pass `prose: 1` or any
+  `language_*` predicate to turn it off, or `--include-prose` on the CLI. Here
+  that hides 550 of 1,778 pairs.
 - **`--` is not treated as a comment marker.** It serves SQL/Lua/Haskell and is
   a decrement operator in the C-family languages that dominate here, so SQL
   comments survive as tokens. Deliberate: mild noise beats truncated code.

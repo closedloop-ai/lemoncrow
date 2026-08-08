@@ -9743,7 +9743,9 @@ def tool_code_query(
     _lt _lte`. `order_by` is `name`, `centrality`, or `callers`. Pass
     `describe=true` for the exact field whitelist. Unknown fields are rejected,
     never ignored. No raw SQL. `select="clones"` needs `lc code clones` to have
-    been run and errors rather than returning nothing if it has not.
+    been run and errors rather than returning nothing if it has not; it excludes
+    markdown/text pairs unless you pass `prose` or a `language_*` predicate, and
+    reports `coverage` for reading an absence.
     """
     from lemoncrow.infra.code_intel.query import code_query, describe_schema
 

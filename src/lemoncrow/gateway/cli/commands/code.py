@@ -870,12 +870,18 @@ def code_import_cmd(source: Path, repo_root: str | None, force: bool, as_json: b
     help="Skip symbols with fewer normalised tokens than this (default: 40).",
 )
 @click.option("--limit", type=int, default=20, show_default=True, help="Pairs to print.")
+@click.option(
+    "--include-prose",
+    is_flag=True,
+    help="Include markdown/text sections. Off by default: near-identical doc headings score 1.000 easily and bury code findings.",
+)
 @click.option("--repo-root", default=None, help="Repository root (default: the resolved workspace root).")
 @click.option("--json", "as_json", is_flag=True)
 def code_clones_cmd(
     threshold: float | None,
     min_tokens: int | None,
     limit: int,
+    include_prose: bool,
     repo_root: str | None,
     as_json: bool,
 ) -> None:
@@ -922,13 +928,17 @@ def code_clones_cmd(
         f"  |  symbols read from disk: {report.symbols_read}"
     )
     click.echo(f"  candidate pairs from banding: {report.candidate_pairs}")
-    for pair in report.pairs[:limit]:
+    shown = report.pairs if include_prose else tuple(p for p in report.pairs if not p.is_prose)
+    prose_count = len(report.pairs) - len(shown)
+    if prose_count and not include_prose:
+        click.echo(f"  {prose_count} prose pair(s) hidden (--include-prose to show)")
+    for pair in shown[:limit]:
         click.echo(
             f"  {pair.jaccard:.3f}  {pair.qualified_name_a} ({pair.file_path_a})"
             f"  <->  {pair.qualified_name_b} ({pair.file_path_b})"
         )
-    if len(report.pairs) > limit:
-        click.echo(f"  ... {len(report.pairs) - limit} more (--limit to show)")
+    if len(shown) > limit:
+        click.echo(f"  ... {len(shown) - limit} more (--limit to show)")
 
 
 @code_group.command("prune")

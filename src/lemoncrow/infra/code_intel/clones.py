@@ -84,6 +84,7 @@ __all__ = [
     "DEFAULT_THRESHOLD",
     "MIN_TOKENS",
     "NUM_PERM",
+    "PROSE_LANGUAGES",
     "ROWS_PER_BAND",
     "SHINGLE_K",
     "ClonePair",
@@ -125,6 +126,14 @@ MIN_TOKENS = 40
 
 #: Pairs scoring below this are not recorded.
 DEFAULT_THRESHOLD = 0.8
+
+#: Languages whose "symbols" are prose sections rather than code. Markdown
+#: headings are indexed like any other symbol, and two near-identical CHANGELOG
+#: entries or generated doc pages reach 1.000 without effort -- on one repo the
+#: entire top twelve was markdown and no code at all. Pairs are still detected
+#: and stored (duplicated docs are a real finding); they are marked so a caller
+#: can exclude them, and the default query does.
+PROSE_LANGUAGES = frozenset({"markdown", "md", "text", "plaintext", "rst", "restructuredtext", "asciidoc", "org"})
 
 if BANDS * ROWS_PER_BAND != NUM_PERM:  # pragma: no cover - guards a constant edit
     raise AssertionError(f"BANDS*ROWS_PER_BAND ({BANDS * ROWS_PER_BAND}) must equal NUM_PERM ({NUM_PERM})")
@@ -234,6 +243,8 @@ class ClonePair:
     symbol_b: str
     content_hash_a: str
     content_hash_b: str
+    language_a: str
+    language_b: str
     qualified_name_a: str
     qualified_name_b: str
     file_path_a: str
@@ -246,6 +257,8 @@ class ClonePair:
         return {
             "symbol_a": self.symbol_a,
             "symbol_b": self.symbol_b,
+            "language_a": self.language_a,
+            "language_b": self.language_b,
             "qualified_name_a": self.qualified_name_a,
             "qualified_name_b": self.qualified_name_b,
             "file_path_a": self.file_path_a,
@@ -254,6 +267,11 @@ class ClonePair:
             "token_count_b": self.token_count_b,
             "jaccard": self.jaccard,
         }
+
+    @property
+    def is_prose(self) -> bool:
+        """True when either side is a prose section rather than code."""
+        return self.language_a in PROSE_LANGUAGES or self.language_b in PROSE_LANGUAGES
 
     def still_current(self, hashes: dict[str, str]) -> bool:
         """True when both symbols still hold the content this pair was measured on."""
@@ -622,6 +640,8 @@ def build_clones(
                 symbol_b=right,
                 content_hash_a=row_a.content_hash,
                 content_hash_b=row_b.content_hash,
+                language_a=row_a.language,
+                language_b=row_b.language,
                 qualified_name_a=row_a.qualified_name,
                 qualified_name_b=row_b.qualified_name,
                 file_path_a=row_a.file_path,
@@ -673,9 +693,9 @@ def _persist(
         conn.execute("DELETE FROM symbol_clones WHERE repo_id = ?", (repo_id,))
         conn.executemany(
             "INSERT INTO symbol_clones (repo_id, symbol_a, symbol_b, content_hash_a, content_hash_b, "
-            "qualified_name_a, qualified_name_b, file_path_a, file_path_b, "
-            "token_count_a, token_count_b, jaccard) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "language_a, language_b, prose, qualified_name_a, qualified_name_b, "
+            "file_path_a, file_path_b, token_count_a, token_count_b, jaccard) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     repo_id,
@@ -683,6 +703,9 @@ def _persist(
                     pair.symbol_b,
                     pair.content_hash_a,
                     pair.content_hash_b,
+                    pair.language_a,
+                    pair.language_b,
+                    int(pair.is_prose),
                     pair.qualified_name_a,
                     pair.qualified_name_b,
                     pair.file_path_a,
@@ -779,7 +802,7 @@ def signature_coverage(repo_root: Path | str = ".") -> tuple[int, int]:
     return sum(1 for row in symbols if _cache_hit(cached, row)), len(symbols)
 
 
-def load_clones(repo_root: Path | str = ".", limit: int = 50) -> CloneView:
+def load_clones(repo_root: Path | str = ".", limit: int = 50, include_prose: bool = False) -> CloneView:
     """Stored pairs that still hold, with the coverage needed to read them.
 
     Raises :class:`ClonesStale` only when nothing has ever built the table --
@@ -801,8 +824,9 @@ def load_clones(repo_root: Path | str = ".", limit: int = 50) -> CloneView:
         # limiting first would silently return fewer pairs than asked for
         # whenever any of the top-scoring ones had gone stale.
         rows = conn.execute(
-            "SELECT symbol_a, symbol_b, content_hash_a, content_hash_b, qualified_name_a, "
-            "qualified_name_b, file_path_a, file_path_b, token_count_a, token_count_b, jaccard "
+            "SELECT symbol_a, symbol_b, content_hash_a, content_hash_b, language_a, language_b, "
+            "qualified_name_a, qualified_name_b, file_path_a, file_path_b, "
+            "token_count_a, token_count_b, jaccard "
             "FROM symbol_clones WHERE repo_id = ? "
             "ORDER BY jaccard DESC, qualified_name_a, qualified_name_b",
             (repo_id or "",),
@@ -813,6 +837,8 @@ def load_clones(repo_root: Path | str = ".", limit: int = 50) -> CloneView:
         conn.close()
 
     recorded = [_row_to_pair(row) for row in rows]
+    if not include_prose:
+        recorded = [pair for pair in recorded if not pair.is_prose]
     current = [pair for pair in recorded if pair.still_current(hashes)]
 
     cached = _load_signature_cache(root, repo_id or "")
@@ -835,6 +861,8 @@ def _row_to_pair(row: sqlite3.Row) -> ClonePair:
         symbol_b=str(row["symbol_b"]),
         content_hash_a=str(row["content_hash_a"]),
         content_hash_b=str(row["content_hash_b"]),
+        language_a=str(row["language_a"]),
+        language_b=str(row["language_b"]),
         qualified_name_a=str(row["qualified_name_a"]),
         qualified_name_b=str(row["qualified_name_b"]),
         file_path_a=str(row["file_path_a"]),
