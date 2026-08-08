@@ -73,6 +73,21 @@ def test_objective_for_coverage(coverage: float | None, expected: str) -> None:
     assert objective_for_coverage(coverage) == expected
 
 
+def test_discarded_rows_downgrade_even_at_full_coverage() -> None:
+    """"Rows were dropped" and "the subject was under-examined" are two claims.
+
+    They normally move together, since a row is superseded because its symbol's
+    content changed -- the same fact that lowers coverage. Checking only one left
+    a representable state where an answer had quietly lost rows and still called
+    itself exhaustive.
+    """
+    from lemoncrow.infra.code_intel.completeness import objective_for_coverage
+
+    assert objective_for_coverage(1.0, 0) == "exhaustive"
+    assert objective_for_coverage(1.0, 3) == "partial"
+    assert objective_for_coverage(None, 3) == "exhaustive", "live surfaces have no stored rows"
+
+
 def test_with_objective_stamps_in_place() -> None:
     payload: dict[str, object] = {"rows": []}
     assert with_objective(payload, OBJECTIVE_EXHAUSTIVE) is payload

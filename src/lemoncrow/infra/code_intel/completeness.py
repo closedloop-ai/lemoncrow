@@ -139,16 +139,26 @@ CODE_OP_MATCH_KINDS: dict[str, str] = {
 }
 
 
-def objective_for_coverage(coverage: float | None) -> str:
-    """The objective a stored-result surface may claim at this coverage.
+def objective_for_coverage(coverage: float | None, superseded: int | None = None) -> str:
+    """The objective a stored-result surface may claim about this answer.
 
-    ``None`` means the surface reads live data, where the question does not
-    arise. Anything short of full coverage is :data:`OBJECTIVE_PARTIAL`: some of
-    the subject was never examined, so an absent row proves nothing about it.
+    ``coverage is None`` means the surface reads live data, where the question
+    does not arise. Otherwise the answer is :data:`OBJECTIVE_PARTIAL` when
+    either the subject was not fully examined (*coverage* below 1.0) or some
+    stored rows were dropped as superseded.
+
+    Both conditions are checked rather than one inferred from the other. In
+    practice they move together -- a row is superseded because its symbol's
+    content changed, which is the same fact that lowers coverage -- but
+    "rows were discarded" and "the subject was under-examined" are separate
+    claims, and an answer that quietly lost rows is not exhaustive whatever the
+    coverage figure says.
     """
-    if coverage is None or coverage >= 1.0:
+    if coverage is None:
         return OBJECTIVE_EXHAUSTIVE
-    return OBJECTIVE_PARTIAL
+    if coverage < 1.0 or (superseded or 0) > 0:
+        return OBJECTIVE_PARTIAL
+    return OBJECTIVE_EXHAUSTIVE
 
 
 def with_objective(payload: dict[str, Any], objective: str) -> dict[str, Any]:

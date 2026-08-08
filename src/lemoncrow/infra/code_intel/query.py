@@ -329,7 +329,7 @@ class QueryResult:
             # `objective: "exhaustive"`, which passes the completeness predicate
             # while asserting this code has no duplicates. `coverage` said
             # otherwise, but the contract does not oblige anyone to read it.
-            "objective": objective_for_coverage(self.coverage),
+            "objective": objective_for_coverage(self.coverage, self.superseded_rows),
             "select": self.select,
             "where": self.where,
             "order_by": self.order_by,
