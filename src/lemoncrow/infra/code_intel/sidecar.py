@@ -35,7 +35,7 @@ __all__ = [
 SIDECAR_DB = "sidecar.sqlite"
 
 #: Bump when adding a migration below. Never renumber an existing one.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 4
 
 _BUSY_TIMEOUT_MS = 5_000
 
@@ -53,6 +53,129 @@ _MIGRATIONS: tuple[tuple[int, tuple[str, ...]], ...] = (
                 engine_index_version INTEGER NOT NULL,
                 built_at             TEXT    NOT NULL
             )
+            """,
+        ),
+    ),
+    (
+        2,
+        (
+            # F6. `repo_id` is carried even though the sidecar is already
+            # per-repo, so `code_query` can reach this table through the same
+            # `WHERE repo_id = ?` shape it uses for every engine table -- one
+            # query builder rather than a sidecar-shaped special case in it.
+            #
+            # The pair is stored once, with `symbol_a < symbol_b` enforced by the
+            # writer. Storing both directions would double the table and let a
+            # reader that forgets to deduplicate report every clone twice.
+            """
+            CREATE TABLE IF NOT EXISTS symbol_clones (
+                repo_id          TEXT    NOT NULL,
+                symbol_a         TEXT    NOT NULL,
+                symbol_b         TEXT    NOT NULL,
+                qualified_name_a TEXT    NOT NULL,
+                qualified_name_b TEXT    NOT NULL,
+                file_path_a      TEXT    NOT NULL,
+                file_path_b      TEXT    NOT NULL,
+                token_count_a    INTEGER NOT NULL,
+                token_count_b    INTEGER NOT NULL,
+                jaccard          REAL    NOT NULL,
+                PRIMARY KEY (repo_id, symbol_a, symbol_b)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_symbol_clones_score
+                ON symbol_clones(repo_id, jaccard DESC)
+            """,
+        ),
+    ),
+    (
+        3,
+        (
+            # F6, second pass. Freshness was keyed on `engine_index_version`, a
+            # global counter any file's reindex bumps -- so one unrelated edit
+            # discarded a table still correct for ~24,000 untouched symbols.
+            # Measured here: three bumps inside one session, the table unusable
+            # within minutes of each build.
+            #
+            # Whether a pair is still valid depends only on the two symbols'
+            # content, and the engine already records `symbols.content_hash`.
+            # Carrying both hashes on the pair makes validity checkable per row
+            # against the live index, so a reader returns a verified-current
+            # subset instead of refusing wholesale.
+            #
+            # Recreated rather than ALTERed: the rows are derived and cheap to
+            # rebuild, and back-filling a hash never recorded would be inventing
+            # provenance for rows we cannot actually vouch for.
+            "DROP TABLE IF EXISTS symbol_clones",
+            """
+            CREATE TABLE symbol_clones (
+                repo_id          TEXT    NOT NULL,
+                symbol_a         TEXT    NOT NULL,
+                symbol_b         TEXT    NOT NULL,
+                content_hash_a   TEXT    NOT NULL,
+                content_hash_b   TEXT    NOT NULL,
+                qualified_name_a TEXT    NOT NULL,
+                qualified_name_b TEXT    NOT NULL,
+                file_path_a      TEXT    NOT NULL,
+                file_path_b      TEXT    NOT NULL,
+                token_count_a    INTEGER NOT NULL,
+                token_count_b    INTEGER NOT NULL,
+                jaccard          REAL    NOT NULL,
+                PRIMARY KEY (repo_id, symbol_a, symbol_b)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_symbol_clones_score
+                ON symbol_clones(repo_id, jaccard DESC)
+            """,
+            # Signatures keyed by content, so a rebuild re-tokenises only what
+            # changed. Hashing 12k symbols' source was ~all of a 33s full pass;
+            # banding over cached signatures is the cheap part.
+            """
+            CREATE TABLE IF NOT EXISTS symbol_signatures (
+                repo_id      TEXT    NOT NULL,
+                symbol_id    TEXT    NOT NULL,
+                content_hash TEXT    NOT NULL,
+                token_count  INTEGER NOT NULL,
+                signature    BLOB    NOT NULL,
+                PRIMARY KEY (repo_id, symbol_id)
+            )
+            """,
+        ),
+    ),
+    (
+        4,
+        (
+            # Prose swamps the default ranking. Markdown headings are symbols
+            # like any other, and near-identical CHANGELOG sections or generated
+            # doc pages score 1.000 trivially -- on one reviewer's repo the top
+            # twelve pairs were 100% markdown and zero code. Carrying each side's
+            # language lets a caller filter, and lets the default query exclude
+            # prose while *saying* it did.
+            "DROP TABLE IF EXISTS symbol_clones",
+            """
+            CREATE TABLE symbol_clones (
+                repo_id          TEXT    NOT NULL,
+                symbol_a         TEXT    NOT NULL,
+                symbol_b         TEXT    NOT NULL,
+                content_hash_a   TEXT    NOT NULL,
+                content_hash_b   TEXT    NOT NULL,
+                language_a       TEXT    NOT NULL,
+                language_b       TEXT    NOT NULL,
+                prose            INTEGER NOT NULL,
+                qualified_name_a TEXT    NOT NULL,
+                qualified_name_b TEXT    NOT NULL,
+                file_path_a      TEXT    NOT NULL,
+                file_path_b      TEXT    NOT NULL,
+                token_count_a    INTEGER NOT NULL,
+                token_count_b    INTEGER NOT NULL,
+                jaccard          REAL    NOT NULL,
+                PRIMARY KEY (repo_id, symbol_a, symbol_b)
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_symbol_clones_score
+                ON symbol_clones(repo_id, prose, jaccard DESC)
             """,
         ),
     ),
