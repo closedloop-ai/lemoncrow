@@ -12,6 +12,7 @@ def _launch(tmp_path: Path, engine: str, *, prompt: str | None = None, resume: s
         executable=f"/bin/{engine}",
         base_url="http://127.0.0.1:43210",
         token="secret",
+        store_root=tmp_path,
         project_root=tmp_path,
         empty_mcp_config=tmp_path / "empty.json",
         budget="balanced",
@@ -27,13 +28,19 @@ def test_lemoncode_is_a_managed_controlled_frontend(tmp_path: Path) -> None:
 
     assert launch.command[:2] == ("/bin/lemoncode", "--pure")
     assert launch.command[-2:] == ("run", "fix it")
-    assert config["model"] == "lc/lemoncrow"
+    # No "Auto" placeholder -- launches pinned directly to a real, visible
+    # model (Zen's keyless free default) instead of blind auto-routing.
+    assert config["model"] == "lc/zen/big-pickle"
+    assert "--model" in launch.command
+    assert launch.command[launch.command.index("--model") + 1] == "lc/zen/big-pickle"
     assert config["enabled_providers"] == ["lc"]
     assert config["share"] == "disabled"
     assert config["snapshot"] is False
     assert config["autoupdate"] is False
     assert config["provider"]["lc"]["options"]["baseURL"].endswith("/v1")
-    assert config["provider"]["lc"]["models"]["lemoncrow"]["limit"]["output"] == 5200
+    assert "lemoncrow" not in config["provider"]["lc"]["models"]
+    assert config["provider"]["lc"]["models"]["zen/big-pickle"]["limit"]["output"] == 5200
+    assert any(key.startswith("zen/") for key in config["provider"]["lc"]["models"])
     assert "mcp" not in config
     assert launch.env["LEMONCODE_MANAGED"] == "1"
     assert launch.env["LEMONCODE_STRIP_HOST_PROMPT"] == "1"

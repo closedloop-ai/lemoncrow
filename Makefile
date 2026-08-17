@@ -12,7 +12,7 @@ TEST_PRINT_TIME ?= 0
 # ~2 points below the first nightly run's reported total.
 COV_FAIL_UNDER ?= 66
 FORCE_ARG := $(if $(f),--force,)
-.PHONY: help uninstall dev build release/build prod status start restart build-host-skills sync-agent-context mirror release \
+.PHONY: help uninstall dev build release/build prod build-lemoncode-host status start restart build-host-skills sync-agent-context mirror release \
 	docs-check worktree-env runtime-evidence \
 	test test-fast test-cov test-full lint format-check format typecheck verify pre-commit \
 	proof-cost-quality import clean \
@@ -29,6 +29,7 @@ FORCE_ARG := $(if $(f),--force,)
 
 dev: ## Install LemonCrow in dev mode (stable source COPY, no auto-update); re-run to pick up edits, then /mcp reconnect
 	bash scripts/local.sh
+	@$(MAKE) build-lemoncode-host
 
 build: ## Build and package for production distribution
 	bash scripts/build.sh
@@ -50,7 +51,7 @@ release: ## Bump version, commit, push, tag: make release tag=v0.4.X [f=1] [SKIP
  uv lock; \
  git add pyproject.toml uv.lock; \
  git commit --no-verify -m "chore: bump to $$TAG" || echo "  → nothing new to commit, continuing..."; \
- git push --no-verify || echo "  → nothing to push, continuing..."; \
+ git push --no-verify -u origin HEAD || echo "  → nothing to push, continuing..."; \
  if [ "$$FORCE" = "1" ]; then \
    git tag -d $$TAG 2>/dev/null || true; \
    git push --no-verify --delete origin $$TAG 2>/dev/null || true; \
@@ -67,7 +68,9 @@ release: ## Bump version, commit, push, tag: make release tag=v0.4.X [f=1] [SKIP
    gh auth setup-git >/dev/null 2>&1 || true; \
  fi; \
  echo "Mirroring to public repo..."; \
- LEMONCROW_MIRROR_RUNNING=1 uv run python -m scripts.mirror; \
+ MIRROR_FORCE_ARG=; \
+ [ "$$FORCE" = "1" ] && MIRROR_FORCE_ARG=--force; \
+ LEMONCROW_MIRROR_RUNNING=1 uv run python -m scripts.mirror $$MIRROR_FORCE_ARG; \
  PUB_SHA=$$(git rev-parse refs/mirror/last-pub); \
  git push --no-verify $$PUSH_FLAG https://github.com/lemoncrow-lab/lemoncrow.git "$$PUB_SHA:refs/tags/$$TAG"; \
  echo "✓ Released $$TAG (dev + public)"
@@ -77,6 +80,18 @@ prod: ## Build and install from local production build (includes mypyc compilati
 	# Run the local installer: copies bundle/ → ~/.local/ and sets up host integrations,
 	# exactly mirroring the remote path (download → extract → bundle.sh).
 	bash scripts/install.sh --local
+	@$(MAKE) build-lemoncode-host
+
+build-lemoncode-host: ## Provision the LemonCode host binary: builds from the vendored opencode/ submodule if bun is available, else downloads a release. Skips if already installed; force rebuild with 'make build-lemoncode-host f=1'
+	@if [ -z "$(f)" ] && [ -x "$(LEMONCROW_STORE)/bin/lemoncode-host" ]; then \
+		echo "LemonCode host already installed at $(LEMONCROW_STORE)/bin/lemoncode-host -- skipping (force with f=1)"; \
+	elif command -v bun >/dev/null 2>&1 && git submodule update --init opencode >/dev/null 2>&1 && [ -f opencode/package.json ]; then \
+		echo "Building LemonCode host from source (opencode/ submodule)..."; \
+		$(LEMONCROW_CMD) code host build --source opencode; \
+	else \
+		echo "bun/opencode submodule unavailable -- downloading prebuilt LemonCode host release..."; \
+		$(LEMONCROW_CMD) code host install; \
+	fi
 
 uninstall: ## Remove all LemonCrow agent-host integrations, hooks, and bin wrappers
 	@bash scripts/uninstall.sh $${ARGS:-}

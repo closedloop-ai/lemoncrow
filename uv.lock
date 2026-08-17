@@ -2606,7 +2606,7 @@ wheels = [
 
 [[package]]
 name = "lemoncrow"
-version = "0.6.1"
+version = "0.6.6"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -2683,9 +2683,6 @@ ortools = [
 ]
 parsers = [
     { name = "tree-sitter-languages", marker = "python_full_version < '3.13' or (extra == 'extra-9-lemoncrow-langfuse' and extra == 'extra-9-lemoncrow-memory-server')" },
-]
-portable = [
-    { name = "zstandard" },
 ]
 postgres = [
     { name = "psycopg", extra = ["binary"] },
@@ -2790,9 +2787,8 @@ requires-dist = [
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.46.0" },
     { name = "yarl", specifier = "==1.24.2" },
     { name = "zipp", specifier = "==4.1.0" },
-    { name = "zstandard", marker = "extra == 'portable'", specifier = ">=0.22" },
 ]
-provides-extras = ["mcp", "memory", "memory-server", "smart", "cloud", "postgres", "vector", "semantic", "parsers", "portable", "rename", "ortools", "litellm", "langfuse", "dev"]
+provides-extras = ["mcp", "memory", "memory-server", "smart", "cloud", "postgres", "vector", "semantic", "parsers", "rename", "ortools", "litellm", "langfuse", "dev"]
 
 [package.metadata.requires-dev]
 dev = [
