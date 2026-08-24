@@ -142,7 +142,6 @@ if $WORKSPACE_SET; then
   "provider": {
     "lc": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "LemonCrow",
       "options": {
         "baseURL": "${LEMONCROW_OPENAI_BASE}",
         "apiKey": "local"
@@ -186,7 +185,6 @@ else
   "provider": {
     "lc": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "LemonCrow",
       "options": {
         "baseURL": "${LEMONCROW_OPENAI_BASE}",
         "apiKey": "local"

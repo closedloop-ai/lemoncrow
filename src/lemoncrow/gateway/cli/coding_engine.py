@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import click
 
@@ -86,12 +86,78 @@ def _output_ceiling(budget: str) -> int:
     return {"cheap": 3600, "balanced": 5200, "best": 7600}.get(budget, 5200)
 
 
+def _picker_model_entries(store_root: Path) -> list[tuple[str, str, str]]:
+    """Real, currently-runnable (litellm model id, provider, raw model) triples.
+
+    Best-effort: any failure here (no configured provider, pro module
+    unavailable, catalog error) just yields nothing -- Zen's free default is
+    always added separately, so launch must never fail because of this.
+    """
+    try:
+        from lemoncrow.gateway.cli.commands.run import _resolve_litellm_model
+        from lemoncrow.pro.capabilities.owned_execution_routing import (
+            OwnedExecutionRouteSelector,
+            OwnedRouteRequest,
+        )
+
+        catalog = OwnedExecutionRouteSelector(store_root).catalog(
+            OwnedRouteRequest(tool_name="edit", task_text="", mode="auto", budget="balanced")
+        )
+    except Exception:
+        return []
+
+    entries: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    for item in catalog:
+        for tier, raw_model in (("cheap", item.cheap_model), ("high", item.high_model)):
+            resolved = _resolve_litellm_model(item.provider, raw_model)
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            suffix = "" if item.cheap_model == item.high_model else f" ({tier})"
+            display = raw_model.split("/", 1)[-1] if "/" in raw_model else raw_model
+            entries.append((resolved, item.provider, f"{display}{suffix}"))
+    return entries
+
+
+def _picker_models(store_root: Path, output_ceiling: int) -> dict[str, dict[str, Any]]:
+    """opencode.json `provider.lc.models`.
+
+    Every real, currently runnable provider/model pair -- no "Auto"
+    placeholder. Selecting one always pins that exact model (never falls
+    into blind server-side auto-routing); Zen's keyless free tier is
+    guaranteed present so there is always at least one entry.
+    """
+    from lemoncrow.core.capabilities.providers.zen import ZEN_DEFAULT_FREE_MODEL
+
+    limit = {"context": 200_000, "output": output_ceiling}
+    models: dict[str, dict[str, Any]] = {
+        ZEN_DEFAULT_FREE_MODEL: {
+            "name": f"zen · {ZEN_DEFAULT_FREE_MODEL.removeprefix('zen/')}",
+            "limit": limit,
+        }
+    }
+    for resolved_model, provider, label in _picker_model_entries(store_root):
+        models[resolved_model] = {"name": f"{provider} · {label}", "limit": limit}
+    return models
+
+
+def _default_picker_model(models: dict[str, dict[str, Any]]) -> str:
+    """Launch model key: Zen's free default when present, else whatever is."""
+    from lemoncrow.core.capabilities.providers.zen import ZEN_DEFAULT_FREE_MODEL
+
+    if ZEN_DEFAULT_FREE_MODEL in models:
+        return ZEN_DEFAULT_FREE_MODEL
+    return next(iter(models))
+
+
 def _build_engine_launch(
     *,
     engine: str,
     executable: str,
     base_url: str,
     token: str,
+    store_root: Path,
     project_root: Path,
     empty_mcp_config: Path,
     budget: str,
@@ -110,10 +176,12 @@ def _build_engine_launch(
     output_ceiling = _output_ceiling(budget)
 
     if engine in {"lemoncode", "opencode"}:
+        picker_models = _picker_models(store_root, output_ceiling)
+        default_model = _default_picker_model(picker_models)
         config = {
             "$schema": "https://opencode.ai/config.json",
-            "model": "lc/lemoncrow",
-            "default_agent": "build",
+            "model": f"lc/{default_model}",
+            "default_agent": "code",
             "enabled_providers": ["lc"],
             "share": "disabled",
             "snapshot": False,
@@ -127,17 +195,18 @@ def _build_engine_launch(
                         "baseURL": f"{base_url}/v1",
                         "apiKey": token,
                     },
-                    "models": {
-                        "lemoncrow": {
-                            # Distinct from the provider name: the frontend
-                            # status line renders "<provider> <model>".
-                            "name": "Auto",
-                            "limit": {
-                                "context": 200_000,
-                                "output": output_ceiling,
-                            },
-                        }
-                    },
+                    "models": picker_models,
+                }
+            },
+            # OPENCODE_DISABLE_PROJECT_CONFIG=true below skips the on-disk
+            # agents/*.md discovery, so the "code" agent named by
+            # default_agent above must be defined here or the host errors
+            # with `default agent "code" not found`. Prompt/tools are blank
+            # here on purpose -- LEMONCODE_STRIP_HOST_PROMPT/TOOLS strip them
+            # for every agent regardless of name, so this is just a carrier id.
+            "agent": {
+                "code": {
+                    "mode": "primary",
                 }
             },
         }
@@ -155,9 +224,9 @@ def _build_engine_launch(
             executable,
             "--pure",
             "--model",
-            "lc/lemoncrow",
+            f"lc/{default_model}",
             "--agent",
-            "build",
+            "code",
         ]
         if prompt is not None:
             command.append("run")
@@ -387,6 +456,13 @@ def run_coding_engine(
     local_retrieval_model: str = "",
 ) -> int:
     """Run the selected mature frontend, with LemonCrow owning every model/tool turn."""
+    if provider == "zen" and not model:
+        # Zen's public tier needs no key -- default to its free model instead of
+        # forcing the user to already know a model id just to pin the vendor.
+        from lemoncrow.core.capabilities.providers.zen import ZEN_DEFAULT_FREE_MODEL
+
+        model = ZEN_DEFAULT_FREE_MODEL.removeprefix("zen/")
+        click.echo(f"lemoncrow: --provider zen with no --model; pinned to zen/{model}", err=True)
     if provider and not model:
         raise click.ClickException("--provider requires --model")
 
@@ -445,6 +521,7 @@ def run_coding_engine(
             executable=executable or selected,
             base_url=base_url,
             token=token,
+            store_root=store_root,
             project_root=project_root,
             empty_mcp_config=empty_mcp,
             budget=budget,

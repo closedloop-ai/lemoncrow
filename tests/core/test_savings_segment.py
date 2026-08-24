@@ -197,14 +197,15 @@ def _runway_frames(
 def test_runway_frame_reports_turns_left_and_the_share_lemoncrow_bought(
     lemoncrow_root: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """20 turns filled 35% of the window, so ~37 remain; 30k of saved context is
-    worth 10 more turns at the same burn."""
+    """20 turns filled 35% of the window, so ~37 remain; without the 30k of saved
+    context the burn would have been 1.5x heavier against a fuller window, leaving
+    18 -- so 19 of the 37 remaining turns are lc's."""
     frames = _runway_frames(lemoncrow_root, monkeypatch)
 
     runway = [f for f in frames if "turns left" in f]
     assert runway, f"expected a runway frame in {frames!r}"
     assert "~37 turns left" in runway[0]
-    assert "(+10 from lc)" in runway[0]
+    assert "(+19 from lc)" in runway[0]
 
 
 def test_runway_frame_carries_the_same_weight_as_the_savings_frame(
@@ -258,7 +259,7 @@ def test_runway_falls_back_to_the_state_file_statusline_parks(
     runway = [f for f in frames if "turns left" in f]
     assert runway, f"expected a runway frame from the parked state in {frames!r}"
     assert "~37 turns left" in runway[0]
-    assert "(+10 from lc)" in runway[0]
+    assert "(+19 from lc)" in runway[0]
 
 
 def test_runway_state_file_missing_or_malformed_is_not_fatal(
@@ -276,6 +277,53 @@ def test_runway_state_file_missing_or_malformed_is_not_fatal(
     frames = savings_frames("bad-session", lemoncrow_root=lemoncrow_root, no_color=True)
 
     assert frames and not any("turns left" in f for f in frames)
+
+
+def test_burn_rate_tracks_recent_turns_not_the_session_average() -> None:
+    """The last turns burn 6k each while the session averaged 3k; the runway has
+    to quote the burn the user is on now, not the one they started with."""
+    from lemoncrow.core.capabilities.savings_summary import _burn_rates, _runway_turns
+
+    # 30 turns, 90k in a 200k window (45%), the last 4 turns twice as heavy.
+    samples = [(26, 66_000, 0), (27, 72_000, 0), (28, 78_000, 0), (29, 84_000, 0), (30, 90_000, 0)]
+    burn, _saved_rate, _saved = _burn_rates(samples, turns=30, ctx_tok=90_000, ctx_saved=0)
+
+    assert burn == 6_000  # not 90_000 / 30 == 3_000
+    # 110k of window left: 18 turns at the measured burn, 36 at the average.
+    assert _runway_turns(90_000, 45.0, 30, burn) == 18
+
+
+def test_compact_rebases_the_burn_and_the_kept_out_total() -> None:
+    """/compact drops the window but not the turn count. Everything before the
+    drop describes a window that no longer exists, so it is discarded."""
+    from lemoncrow.core.capabilities.savings_summary import _burn_rates
+
+    samples = [
+        (20, 120_000, 400_000),  # pre-compact: fat window, 400k kept out so far
+        (21, 130_000, 420_000),
+        (22, 20_000, 430_000),  # /compact
+        (23, 24_000, 435_000),
+        (24, 28_000, 440_000),
+    ]
+    burn, saved_rate, saved_in_window = _burn_rates(samples, turns=24, ctx_tok=28_000, ctx_saved=440_000)
+
+    assert burn == 4_000  # post-compact deltas only, not the 10k pre-compact ones
+    assert saved_rate == 5_000
+    assert saved_in_window == 20_000  # 440k - 420k banked before the reset
+
+
+def test_ctx_sample_ring_overwrites_within_a_turn_and_is_bounded(lemoncrow_root: Path) -> None:
+    """The statusline re-renders many times per turn; those repeats must not
+    become zero-delta samples, and the ring must not grow without bound."""
+    from lemoncrow.core.capabilities.savings_summary import _RUNWAY_HIST_SAMPLES, _record_ctx_sample
+
+    for _ in range(3):
+        samples = _record_ctx_sample("ring-session", lemoncrow_root, 7, 50_000, 1_000)
+    assert samples == [(7, 50_000, 1_000)]
+
+    for turn in range(8, 8 + _RUNWAY_HIST_SAMPLES * 2):
+        samples = _record_ctx_sample("ring-session", lemoncrow_root, turn, turn * 5_000, turn * 100)
+    assert len(samples) == _RUNWAY_HIST_SAMPLES
 
 
 def test_savings_frames_weighted_and_segment_consistent(lemoncrow_root: Path) -> None:
