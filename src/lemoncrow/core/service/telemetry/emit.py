@@ -14,6 +14,7 @@ import atexit
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 from typing import Any
@@ -181,11 +182,18 @@ def flush_product_telemetry(timeout: float = 2.0) -> None:
 
 
 def _export_remote(event: str, props: dict[str, Any]) -> bool:
+    # This runs on the daemon drain thread, which can still be alive once the
+    # interpreter is finalizing — importing or driving the OTel SDK that late
+    # raises RuntimeError. Skip the remote hop; the caller still records the
+    # event locally with exported=False.
+    if sys.is_finalizing():
+        return False
     try:
         from lemoncrow.core.service.telemetry.exporters.otel import emit_product_log
 
         return emit_product_log(event, props)
     except Exception as exc:
-        logging.exception("Recovered from broad exception handler")
-        logger.debug("telemetry.remote_export_failed", extra={"event": event, "error": str(exc)})
+        # Never surface remote-export failures on the user's terminal: root-level
+        # logging.exception here printed a full traceback per CLI invocation.
+        logger.debug("telemetry.remote_export_failed", extra={"event": event, "error": str(exc)}, exc_info=True)
         return False
