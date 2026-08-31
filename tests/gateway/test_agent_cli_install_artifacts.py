@@ -127,6 +127,11 @@ def test_lemoncrow_meta_skill_ships_by_default_while_public_skills_stay_optional
             assert not (dest / name).exists(), f"{host}: {name} must not ship by default"
 
 
+def test_managed_pi_extension_and_docs_ship() -> None:
+    assert (INTEGRATIONS / "pi" / "managed.mjs").is_file()
+    assert (DOCS_HOSTS / "pi-install.md").is_file()
+
+
 def test_codex_plugin_agent_surface_exists() -> None:
     surface = INTEGRATIONS / "codex" / "plugin" / "agents" / "openai.yaml"
     assert surface.exists()
@@ -534,6 +539,21 @@ def test_managed_context_helper_shared_across_host_installs() -> None:
         assert (
             'source "${SCRIPT_DIR}/lib/managed_context.sh"' in content
         ), f"{script_name} must use the shared managed context helper"
+
+
+def test_distribution_bundle_ships_python_bootstrap_helper() -> None:
+    build_content = (SCRIPTS / "build.sh").read_text()
+    common_content = (SCRIPTS / "lib" / "common.sh").read_text()
+    assert 'source "${BASH_SOURCE[0]%/*}/python_bootstrap.sh"' in common_content
+    assert "cp -f scripts/lib/python_bootstrap.sh bundle/scripts/lib/python_bootstrap.sh" in build_content
+
+
+def test_distribution_installer_always_installs_wheel_and_propagates_failures() -> None:
+    content = (SCRIPTS / "install.sh").read_text()
+    assert '[[ "$LEMONCROW_NO_HOSTS" == "1" ]] && SETUP_ARGS+=(--no-hosts)' in content
+    assert "Skipping setup (LEMONCROW_NO_HOSTS=1)" not in content
+    assert '|| fail "LemonCrow setup failed while installing the bundled wheel."' in content
+    assert 'fail "bundle.sh not found at ${BUNDLE_SH} — the distribution archive is incomplete."' in content
 
 
 def test_local_sh_bootstraps_lemoncrow_before_host_installers() -> None:
