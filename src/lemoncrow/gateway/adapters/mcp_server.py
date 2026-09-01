@@ -7332,6 +7332,23 @@ def _edit_result_is_silent_success(result: dict[str, Any]) -> bool:
     return True
 
 
+#: Total post-write phase time an edit must exceed before it reports where the
+#: time went. Every edit result is re-billed on each later round-trip, so a
+#: healthy edit stays silent; a slow one explains itself without needing the
+#: event log. Tunable via LEMONCROW_EDIT_TIMING_MS (0 = always report).
+_DEFAULT_EDIT_TIMING_FLOOR_MS = 2_000
+
+
+def _edit_timing_floor_ms() -> int:
+    raw = os.environ.get("LEMONCROW_EDIT_TIMING_MS", "").strip()
+    if not raw:
+        return _DEFAULT_EDIT_TIMING_FLOOR_MS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return _DEFAULT_EDIT_TIMING_FLOOR_MS
+
+
 def _silence_clean_edit_result(result: dict[str, Any]) -> dict[str, Any]:
     """Strip confirmation noise from every edit result; empty a clean success.
 
@@ -7354,6 +7371,11 @@ def _silence_clean_edit_result(result: dict[str, Any]) -> dict[str, Any]:
             silent["applied"] = applied
         if "calls_saved" in result:
             silent["calls_saved"] = result["calls_saved"]
+        # A slow edit is never silent about being slow: the timing block only
+        # exists past the floor, and dropping it here would hide the one signal
+        # that says which phase stalled.
+        if "timing_ms" in result:
+            silent["timing_ms"] = result["timing_ms"]
         return silent
     for key in _EDIT_NOISE_KEYS:
         result.pop(key, None)
@@ -7700,6 +7722,14 @@ def tool_smart_edit(
     # lock. The verify gate (which runs after the lock releases) uses it to skip
     # restoring any file a concurrent edit moved on, avoiding a lost update.
     applied_content: dict[str, str | None] = {}
+    # Per-phase wall clock. An edit that stalls after writing to disk is the
+    # failure this measures: the bytes land, the response does not, and the
+    # duration alone cannot say which phase held it. Surfaced only past
+    # _edit_timing_floor_ms() -- a healthy edit ships nothing extra.
+    _phase_start = time.monotonic()
+    _phase_write_ms = 0
+    _phase_hooks_ms = 0
+    _phase_contract_ms = 0
     with contextlib.ExitStack() as _edit_locks:
         for _lock in _edit_path_locks(list(paths.values())):
             _edit_locks.enter_context(_lock)
@@ -7708,6 +7738,7 @@ def tool_smart_edit(
         from lemoncrow.pro.capabilities.tool_supervision.rich_edit import apply_rich_edits
 
         result = apply_rich_edits(edits, atomic=atomic, repo_root=repo_root, allowed_roots=_extra_roots)
+        _phase_write_ms = int((time.monotonic() - _phase_start) * 1000)
 
         # Sync the long-lived engine's index-version cache so the next explore
         # call gets a cache miss and re-queries the FTS5 index (which the
@@ -7740,6 +7771,7 @@ def tool_smart_edit(
                         "rolled_back": True,
                         "test_weakening": weakenings,
                     }
+            _hooks_start = time.monotonic()
             if hooks:
                 from lemoncrow.pro.capabilities.tool_supervision.post_edit_hooks import (
                     HookConfig,
@@ -7788,6 +7820,7 @@ def tool_smart_edit(
                 except Exception as hook_exc:
                     logging.exception("Recovered from broad exception handler")
                     result["hooks"] = {"error": str(hook_exc)}
+            _phase_hooks_ms = int((time.monotonic() - _hooks_start) * 1000)
             # WS1 edit-loop correctness gate: optional executing parse + scoped
             # mypy/pytest verification with rollback. Opt-in via the `verify` arg or
             # the LEMONCROW_EDIT_VERIFY env var; fully fail-open.
@@ -7903,15 +7936,23 @@ def tool_smart_edit(
     if applied_entries and not result.get("failed") and not result.get("rolled_back"):
         result["applied"] = _compact_applied_entries(applied_entries)
     if not result.get("failed") and not result.get("rolled_back"):
+        _contract_start = time.monotonic()
         _attach_contract_literal_review(
             result,
             edits,
             repo_root=repo_root,
             touched_paths=[str(p.relative_to(repo_root)) for p in paths.values() if p.is_relative_to(repo_root)],
         )
+        _phase_contract_ms = int((time.monotonic() - _contract_start) * 1000)
         # Incremental: refresh the shared index for the touched files now, so a
         # follow-up search/explore reflects this edit without the autosync lag.
         _reindex_edited_files(repo_root, [str(p) for p in paths.values()])
+    if (_phase_write_ms + _phase_hooks_ms + _phase_contract_ms) >= _edit_timing_floor_ms():
+        result["timing_ms"] = {
+            "write": _phase_write_ms,
+            "hooks": _phase_hooks_ms,
+            "contract": _phase_contract_ms,
+        }
     return _silence_clean_edit_result(result)
 
 
