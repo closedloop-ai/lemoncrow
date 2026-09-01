@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import sys
 from typing import Any
 
 logger: logging.Logger | None = None
@@ -92,6 +93,13 @@ def init_otel(
     if logger is not None:
         return True
 
+    # Never build the pipeline while the interpreter is tearing down. The SDK
+    # starts threads and registers its own atexit hooks during construction,
+    # both of which raise RuntimeError once finalization has begun. See
+    # emit_product_log for why we can still be called that late.
+    if sys.is_finalizing():
+        return False
+
     # Negative cache: if we recently failed a TCP check, skip retrying for a
     # short window to avoid hammering the network (common during service
     # startup when many requests arrive before the collector is ready).
@@ -122,27 +130,38 @@ def init_otel(
         # Setting this to 2 limits it to one attempt plus minimal backoff.
         OTLPLogExporter._MAX_RETRY_TIMEOUT = 2  # type: ignore[attr-defined]
     except Exception:
-        logging.exception("Recovered from broad exception handler")
+        # Telemetry is best-effort and must never write to the user's terminal:
+        # this module exists to keep OTel quiet (see _apply_silence). Root-level
+        # logging.exception here dumped a full traceback onto every CLI command.
+        _logger.debug("otel pipeline unavailable", exc_info=True)
         return False
 
     from lemoncrow.core.foundation.identity import get_anon_id
 
-    resource = Resource.create(
-        {
-            "service.name": "lemoncrow",
-            "service.version": service_version,
-            "machine.id": get_anon_id(),
-        }
-    )
-    provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
-    provider.add_log_record_processor(
-        BatchLogRecordProcessor(
-            OTLPLogExporter(endpoint=_logs_endpoint(endpoint), timeout=2, headers=headers),
-            schedule_delay_millis=1000,
-            export_timeout_millis=2000,
+    # Building the pipeline is as failure-prone as importing it — Resource.create()
+    # fans out to detector threads, and the processor starts a worker — so it needs
+    # the same containment. Without this, a construction failure escaped all the way
+    # to the caller in emit.py and was printed there as a traceback.
+    try:
+        resource = Resource.create(
+            {
+                "service.name": "lemoncrow",
+                "service.version": service_version,
+                "machine.id": get_anon_id(),
+            }
         )
-    )
-    _logs.set_logger_provider(provider)
+        provider = LoggerProvider(resource=resource, shutdown_on_exit=False)
+        provider.add_log_record_processor(
+            BatchLogRecordProcessor(
+                OTLPLogExporter(endpoint=_logs_endpoint(endpoint), timeout=2, headers=headers),
+                schedule_delay_millis=1000,
+                export_timeout_millis=2000,
+            )
+        )
+        _logs.set_logger_provider(provider)
+    except Exception:
+        _logger.debug("otel pipeline construction failed", exc_info=True)
+        return False
 
     logger = logging.getLogger("lemoncrow.product.telemetry.otel")
     logger.setLevel(logging.DEBUG)
@@ -182,6 +201,14 @@ def _check_endpoint_reachable(endpoint: str) -> bool:
 
 
 def emit_product_log(event_name: str, props: dict[str, Any]) -> bool:
+    # The telemetry worker (emit.py) is a daemon thread, so it can still be
+    # draining its queue after the interpreter has started finalizing. Every
+    # OTel call is unsafe at that point — Resource.create() submits to a
+    # ThreadPoolExecutor and raises "cannot schedule new futures after
+    # interpreter shutdown". Drop the remote export; the event is still
+    # recorded in the local store with exported=False.
+    if sys.is_finalizing():
+        return False
     if logger is None:
         from lemoncrow.core.service.telemetry.config import otel_endpoint
 
@@ -191,8 +218,6 @@ def emit_product_log(event_name: str, props: dict[str, Any]) -> bool:
         return False
     try:
         from opentelemetry._logs.severity import SeverityNumber
-        from opentelemetry.sdk._logs import LogRecord  # type: ignore[attr-defined]
-        from opentelemetry.trace import TraceFlags, get_current_span
 
         # Flatten dict values to OTel-compatible types (str, int, float, bool)
         flat_attrs = {"event.name": event_name}
@@ -201,6 +226,27 @@ def emit_product_log(event_name: str, props: dict[str, Any]) -> bool:
                 flat_attrs[key] = json.dumps(value, ensure_ascii=False)
             else:
                 flat_attrs[key] = value
+
+        otel_logger = _PROVIDER.get_logger("lemoncrow.product.telemetry.otel")
+
+        try:
+            from opentelemetry.sdk._logs import LogRecord  # type: ignore[attr-defined]
+        except ImportError:
+            # opentelemetry-sdk >= 1.43 turned LogRecord into an internal ABC
+            # (the public names are now ReadableLogRecord / ReadWriteLogRecord)
+            # and moved the fields onto emit() itself, which reads the span
+            # context from the active context — the same span get_current_span()
+            # would have returned below. pyproject floats the SDK at >=1.27, so
+            # both call shapes have to keep working.
+            otel_logger.emit(
+                body=event_name,
+                attributes=flat_attrs,
+                severity_text="DEBUG",
+                severity_number=SeverityNumber.DEBUG,
+            )
+            return True
+
+        from opentelemetry.trace import TraceFlags, get_current_span
 
         # Get current span context if available
         span = get_current_span()
@@ -216,10 +262,10 @@ def emit_product_log(event_name: str, props: dict[str, Any]) -> bool:
             severity_text="DEBUG",
             severity_number=SeverityNumber.DEBUG,
         )
-        _PROVIDER.get_logger("lemoncrow.product.telemetry.otel").emit(record)
+        otel_logger.emit(record)
         return True
     except Exception:
-        logging.exception("Recovered from broad exception handler")
+        _logger.debug("product-log emit failed", exc_info=True)
         return False
 
 
