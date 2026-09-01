@@ -334,4 +334,10 @@ build_dist/
 
 # LibreOffice/soffice lock files (created while a CSV is open in a spreadsheet app)
 .~lock.*#
+
+# Closedloop tooling scratch: code-review run artifacts (diffs, prompts, agent
+# findings), session analysis, injection log. Written per run, megabytes at a
+# time, and marked intent-to-add so untracked files show up in `git diff` --
+# which is how 123 of them nearly rode into an unrelated commit.
+/.closedloop-ai/
 docs/assets/screenshots/session-replay.gif
