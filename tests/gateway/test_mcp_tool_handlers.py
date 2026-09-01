@@ -2783,6 +2783,34 @@ def test_render_bash_text_includes_spill_hint_in_truncation_notice() -> None:
     assert "[output truncated: 50 lines omitted]" not in text
 
 
+def test_smart_state_flock_gives_up_instead_of_waiting_forever(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A busy machine-global lock must not park the caller indefinitely.
+
+    The lock file is shared by every MCP process on the machine, so a blocking
+    acquisition lets one stalled holder park every tool call everywhere -- after
+    the call has already done its real work and is queued only to record a
+    counter.
+    """
+    import fcntl
+    import time as _time
+
+    from lemoncrow.gateway.adapters.mcp import smart_state
+
+    monkeypatch.setenv("LEMONCROW_SMART_STATE_LOCK_TIMEOUT", "0.2")
+
+    def _always_busy(*_args: object, **_kwargs: object) -> None:
+        raise BlockingIOError("locked")
+
+    monkeypatch.setattr(fcntl, "flock", _always_busy)
+
+    started = _time.monotonic()
+    handle = smart_state._acquire_smart_state_flock()
+    elapsed = _time.monotonic() - started
+
+    assert handle is None
+    assert elapsed < 5.0, f"acquisition should give up near the timeout, took {elapsed:.1f}s"
+
+
 def test_unknown_session_error_names_the_live_handles(monkeypatch: pytest.MonkeyPatch) -> None:
     from lemoncrow.gateway.adapters.mcp import bash as bash_mod
 

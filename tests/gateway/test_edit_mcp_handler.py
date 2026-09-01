@@ -122,6 +122,45 @@ def test_rich_replace_basic(workspace: Path) -> None:
     assert "HELLO" not in f.read_text(encoding="utf-8")
 
 
+def test_slow_edit_reports_where_the_time_went(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Past the floor, an edit says which phase spent the time.
+
+    A stalled edit writes to disk and then goes quiet; the call duration alone
+    cannot say whether the write, the hooks, or the contract review held it.
+    """
+    monkeypatch.setenv("LEMONCROW_EDIT_TIMING_MS", "0")
+    f = workspace / "timed.py"
+    f.write_text("VALUE = 1\n", encoding="utf-8")
+
+    payload = _edit(
+        {
+            "post_edit_hooks": False,
+            "edits": [{"file_path": "timed.py", "old_string": "1", "new_string": "2"}],
+        }
+    )
+
+    timing = payload.get("timing_ms")
+    assert isinstance(timing, dict), payload
+    assert set(timing) == {"write", "hooks", "contract"}
+    assert all(isinstance(v, int) and v >= 0 for v in timing.values())
+
+
+def test_fast_edit_stays_silent_about_timing(workspace: Path) -> None:
+    # Every edit result is re-billed on later round-trips, so a healthy edit
+    # must not carry a diagnostic block nobody asked for.
+    f = workspace / "quick.py"
+    f.write_text("VALUE = 1\n", encoding="utf-8")
+
+    payload = _edit(
+        {
+            "post_edit_hooks": False,
+            "edits": [{"file_path": "quick.py", "old_string": "1", "new_string": "2"}],
+        }
+    )
+
+    assert "timing_ms" not in payload
+
+
 def test_rich_create_new_file_via_overwrite(workspace: Path) -> None:
     """Rich overwrite with no existing file creates it from scratch."""
     f = workspace / "new_module.py"
