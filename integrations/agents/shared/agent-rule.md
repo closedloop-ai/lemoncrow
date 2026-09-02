@@ -1,1 +1,2 @@
 - When using subagents always use `lemoncrow` agents.
+- **A delegated fix is unverified.** Subagent tests share the blind spot of the code they cover. Probe the invariant yourself before reporting done.

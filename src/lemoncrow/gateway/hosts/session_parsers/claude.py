@@ -31,10 +31,11 @@ from lemoncrow.core.foundation.models import (
     ToolCall,
     Trace,
 )
-from lemoncrow.core.foundation.redaction import redact
+from lemoncrow.core.foundation.redaction import redact, redact_jsonl
 from lemoncrow.gateway.hosts.session_parsers._common import (
     _SIZE_LIMIT_BYTES,
     _SYSTEM_PREFIXES_CLAUDE,
+    extract_task_wrapper,
     make_llm_usage_entry,
     persist_imported_run_snapshot,
     snapshot_edited_files,
@@ -142,9 +143,9 @@ def _extract_user_text(content: Any) -> str:
         if any(text.startswith(p) for p in _SYSTEM_PREFIXES_CLAUDE):
             return ""
         # Claude Code often wraps the main task in <task> tags
-        xml_match = re.search(r"<(task|prompt|request|question)[^>]*>(.*?)</\1>", text, re.IGNORECASE | re.DOTALL)
-        if xml_match:
-            return xml_match.group(2).strip()
+        wrapped = extract_task_wrapper(text)
+        if wrapped is not None:
+            return wrapped
         return text
 
     if isinstance(content, list):
@@ -153,15 +154,8 @@ def _extract_user_text(content: Any) -> str:
             if isinstance(block, dict) and block.get("type") == "text":
                 text = block.get("text", "").strip()
                 if text and not any(text.startswith(p) for p in _SYSTEM_PREFIXES_CLAUDE):
-                    xml_match = re.search(
-                        r"<(task|prompt|request|question)[^>]*>(.*?)</\1>",
-                        text,
-                        re.IGNORECASE | re.DOTALL,
-                    )
-                    if xml_match:
-                        parts.append(xml_match.group(2).strip())
-                    else:
-                        parts.append(text)
+                    wrapped = extract_task_wrapper(text)
+                    parts.append(wrapped if wrapped is not None else text)
         return "\n\n".join(parts)
     return ""
 
@@ -345,7 +339,10 @@ class ClaudeImporter:
                 raw_content = f_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            redacted = redact(raw_content)
+            # JSON-aware (the transcripts are JSONL): plain redact() would eat
+            # JSON escapes and, via the to-end-of-line credential rule, the
+            # record's closing braces.
+            redacted = redact_jsonl(raw_content)
 
             rel_path = f_path.relative_to(project_dir)
             art = RawArtifact(
