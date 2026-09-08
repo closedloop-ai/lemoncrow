@@ -288,7 +288,8 @@ Execution order (each step verified before the next):
 **Step B — Remove account/cap/entitlement system (Phases 3, 4, 10 core).**
 **Step C — Remove device minting + hardware readers (Phase 4).**
 **Step D — Neutralize remaining hosted network calls (Phase 5 tail).**
-**Step E — Open the `pro` engine in the mirror/build (Phase 6).**
+**Step E — Open the `pro` engine in the mirror/build (Phase 6).** DONE, under a
+split license — see §5.2.
 **Step F — Install/uninstall hygiene (Phases 7, 8).**
 **Step G — Docs rewrite + community-health files (Phases 9, 10, 11).**
 **Step H — Offline/no-network test + full suite (acceptance).**
@@ -471,3 +472,22 @@ hygiene, docs) proceeds regardless of these answers.
 3. **Relicense to Apache-2.0: YES.** Rewrite `LICENSE` to pure Apache-2.0, add
    `NOTICE`, update the `pyproject.toml` license string, and produce
    `docs/licensing-report.md` for the record.
+
+### 5.2 Step E executed (2026-09-07)
+
+Decisions 1 and 3 both stand, as written: the `pro` source is published in the
+mirror under Apache-2.0, the `!src/lemoncrow/pro` deny is gone, and the
+`hatch_build` IP-leak guard is removed (the remaining wheel check only rejects a
+`.so`/`.py` twin). The whole repository is Apache-2.0 and builds from public
+source.
+
+A split license (Apache-2.0 + PolyForm Noncommercial on `pro/`) was briefly
+shipped and reverted the same day — protecting against a commercial fork was
+judged not worth excluding every commercial adopter at this stage. Tighten
+future releases if that ever changes; see `docs/legal/licensing.md`.
+
+One mechanical lesson, now fixed in `scripts/mirror.py`: widening the allowlist
+publishes nothing on its own. Incremental mirroring applies only the paths each
+commit touched, so removing a deny needs `make mirror ARGS="--resync"` (full
+filtered-tree rebuild as one fast-forward commit) or `--force` (full replay,
+rewrites public history).

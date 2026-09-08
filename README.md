@@ -12,7 +12,7 @@
 
 LemonCrow runs underneath Claude Code, Codex, and other supported hosts with a local code graph, exact-range reads, bounded output, durable memory, and verified runtime controls — fully local, no account required.
 
-**State-of-the-art context engineering.** Read less, Output less, without compromising correctness. LemonCrow is tuned end to end across input context and output — ranked retrieval, exact-range reads, and bounded, compacted output — and out-measures grep-class code-index and output-compression tooling on the [numbers below](#results) (~1.9x retrieval MRR vs ripgrep, 27.9% fewer output tokens on SWE-bench Verified).
+**State-of-the-art context engineering.** Read less, output less, without compromising correctness — out-measuring grep-class code-index and output-compression tooling on the [numbers below](#results) (~1.9x retrieval MRR vs ripgrep, 27.9% fewer output tokens on SWE-bench Verified).
 
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue?style=flat-square)](LICENSE)
 [![Latest release](https://img.shields.io/github/v/release/lemoncrow-lab/lemoncrow?style=flat-square)](https://github.com/lemoncrow-lab/lemoncrow/releases)
@@ -25,7 +25,7 @@ LemonCrow runs underneath Claude Code, Codex, and other supported hosts with a l
 [![Copilot](https://img.shields.io/badge/Copilot-supported-blue?style=flat-square)](integrations/copilot)
 [![Copilot CLI](https://img.shields.io/badge/Copilot_CLI-supported-blue?style=flat-square)](integrations/copilot-cli)
 
-[Results](#results) · [What it does](#what-lemoncrow-does) · [Quick start](#quick-start) · [Limitations](#what-lemoncrow-does-not-do) · [Privacy](#privacy-and-network-behavior) · [Removal](#removal)
+[Results](#results) · [Philosophy](#philosophy--optimize-the-journey-not-the-hop) · [What it does](#what-lemoncrow-does) · [Quick start](#quick-start) · [Limitations](#what-lemoncrow-does-not-do) · [Privacy](#privacy-and-network-behavior) · [Removal](#removal)
 
 </div>
 
@@ -53,10 +53,10 @@ a regression (SWE-bench Lite below).
 | SWE-bench Pro, 10 tasks x 5 reps                  |            88.0% |         **90.0%** |   **+2.0 pp** |   $39.01 |**$30.61** | **21.5% cheaper** |            |
 | Exploration tasks across 7 large repos x 5 reps   |                - |                 - |             - |    $19.11 |**$6.29** |   **67% cheaper** |            |
 | Telegraphic Q&A, 20 prompts x 5 reps              |                - |                 - |             - |     $8.40 |**$4.48** | **46.7% cheaper** |            |
-| Terminal-Bench 2.1, 89 tasks x 5 reps, Opus 4.8 (matched)\* |            78.9% |             78.9% |  0.0 pp (tied) |               $73.75 |          **$61.98** | **16.0% cheaper** |
-| Terminal-Bench 2.1, 89 tasks x 5 reps, Opus 5 (standalone)† |                - |             80.7% |             - |                    - |             $38.68 |                 **47% cheaper** than opus 4.8 |
+| [Terminal-Bench 2.1, 89 tasks x 5 reps, Opus 4.8 (matched)\*](https://hub.harborframework.com/jobs/47e1713b-cad9-4715-a9e7-ca71ff202ba7) |            78.9% |             78.9% |  0.0 pp (tied) |               $73.75 |          **$61.98** | **16.0% cheaper** |
+| [Terminal-Bench 2.1, 89 tasks x 5 reps, Opus 5 (standalone)†](https://hub.harborframework.com/jobs/18239ddc-556a-4631-a20d-bcf5da8d16a2) |                - |             80.7% |             - |                    - |             $38.68 |                 **47% cheaper** than opus 4.8 |
 
-<sub> Both arms 89 tasks x 5 reps = 445 trials on the same dataset — LemonCrow's Harbor run, public at [Harbor Hub job `47e1713b`](https://hub.harborframework.com/jobs/47e1713b-cad9-4715-a9e7-ca71ff202ba7), vs the Claude Code 2.1.205 leaderboard run — so correctness is directly comparable; this run ties baseline exactly (351/445 both sides). LemonCrow sends 98.6% fewer fresh input tokens (182K vs 12.87M). Cost is normalized to the 1-hour cache-write rate on both sides (LemonCrow's harness bills prompt-cache writes at that tier; baseline's real run used the cheaper 5-minute tier, so it's re-priced at 1-hour for a same-rate comparison) on the 86 of 89 tasks with a priceable trajectory both sides. † The Opus 5 row is LemonCrow-only ([Harbor Hub job `18239ddc`](https://hub.harborframework.com/jobs/18239ddc-556a-4631-a20d-bcf5da8d16a2), 359/445 resolved, `reasoning_effort=high`): no official Claude Code + Opus 5 leaderboard run exists yet, so there is nothing to compare against — the empty cells are missing baselines, not zeros. Its $38.68 is real own-tier billing (nothing to normalize) over its own 86-of-89 priceable tasks, a different exclusion set from the Opus 4.8 cut, so do **not** subtract the two rows from each other: different model, different task set, no controlled comparison. See [BENCHMARKS.md](BENCHMARKS.md#terminal-bench).</sub>
+<sub>Both arms: 445 trials on the same dataset, tied 351/445; LemonCrow sends 98.6% fewer fresh input tokens. Cost normalized to the 1-hour cache-write rate both sides, over the 86/89 priceable tasks. † Opus 5 row is LemonCrow-only — no official Claude Code + Opus 5 baseline exists, so it's not a controlled comparison with the row above (different model, different task set, different exclusion set); don't subtract the two. Full methodology in [BENCHMARKS.md](BENCHMARKS.md#terminal-bench).</sub>
 
 <p align="center">
   <img src="benchmarks/cost_vs_savings_scatter.svg" alt="LemonCrow vs baseline: dollars saved per run against baseline task cost" width="720">
@@ -90,8 +90,33 @@ Ranked search is ~1.9x more accurate than ripgrep at a still-interactive p95;
 ripgrep wins raw latency but not what it finds. Per-repo indexing table and the
 full 13-tool retrieval comparison: [BENCHMARKS.md](BENCHMARKS.md#indexing-time).
 
-Reproduce any of this from committed raw data: see [BENCHMARKS.md](BENCHMARKS.md)
-and [docs/benchmarks/results.md](docs/benchmarks/results.md).
+Reproduce any of this from committed raw data: [docs/benchmarks/results.md](docs/benchmarks/results.md).
+
+## Philosophy — optimize the journey, not the hop
+
+The tooling around coding agents is fragmented by construction: a better index
+here, a context compressor there, a model router, a memory store, a reranker.
+Each one optimizes a single hop of the agent's loop — and, tellingly, each one
+benchmarks itself on that same hop.
+
+But a task is not a hop. It is a loop — find, read, act, carry, verify — run
+until the work is done or the budget is gone. Optimize one hop in isolation and
+the cost usually just relocates to the next one:
+
+- a retriever that returns more context makes the read cheap and the prompt expensive;
+- a compressor that shrinks the prompt makes the model re-ask, buying the tokens back as turns;
+- a router that picks the cheaper model saves per token and gives it back in retries;
+- a memory layer that remembers everything charges you for it on every later call.
+
+Every one of those wins its own benchmark. The bill doesn't move.
+
+LemonCrow takes the opposite bet: own every hop in one runtime, tune them
+against each other, and report the one number that can't be gamed by scope —
+absolute dollars per completed task, over whole runs, on task mixes we didn't
+hand-pick. That is why retrieval, exact-range reads, output bounding, memory,
+routing, and verification ship as one thing instead of five installables: the
+interactions between them are where the savings actually live, and a single-hop
+tool cannot see them.
 
 ## What LemonCrow does
 
@@ -129,23 +154,20 @@ strongest equivalent controls they expose.
 | `bash`         | Bash                             | Output is capped and structured so a noisy build log can't blow the context window                                                                                        |
 | `web_fetch`    | WebFetch                         | Strips a page to clean Markdown instead of a raw HTML dump                                                                                                                |
 
-What's unchanged: the host, the model, your workflow. Full internals:
-[Architecture](docs/reference/architecture.md).
+What's unchanged: the host, the model, your workflow — internals: [Architecture](docs/reference/architecture.md).
 
 **Caveat — Cursor (CLI vs IDE).** Built-ins can't be hidden there, so
 LemonCrow is additive — Claude Code and Codex can displace most of their
-built-in toolset, and that does not apply on Cursor. Measured on SWE-bench
-Lite (10 tasks, `cursor-grok-4.5-high`, matched prompts): **Cursor CLI +
-LemonCrow was ~40% cheaper** than Cursor CLI baseline (tokens −39.8%, cost
-−41.2%). The same tasks in **Cursor IDE did not show that saving** — CLI is
-the cheaper Cursor path today. Reproduce from
-`reports/benchmark/swe/20260802T121526Z/`.
+built-in toolset, Cursor can't. Measured on SWE-bench Lite (10 tasks,
+`cursor-grok-4.5-high`, matched prompts): **Cursor CLI + LemonCrow was ~40%
+cheaper** than Cursor CLI baseline (tokens −39.8%, cost −41.2%); the same
+tasks in **Cursor IDE did not show that saving** — CLI is the cheaper Cursor
+path today. Reproduce from `reports/benchmark/swe/20260802T121526Z/`. One
+flagged inference in that number: Cursor's server-side cache-write choice is
+implied from hit rates (1 − billed/integral), not confirmed in their docs or
+exposed via local counters — treat the caching mechanism as unproven; the
+cost delta itself is measured from Usage/token totals on the pinned run.
 
-NOTE: One inference, flagged: that Cursor selectively chooses server-side what to cache-write
-is derived from implied hit rates, not confirmed in their docs.
-Cursor stores no local cache counters, so every hit
-rate is computed as 1 − billed/integral. Treat the caching mechanism as
-unproven; the CLI cost delta above is from Usage/token totals on the pinned run.
 ## Quick start
 
 The [two lines at the top](#lemoncrow-runtime) are the whole setup: the installer
@@ -225,8 +247,8 @@ Full request/response traffic is logged locally per run (path printed at
 startup; credentials and tokens are redacted) so you can audit exactly what the
 client sent and got back.
 
-**Known ChatGPT-side quirk:** Persistent connection is much more reliable. Sometimes chatgpt looses the tool aceess on a new chat message conversation and without reattaching it can't access the tool. Workaround is branchoff the chat and then reattach the tool and continue with your message.
-**Permissions**: If it complains about permissions or asks to reconnect, check in the Setting -> Plugins, it has `Allow All` permission
+**Known ChatGPT-side quirk:** persistent connections are far more reliable — ChatGPT can lose tool access mid-conversation on a fresh message and won't regain it without reattaching; workaround: branch off the chat, reattach the tool, continue.
+**Permissions:** connection or reconnect complaints usually mean Settings → Plugins needs `Allow All` for the tool.
 
 > ⚠ The pairing code is a password — don't share the tunnel URL. This
 > exposes shell-grade tool access (`bash`, `edit`) to this machine while the
@@ -389,11 +411,12 @@ exactly what was removed and preserved. Preview with `--dry-run`.
 
 ## Why I built this
 
-I am a solo builder, previously at Google doing performance optimizations and cost savings. I kept burning my weekly credits before the week was out. Every
-"token-saving" claimed tools only every shows me a curated list of tasks where they save. Only showing partial wins. Claiming 50-60-70% wins infact they never shows on all varaties of tasks. In reality they either same so little to justify complexity or they don't save at all because they add fat system prompts on their own that the savings are offset.
+I'm a solo builder, previously at Google doing performance optimization and cost savings. I kept burning my weekly credits before the week was out. Every
+"token-saving" tool I tried showed a curated slice of tasks where it won — never the full spread. Claimed 50-70% savings that didn't hold across task variety; in practice they either saved too little to justify the complexity, or the fat system prompts they add offset whatever they saved.
 
-So I built LemonCrow. Every number below is an absolute-dollar measurement
-([BENCHMARKS.md](BENCHMARKS.md)) — on swe, terminalbench and infact some of the claimed tools task themselves. Result? **lemoncrow beat them all**.
+So I built LemonCrow and measured in absolute dollars, not curated wins
+([BENCHMARKS.md](BENCHMARKS.md)) — across SWE-bench, Terminal-Bench, and even
+some of those other tools' own benchmark tasks. **LemonCrow beat them all.**
 
 ## Development & Building from Source
 
@@ -409,6 +432,18 @@ bash scripts/local.sh
 
 ## License
 
-LemonCrow is free and open-source software under the
-[Apache License, Version 2.0](LICENSE)
-`lemoncrow.pro` engine is planned to be released soon. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
+[Apache-2.0](LICENSE), all of it. The `lemoncrow.pro` engine — retrieval,
+ranking, memory, routing, verification — was the last closed piece; it has been
+open source since **7 September 2026**.
+
+Team use is included on the same terms: `lc team` creates a workspace in your
+own store — invite codes, roles, per-user cost attribution, and an audit trail.
+It runs locally: files on your machine, no server, no seats.
+
+**Hosted LemonCrow is a separate, paid product** and is not in this repository:
+team workspaces shared across machines, shared context and memory, SSO, org-wide
+usage dashboards, retention and audit export, and support. The runtime stays
+open source — the service is what's sold. Interested, or want it run for you?
+Contact <legal@lemoncrow.com>.
+
+See [LICENSE](LICENSE) and [NOTICE](NOTICE).
