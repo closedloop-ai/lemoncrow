@@ -36,6 +36,10 @@ EXPECTED_TOOLS = {
     "code_changes",
     # F5: whitelisted graph query -- advertised, not hidden.
     "code_query",
+    # Review authoring hooks are registered/callable but hidden from tools/list.
+    "review_rationale",
+    "review_evidence",
+    "review_feedback_addressed",
 }
 
 

@@ -474,7 +474,6 @@ def import_index(
     if not path.exists():
         raise PortableIndexError(f"{path} does not exist")
     root = Path(repo_root).resolve()
-    workspace = workspace_dir(root)
 
     with tempfile.TemporaryDirectory(prefix="lemoncrow-index-import-") as tmp:
         staging = Path(tmp)
@@ -504,6 +503,11 @@ def import_index(
                     "the archive is corrupt or was modified"
                 )
 
+        # Resolve the target only after the archive has passed every check.
+        # Resolving the store dir creates ``.lemoncrow/`` in the target (it
+        # self-ignores on first resolve), and a refused archive must leave the
+        # target untouched.
+        workspace = workspace_dir(root)
         local_index_version, local_semantics = _engine_versions(workspace)
         archive_semantics = int(manifest.get("indexer_semantics_version") or 0)
         populated = (workspace / CODE_CONTEXT_DB).exists()

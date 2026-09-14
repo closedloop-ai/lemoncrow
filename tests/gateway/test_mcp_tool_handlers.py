@@ -33,8 +33,11 @@ from tests.helpers import grant_oauth_pro, init_store_at
 
 # Single-primary retrieval surface: `explore` (ranked source + call-graph
 # relations + blast-radius in one call) + `read`, plus edit/bash/web_fetch.
-# `grep`, `search`, `memory`, `sql`, `codemod` are registered but hidden from
-# agents (grep stays callable as an escape hatch through the broker).
+# Review authoring hooks are registered/callable workflow tools, but hidden from
+# generic tools/list because they only make sense with exact host/session
+# provenance. `grep`, `search`, `memory`, `sql`, `codemod` and the review hooks
+# remain callable as internal/power surfaces (grep as an escape hatch through
+# the broker).
 EXPECTED_TOOLS = {
     "read",
     "edit",
