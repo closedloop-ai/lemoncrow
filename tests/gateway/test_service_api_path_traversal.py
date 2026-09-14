@@ -53,11 +53,12 @@ def test_safe_segment_accepts_real_ids() -> None:
     assert safe_segment("run.json", field="session_id")
 
 
-def test_namespaced_agent_ids_survive_but_traversal_does_not() -> None:
-    """Regression: agent identifiers are namespaced (``lemoncrow:code``) and have
-    always been used as session-directory segments, so the colon must be
-    admitted -- but not at the cost of the traversal protection it was added
-    alongside (see ``_SAFE_SEGMENT`` in ``paths.py``)."""
+def test_namespaced_host_ids_survive_but_traversal_does_not() -> None:
+    """Regression: a host label may be namespaced (``lemoncrow:code`` via
+    ``LEMONCROW_AGENT`` / ``lc mcp --host``) and becomes a session-directory
+    segment, so the colon must be admitted -- but not at the cost of the
+    traversal protection it sits beside (see ``_SAFE_SEGMENT`` in ``paths.py``).
+    """
     assert safe_segment("lemoncrow:code", field="host") == "lemoncrow:code"
 
     for bad in ("..", ".", "a/b", "../../etc/passwd", "", "a b", "a\\b"):
