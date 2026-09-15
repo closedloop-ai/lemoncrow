@@ -158,7 +158,9 @@ def test_verdict_ahead_of_local_ledger_triggers_throttled_reconcile(
 
     monkeypatch.setenv("LEMONCROW_ROOT", str(tmp_path))
     monkeypatch.setattr(mcp_server, "_tick_usage_report", lambda _root: None)
-    monkeypatch.setattr(mcp_server, "_ledger_reconcile_at", 0.0)
+    # None = never reconciled. 0.0 means "reconciled at monotonic 0", which is still
+    # inside the throttle window on a host up for under 10 minutes (a fresh CI runner).
+    monkeypatch.setattr(mcp_server, "_ledger_reconcile_at", None)
     monkeypatch.setattr(
         licensing_gate,
         "resolve_cap_verdict",
@@ -183,7 +185,7 @@ def test_ledger_reconcile_is_throttled(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     monkeypatch.setenv("LEMONCROW_ROOT", str(tmp_path))
     monkeypatch.setattr(mcp_server, "_tick_usage_report", lambda _root: None)
-    monkeypatch.setattr(mcp_server, "_ledger_reconcile_at", 0.0)
+    monkeypatch.setattr(mcp_server, "_ledger_reconcile_at", None)
     monkeypatch.setattr(
         licensing_gate,
         "resolve_cap_verdict",

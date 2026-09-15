@@ -208,7 +208,7 @@ def test_tools_list_hides_internal_workflow_tools(tmp_path: Path, monkeypatch: p
     tools = response["result"]["tools"]
     names = {tool["name"] for tool in tools}
     assert names == EXPECTED_TOOLS
-    assert not (names & HIDDEN_LLM_TOOLS)
+    assert not (names & (HIDDEN_LLM_TOOLS - mcp_server._FORCE_VISIBLE_TOOLS))
     assert all("passive" not in tool["description"] for tool in tools if tool["name"] in EXPECTED_TOOLS)
 
 

@@ -273,9 +273,7 @@ def test_double_dash_is_not_treated_as_a_comment() -> None:
     everywhere else, so the trade runs the other way: SQL comments surviving as
     tokens is noise, a truncated C-family line is a wrong answer.
     """
-    assert normalise_tokens("while (i-- > 0) { total += i; }") == normalise_tokens(
-        "while (j-- > 0) { count += j; }"
-    )
+    assert normalise_tokens("while (i-- > 0) { total += i; }") == normalise_tokens("while (j-- > 0) { count += j; }")
     assert "while" in normalise_tokens("while (i-- > 0) { total += i; }")
     assert "}" in normalise_tokens("while (i-- > 0) { total += i; }")
 
@@ -364,9 +362,7 @@ def test_banding_finds_every_pair_brute_force_would_report(clone_repo: Path) -> 
         symbols = store.symbols()
     tokens_by_symbol, _ = _read_symbol_sources(symbols, clone_repo)
     signatures = {
-        symbol_id: signature(tokens)
-        for symbol_id, tokens in tokens_by_symbol.items()
-        if len(tokens) >= MIN_TOKENS
+        symbol_id: signature(tokens) for symbol_id, tokens in tokens_by_symbol.items() if len(tokens) >= MIN_TOKENS
     }
 
     brute: set[tuple[str, str]] = set()
@@ -419,9 +415,7 @@ def test_every_reported_pair_was_actually_scored(clone_repo: Path) -> None:
 
 
 def test_the_copied_function_is_found_and_the_unrelated_one_is_not(clone_repo: Path) -> None:
-    names = {
-        (pair.qualified_name_a, pair.qualified_name_b) for pair in build_clones(clone_repo).pairs
-    }
+    names = {(pair.qualified_name_a, pair.qualified_name_b) for pair in build_clones(clone_repo).pairs}
     assert ("compute_average", "compute_average_copy") in names
     assert not any("fetch_payload" in pair for pair in names)
 
@@ -462,9 +456,7 @@ def test_a_symbol_is_never_reported_as_a_clone_of_its_own_parent(
     _insert_symbols(root, [method, parent])
 
     report = build_clones(root)
-    assert report.pairs == (), [
-        (pair.qualified_name_a, pair.qualified_name_b, pair.jaccard) for pair in report.pairs
-    ]
+    assert report.pairs == (), [(pair.qualified_name_a, pair.qualified_name_b, pair.jaccard) for pair in report.pairs]
 
 
 def test_enclosure_only_suppresses_within_one_file(make_workspace: WorkspaceFactory) -> None:
@@ -513,7 +505,7 @@ def test_the_build_stamps_the_index_generation_it_read(clone_repo: Path) -> None
 
 
 def test_loading_an_unbuilt_table_raises_rather_than_returning_nothing(clone_repo: Path) -> None:
-    """"No duplicates" is a claim about the code; "never built" is not."""
+    """ "No duplicates" is a claim about the code; "never built" is not."""
     with pytest.raises(ClonesStale, match="never been built"):
         load_clones(clone_repo)
 
@@ -880,9 +872,7 @@ def test_build_refuses_a_torn_index(clone_repo: Path, monkeypatch: pytest.Monkey
 @pytest.fixture
 def prose_repo(make_workspace: WorkspaceFactory) -> Path:
     """Two identical doc sections alongside two identical functions."""
-    root = make_workspace(
-        files=[{"file_path": p} for p in ("a.md", "b.md", "src/x.py", "src/y.py")]
-    )
+    root = make_workspace(files=[{"file_path": p} for p in ("a.md", "b.md", "src/x.py", "src/y.py")])
     rows: list[dict[str, object]] = []
     for path in ("a.md", "b.md"):
         rows += _write_module(root, path, [("section", _BODY)])

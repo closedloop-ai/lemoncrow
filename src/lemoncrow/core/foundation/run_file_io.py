@@ -42,8 +42,8 @@ class RunFileLock(AbstractContextManager["RunFileLock"]):
                 handle.write(b"\0")
                 handle.flush()
             handle.seek(0)
-            locking = getattr(msvcrt, "locking")
-            locking(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+            locking = getattr(msvcrt, "locking")  # noqa: B009 -- msvcrt attrs exist only on Windows to mypy
+            locking(handle.fileno(), getattr(msvcrt, "LK_LOCK"), 1)  # noqa: B009
         else:
             import fcntl
 
@@ -65,8 +65,8 @@ class RunFileLock(AbstractContextManager["RunFileLock"]):
                 import msvcrt
 
                 handle.seek(0)
-                locking = getattr(msvcrt, "locking")
-                locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)
+                locking = getattr(msvcrt, "locking")  # noqa: B009 -- msvcrt attrs exist only on Windows to mypy
+                locking(handle.fileno(), getattr(msvcrt, "LK_UNLCK"), 1)  # noqa: B009
             else:
                 import fcntl
 

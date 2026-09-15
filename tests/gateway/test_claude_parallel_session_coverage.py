@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from lemoncrow.core.foundation.models import FileEditRecord
 from lemoncrow.gateway.hosts.session_parsers._common import snapshot_edited_files
 from lemoncrow.gateway.hosts.session_parsers.claude import ClaudeImporter, find_claude_sessions
@@ -148,6 +150,9 @@ def test_claude_parallel_coverage_matrix_doc_exists_and_has_required_rows() -> N
     matrix = repo_root / "docs-internal" / "engineering" / "claude-parallel-session-harvest-matrix.md"
     if not matrix.exists():
         matrix = repo_root / "docs" / "engineering" / "claude-parallel-session-harvest-matrix.md"
+    if not matrix.exists():
+        # Private docs tree only; the public mirror (and forks of it) ship neither copy.
+        pytest.skip("claude-parallel-session-harvest-matrix.md is not in this checkout")
 
     content = matrix.read_text(encoding="utf-8")
 

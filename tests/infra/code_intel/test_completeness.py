@@ -74,7 +74,7 @@ def test_objective_for_coverage(coverage: float | None, expected: str) -> None:
 
 
 def test_discarded_rows_downgrade_even_at_full_coverage() -> None:
-    """"Rows were dropped" and "the subject was under-examined" are two claims.
+    """ "Rows were dropped" and "the subject was under-examined" are two claims.
 
     They normally move together, since a row is superseded because its symbol's
     content changed -- the same fact that lowers coverage. Checking only one left

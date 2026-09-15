@@ -911,9 +911,8 @@ def test_model_recommendation_emitted_before_tool_dispatch(store_root: Path) -> 
 def test_model_recommendation_fallback_records_route_decision(
     monkeypatch: pytest.MonkeyPatch, store_root: Path
 ) -> None:
-    from lemoncrow.pro.capabilities.cross_vendor_routing.configuration import RouteConfigError
-
     from lemoncrow.infra.runtime.run_ledger import RunLedger
+    from lemoncrow.pro.capabilities.cross_vendor_routing.configuration import RouteConfigError
 
     def fail_recommend(*_: object, **__: object) -> dict[str, object]:
         raise RouteConfigError("disabled")

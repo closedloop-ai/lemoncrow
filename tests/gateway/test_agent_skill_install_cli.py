@@ -12,6 +12,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from click.testing import CliRunner
 
 from lemoncrow.core.capabilities.workspace_host_overrides import write_opencode_agents
@@ -52,9 +53,13 @@ def test_agent_list_shows_installed_vs_available_with_costs(tmp_path: Path) -> N
     assert all(row["token_cost"] > 0 for row in payload["roles"])
 
 
-def test_agent_list_requires_host_when_ambiguous_or_absent(tmp_path: Path) -> None:
+def test_agent_list_requires_host_when_ambiguous_or_absent(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ws = tmp_path / "ws"
     ws.mkdir()
+    # Host detection falls back to PATH lookups, and `uv sync` puts this project's
+    # own `lemoncode` console script on PATH: on a machine with no other agent CLI
+    # (CI) that is exactly one host, so nothing is ambiguous or absent.
+    monkeypatch.setattr("shutil.which", lambda *_args, **_kwargs: None)
     result = _invoke("agent", "list", "--workspace", str(ws))
     assert result.exit_code != 0
     assert "--host" in result.output

@@ -107,6 +107,21 @@ def _append_rg_skip_globs(cmd: list[str]) -> None:
         cmd.extend(["--glob", f"!**/{directory}/**"])
 
 
+def _outside_skip_dirs(path: str, base: Path) -> bool:
+    """The grep fallback's copy of the walker exclusions (rg gets ``_append_rg_skip_globs``).
+
+    Applied to grep's output rather than passed as ``--exclude-dir`` (which also
+    drops a matching command-line directory) so it matches rg: only directories
+    below ``base`` count, and an explicit search inside a skipped directory runs.
+    """
+    parts = Path(path).parts
+    try:
+        parts = Path(path).relative_to(base).parts
+    except ValueError:
+        pass
+    return not any(part in _SKIP_DIRS for part in parts[:-1])
+
+
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 _PDF_SUFFIXES = {".pdf"}
 _BINARY_SUFFIXES = {
@@ -820,7 +835,7 @@ def _grep_candidate_files(
         return None
     if proc.returncode not in (0, 1):
         return None
-    return [Path(line) for line in proc.stdout.splitlines() if line]
+    return [Path(line) for line in proc.stdout.splitlines() if line and _outside_skip_dirs(line, base)]
 
 
 def _rg_line_numbers(
@@ -901,7 +916,7 @@ def _grep_line_numbers(
     for line in proc.stdout.splitlines():
         # format: path\0lineno:content  (NUL isolates a path that may contain ':')
         path, sep, rest = line.partition("\0")
-        if not sep:
+        if not sep or not _outside_skip_dirs(path, base):
             continue
         lineno_str = rest.partition(":")[0]
         try:

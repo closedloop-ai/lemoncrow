@@ -1601,7 +1601,7 @@ def record_revision(
     # large/binary source states can no longer collapse onto one revision row.
     has_unknown_file = any(unit.kind == "file" and unit.fingerprint_method == "unknown" for unit in units)
     if has_unknown_file and watch_fingerprint:
-        payload = f"{fingerprint}\0source\0{watch_fingerprint}".encode("utf-8")
+        payload = f"{fingerprint}\0source\0{watch_fingerprint}".encode()
         fingerprint = hashlib.sha256(payload).hexdigest()
 
     # Read before write: after ``add_revision`` these are no longer "previous".
