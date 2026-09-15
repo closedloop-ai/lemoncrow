@@ -165,6 +165,7 @@ from lemoncrow.gateway.adapters.mcp_branding import icon_metadata
 from lemoncrow.infra.code_intel.completeness import (
     CODE_OP_MATCH_KINDS,
     CODE_OP_OBJECTIVES,
+    DATA_UNAVAILABLE,
     OBJECTIVE_PARTIAL,
     OBJECTIVE_RANKED,
 )
@@ -9003,7 +9004,7 @@ def _maybe_attach_code_rendered(op: str, payload: dict[str, Any], *, render_comp
     if objective is not None:
         # Edge data that was never there to look up is not "no edges found":
         # `empty` keeps the op's claim, `unavailable` cannot make it.
-        if result.get("data_status") == "unavailable":
+        if result.get("data_status") == DATA_UNAVAILABLE:
             result["objective"] = OBJECTIVE_PARTIAL
         else:
             result.setdefault("objective", objective)
