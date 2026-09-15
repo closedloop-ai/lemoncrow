@@ -657,6 +657,46 @@ def test_report_serializes_to_plain_json_types(
     assert payload["changed_symbols"][0]["name"] == "alpha"
 
 
+_GAMMA = "def gamma():\n    return 3\n"
+
+
+def test_to_dict_reports_fork_point_and_uncommitted(
+    workspace_root: Path,
+    make_workspace: WorkspaceFactory,
+) -> None:
+    """The diff runs from where the branch forked to the working tree, and says so.
+
+    ``main`` moves on after the fork: a diff from its tip would report ``beta``,
+    which this branch never touched. The edit to ``gamma`` is uncommitted.
+    """
+    _init_repo(workspace_root, {"a.py": _ALPHA, "b.py": _GAMMA})
+    fork_point = _git(workspace_root, "rev-parse", "HEAD").strip()
+    _git(workspace_root, "checkout", "-q", "-b", "feature")
+    (workspace_root / "a.py").write_text(_ALPHA.replace("return 1", "return 2"), encoding="utf-8")
+    _git(workspace_root, "commit", "-q", "-am", "feature edits alpha")
+    _git(workspace_root, "checkout", "-q", "main")
+    (workspace_root / "a.py").write_text(_ALPHA.replace("return alpha()", "return alpha() + 1"), encoding="utf-8")
+    _git(workspace_root, "commit", "-q", "-am", "main edits beta")
+    main_tip = _git(workspace_root, "rev-parse", "main").strip()
+    _git(workspace_root, "checkout", "-q", "feature")
+    (workspace_root / "b.py").write_text(_GAMMA.replace("return 3", "return 4"), encoding="utf-8")
+    make_workspace(
+        files=[{"file_path": "a.py"}, {"file_path": "b.py"}],
+        symbols=[
+            {"file_path": "a.py", "symbol_name": "alpha", "start_line": 1, "end_line": 2},
+            {"file_path": "a.py", "symbol_name": "beta", "start_line": 5, "end_line": 6},
+            {"file_path": "b.py", "symbol_name": "gamma", "start_line": 1, "end_line": 2},
+        ],
+    )
+
+    payload = analyze_changes(base_ref="main", repo_root=workspace_root).to_dict()
+
+    assert payload["base_ref"] == "main"
+    assert payload["diff_ref"] == fork_point != main_tip
+    assert payload["includes_uncommitted"] is True
+    assert sorted(symbol["name"] for symbol in payload["changed_symbols"]) == ["alpha", "gamma"]
+
+
 # --------------------------------------------------------------------------- #
 # data availability and index readiness
 # --------------------------------------------------------------------------- #

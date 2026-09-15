@@ -7,7 +7,8 @@ changed symbols become the callers that reference them.
 
 The pipeline is deliberately boring:
 
-1. ``git diff --unified=0`` against the merge base -> changed line ranges per file
+1. ``git diff --unified=0`` from the merge base to the working tree -> changed line
+   ranges per file
 2. ranges intersected with ``symbols.start_line``/``end_line`` -> changed symbols
 3. ``call_edges`` and ``references`` reversed on the changed symbol's name
    -> impacted callers
@@ -214,6 +215,10 @@ class ChangeImpactReport:
             "repo_root": self.repo_root,
             "base_ref": self.base_ref,
             "diff_ref": self.diff_ref,
+            # `diff_ref` is the fork point, and the diff runs from there to the
+            # working tree: staged and unstaged edits to tracked files are in it,
+            # untracked files are not.
+            "includes_uncommitted": True,
             "engine_index_version": self.engine_index_version,
             "depth": self.depth,
             "match_kind": self.match_kind,
