@@ -432,9 +432,19 @@ def test_bash_bg_batch_shows_output_of_a_command_that_exited_before_first_poll(
     from lemoncrow.gateway.adapters.mcp import bash as bash_adapter
 
     # What _run_bash_tool hands back for a bg command reaped inline: no session_id.
-    finished = {"stdout": "P1", "stderr": "", "exit_code": 0, "truncated": False, "lines_omitted": 0}
+    finished = {
+        "stdout": "P1",
+        "stderr": "",
+        "exit_code": 0,
+        "truncated": True,
+        "lines_omitted": 12,
+        "chars_omitted": 5000,
+        "log_file": "/tmp/bg.out",
+    }
     monkeypatch.setattr(bash_adapter, "_run_bash_tool", lambda *_args, **_kwargs: dict(finished))
     out = _text(_call("bash", {"command": ["echo P1", "echo P1"], "bg": True}))
     assert "id=?" not in out
-    assert out.count("done exit=0") == 2
+    assert out.count(": done") == 2
     assert "P1" in out
+    # The cut stays visible, with a pointer to the full output.
+    assert "[output truncated: 12 lines omitted; full: /tmp/bg.out]" in out
