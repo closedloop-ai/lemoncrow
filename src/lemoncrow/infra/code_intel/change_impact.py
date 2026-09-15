@@ -32,7 +32,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.infra.code_intel.completeness import MATCH_NAME, MATCH_RESOLVED, OBJECTIVE_EXHAUSTIVE
+from lemoncrow.infra.code_intel.completeness import (
+    DATA_AVAILABLE,
+    DATA_UNAVAILABLE,
+    MATCH_NAME,
+    MATCH_RESOLVED,
+    objective_for_data,
+)
+from lemoncrow.infra.code_intel.freshness import require_ready
 from lemoncrow.infra.code_intel.store import CodeIntelStore, SymbolRow
 
 __all__ = [
@@ -190,13 +197,20 @@ class ChangeImpactReport:
     impacted_total: int
     truncated: bool
     unindexed_paths: tuple[str, ...]
+    #: ``unavailable`` when the call graph the caller lookups read was never
+    #: built: every ``callers`` count is then a zero nobody measured, and
+    #: ``reason`` says what was missing.
+    data_status: str = DATA_AVAILABLE
+    reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             # Name-keyed matching over-reports and never misses, so the caller
             # list is a superset of the truth -- exhaustive in the sense that
-            # matters for impact analysis.
-            "objective": OBJECTIVE_EXHAUSTIVE,
+            # matters for impact analysis. Only over a call graph that exists,
+            # though: with no edges to reverse, every changed symbol reads as
+            # having no callers, and that is missing data rather than an answer.
+            "objective": objective_for_data(self.data_status == DATA_AVAILABLE),
             "repo_root": self.repo_root,
             "base_ref": self.base_ref,
             "diff_ref": self.diff_ref,
@@ -209,7 +223,11 @@ class ChangeImpactReport:
             "impacted_total": self.impacted_total,
             "truncated": self.truncated,
             "unindexed_paths": list(self.unindexed_paths),
+            "data_status": self.data_status,
         }
+        if self.reason is not None:
+            payload["reason"] = self.reason
+        return payload
 
 
 # --------------------------------------------------------------------------- #
@@ -465,14 +483,27 @@ def analyze_changes(
     A site that reaches two changed symbols is reported once per symbol. That is
     not double counting: "who calls what" has two answers there, and collapsing
     them would silently drop one.
+
+    Raises :class:`~lemoncrow.infra.code_intel.freshness.IndexRebuilding` while
+    the index is mid-write and
+    :class:`~lemoncrow.infra.code_intel.store.CodeIntelUnavailable` when it is
+    absent. With no call graph to reverse, the report still maps the diff onto
+    changed symbols but states ``data_status: "unavailable"`` and a ``partial``
+    objective, because the zero callers it would otherwise report were never
+    measured.
     """
     root = Path(repo_root).resolve()
     depth = max(1, int(depth))
     limit = max(1, int(limit))
     diff_ref, changes = collect_changes(root, base_ref=base_ref, paths=paths)
+    # After the diff, which reports a directory that is not a git worktree as the
+    # caller's error to fix first; before the first store read, so a torn or
+    # empty index raises rather than mapping the diff onto nothing.
+    require_ready(root)
 
     with CodeIntelStore(root) as store:
         index_version = store.engine_state("index_version")
+        call_graph_gap = store.call_graph_gap()
         indexed_paths = {row.file_path for row in store.files()}
 
         pending: list[tuple[SymbolRow, str]] = []
@@ -576,4 +607,6 @@ def analyze_changes(
         impacted_total=len(impacted),
         truncated=len(impacted) > limit,
         unindexed_paths=tuple(unindexed),
+        data_status=DATA_AVAILABLE if call_graph_gap is None else DATA_UNAVAILABLE,
+        reason=call_graph_gap,
     )

@@ -10,7 +10,7 @@ fixtures drift from reality -- which is exactly what
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -174,6 +174,37 @@ def workspace_root(tmp_path: Path) -> Path:
     root = tmp_path / DEFAULT_WORKSPACE_NAME
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+@pytest.fixture(autouse=True)
+def _fresh_readiness_probes() -> Iterator[None]:
+    """Readiness probes are throttled per process; one test's must not reach another."""
+    from lemoncrow.infra.code_intel.freshness import reset_readiness_probes
+
+    reset_readiness_probes()
+    yield
+    reset_readiness_probes()
+
+
+@pytest.fixture
+def tear_index() -> Callable[[Path], None]:
+    """Reproduce a reindex caught mid-write: symbol rows survive, file rows are gone.
+
+    That direction and not the other. Files with no symbols is a resting state
+    (a docs-only repository); symbols with no files never is.
+    """
+
+    def _tear(root: Path) -> None:
+        from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, workspace_dir
+
+        conn = sqlite3.connect(workspace_dir(root) / CODE_CONTEXT_DB)
+        try:
+            conn.execute("DELETE FROM files")
+            conn.commit()
+        finally:
+            conn.close()
+
+    return _tear
 
 
 @pytest.fixture

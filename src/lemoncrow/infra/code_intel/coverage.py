@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any
 
 from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
+from lemoncrow.infra.code_intel.freshness import require_ready
 from lemoncrow.infra.code_intel.languages import language_for_path
 from lemoncrow.infra.code_intel.store import CodeIntelStore, FileRow
 
@@ -179,8 +180,15 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
     With no *paths*, the candidate set is every git-tracked file plus everything
     already in the index -- not a filesystem walk, which would drag in build
     output and virtualenvs the indexer never looked at.
+
+    Raises :class:`~lemoncrow.infra.code_intel.freshness.IndexRebuilding` while
+    the index is mid-write, and
+    :class:`~lemoncrow.infra.code_intel.store.CodeIntelUnavailable` when it is
+    absent: verdicts judged against a torn index report real files as missing,
+    and an absent one has nothing to judge against.
     """
     root = Path(repo_root).expanduser().resolve()
+    require_ready(root)
 
     with CodeIntelStore(root) as store:
         snapshot = store.snapshot()

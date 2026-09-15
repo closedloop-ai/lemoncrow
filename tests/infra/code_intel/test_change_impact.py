@@ -28,6 +28,8 @@ from lemoncrow.infra.code_intel.change_impact import (
     analyze_changes,
     parse_diff,
 )
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_PARTIAL
+from lemoncrow.infra.code_intel.freshness import IndexRebuilding
 
 WorkspaceFactory = Callable[..., Path]
 
@@ -642,3 +644,64 @@ def test_report_serializes_to_plain_json_types(
     payload = analyze_changes(repo_root=workspace_root).to_dict()
     assert json.loads(json.dumps(payload))["match_kind"] == MATCH_NAME
     assert payload["changed_symbols"][0]["name"] == "alpha"
+
+
+# --------------------------------------------------------------------------- #
+# data availability and index readiness
+# --------------------------------------------------------------------------- #
+
+_ALPHA_ONLY = [{"file_path": "a.py", "symbol_name": "alpha", "start_line": 1, "end_line": 2}]
+
+
+def _edit_alpha(workspace_root: Path) -> None:
+    _init_repo(workspace_root, {"a.py": _ALPHA})
+    (workspace_root / "a.py").write_text(_ALPHA.replace("return 1", "return 2"), encoding="utf-8")
+
+
+def test_missing_intel_db_is_partial_not_exhaustive(
+    workspace_root: Path,
+    make_workspace: WorkspaceFactory,
+) -> None:
+    """No call graph: every changed symbol reads as uncalled, and nobody measured that."""
+    _edit_alpha(workspace_root)
+    make_workspace(files=[{"file_path": "a.py"}], symbols=_ALPHA_ONLY, with_intel=False)
+
+    payload = analyze_changes(repo_root=workspace_root).to_dict()
+
+    assert [symbol["name"] for symbol in payload["changed_symbols"]] == ["alpha"]
+    assert payload["changed_symbols"][0]["callers"] == 0
+    assert payload["data_status"] == "unavailable"
+    assert "intel.sqlite is absent" in payload["reason"]
+    assert payload["objective"] == OBJECTIVE_PARTIAL
+
+
+def test_symbols_without_any_edges_is_partial(
+    workspace_root: Path,
+    make_workspace: WorkspaceFactory,
+) -> None:
+    """The engine creates intel.sqlite before its call-graph pass has filled it."""
+    _edit_alpha(workspace_root)
+    make_workspace(files=[{"file_path": "a.py"}], symbols=_ALPHA_ONLY)
+
+    payload = analyze_changes(repo_root=workspace_root).to_dict()
+
+    assert payload["data_status"] == "unavailable"
+    assert "no call edges or references" in payload["reason"]
+    assert payload["objective"] == OBJECTIVE_PARTIAL
+
+
+def test_rebuilding_index_raises(
+    workspace_root: Path,
+    make_workspace: WorkspaceFactory,
+    tear_index: Callable[[Path], None],
+) -> None:
+    _edit_alpha(workspace_root)
+    make_workspace(
+        files=[{"file_path": "a.py"}],
+        symbols=_ALPHA_ONLY,
+        call_edges=[{"caller_file_path": "b.py", "callee_name": "alpha"}],
+    )
+    tear_index(workspace_root)
+
+    with pytest.raises(IndexRebuilding):
+        analyze_changes(repo_root=workspace_root)

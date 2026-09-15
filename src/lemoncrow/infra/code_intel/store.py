@@ -566,3 +566,76 @@ class CodeIntelStore:
             references=references,
             centrality=centrality,
         )
+
+    def call_graph_gap(self) -> str | None:
+        """Why the call graph cannot answer a reverse lookup, or ``None`` when it can.
+
+        ``call_edges`` and ``"references"`` come from a later pass than the symbol
+        index, and the engine creates ``intel.sqlite`` with empty tables before
+        that pass runs. A lookup there returns ``[]`` -- the value a symbol with
+        no callers also returns -- so an enumeration built on it cannot tell "no
+        callers" from "never looked". This decides it once, for every caller.
+
+        The data is missing when ``intel.sqlite`` is absent, or when it holds no
+        call edge **and** no reference while ``symbols`` has rows.
+
+        The second rule is deliberately fail-safe. A repository that genuinely
+        contains no calls at all also reads as missing data; that costs a
+        reviewer a grep replay, where the opposite error hands them a confident
+        "nothing calls this". Both probes are ``EXISTS`` checks rather than the
+        full counts :meth:`snapshot` takes, so a query path pays index seeks,
+        not table scans.
+        """
+        conn = self.intel
+        if conn is None:
+            return f"{INTEL_DB} is absent: the call graph has not been built"
+        repo_id = self.repo_id_or_none()
+        if repo_id is None:
+            return None
+        has_symbols = self.code.execute(
+            "SELECT EXISTS(SELECT 1 FROM symbols WHERE repo_id = ?)",
+            (repo_id,),
+        ).fetchone()[0]
+        if not has_symbols:
+            return None
+        has_edges = conn.execute(
+            "SELECT EXISTS(SELECT 1 FROM call_edges WHERE repo_id = ?1) "
+            'OR EXISTS(SELECT 1 FROM "references" WHERE repo_id = ?1)',
+            (repo_id,),
+        ).fetchone()[0]
+        if has_edges:
+            return None
+        return (
+            f"{INTEL_DB} holds no call edges or references for the indexed symbols: "
+            "the call-graph pass has not run, or found no calls"
+        )
+
+    def import_gap(self) -> str | None:
+        """Why the import graph cannot answer a dependency lookup, or ``None`` when it can.
+
+        ``imports`` comes from the engine's import pass. Indexed files with no
+        import row at all means that pass produced nothing, and every answer
+        built on it would read "nothing imports anything".
+
+        Fail-safe like :meth:`call_graph_gap`: a repository whose files genuinely
+        import nothing (docs, config) reads as missing data too, which costs a
+        grep rather than a false "no importers". The ``imports`` probe is an
+        ``EXISTS`` check, so an index with import rows pays one seek; files are
+        counted only when there is a gap to report.
+        """
+        repo_id = self.repo_id_or_none()
+        if repo_id is None:
+            return None
+        has_imports = self.code.execute(
+            "SELECT EXISTS(SELECT 1 FROM imports WHERE repo_id = ?)",
+            (repo_id,),
+        ).fetchone()[0]
+        if has_imports:
+            return None
+        files = int(self.code.execute("SELECT COUNT(*) FROM files WHERE repo_id = ?", (repo_id,)).fetchone()[0])
+        if files == 0:
+            return None
+        return (
+            f"imports has no rows for the {files} indexed files: the import pass has "
+            "not produced a graph, so no dependency was examined"
+        )

@@ -74,7 +74,7 @@ def test_objective_for_coverage(coverage: float | None, expected: str) -> None:
 
 
 def test_discarded_rows_downgrade_even_at_full_coverage() -> None:
-    """"Rows were dropped" and "the subject was under-examined" are two claims.
+    """ "Rows were dropped" and "the subject was under-examined" are two claims.
 
     They normally move together, since a row is superseded because its symbol's
     content changed -- the same fact that lowers coverage. Checking only one left
@@ -177,7 +177,13 @@ def test_change_impact_stamps_an_objective(make_workspace: WorkspaceFactory, wor
         check=True,
         capture_output=True,
     )
-    make_workspace(files=[{"file_path": "a.py"}], symbols=[{"file_path": "a.py", "symbol_name": "alpha"}])
+    make_workspace(
+        files=[{"file_path": "a.py"}],
+        symbols=[{"file_path": "a.py", "symbol_name": "alpha"}],
+        # A built call graph: with no edge or reference at all the objective is
+        # partial by design (test_change_impact covers that case).
+        call_edges=[{"caller_file_path": "b.py", "callee_name": "alpha"}],
+    )
 
     assert analyze_changes(repo_root=workspace_root).to_dict()["objective"] == OBJECTIVE_EXHAUSTIVE
 

@@ -16,6 +16,9 @@ Two mechanisms live here:
   error.
 * :class:`VersionedEngineCache` -- a process cache whose entries are stamped
   with the generation they were built against, and rebuilt on mismatch.
+* :func:`require_ready` -- the same probe, throttled the same way, as a gate
+  for the tools that read the databases directly instead of through a cached
+  engine.
 
 The rule both serve is **fail loud, never empty**. An empty result set from an
 index that is mid-rebuild is indistinguishable from a true negative, which
@@ -40,7 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, workspace_dir
+from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, CodeIntelUnavailable, workspace_dir
 
 __all__ = [
     "DEFAULT_RECHECK_SECONDS",
@@ -57,6 +60,8 @@ __all__ = [
     "IndexState",
     "VersionedEngineCache",
     "index_state",
+    "require_ready",
+    "reset_readiness_probes",
 ]
 
 logger = logging.getLogger(__name__)
@@ -354,3 +359,46 @@ class VersionedEngineCache:
 
     def __contains__(self, key: object) -> bool:
         return key in self._entries
+
+
+#: Readiness probes for the store-backed tools, throttled exactly like the engine
+#: cache's. One entry per distinct repo root this process has queried -- the bound
+#: ``_code_engine_cache`` already has -- cleared by :func:`reset_readiness_probes`.
+_readiness = VersionedEngineCache("store_readiness")
+
+
+def require_ready(repo_root: Path | str = ".") -> IndexState:
+    """Raise unless the index under *repo_root* can answer; return its state.
+
+    ``code_changes``, ``code_query``, ``code_coverage_check`` and the file-graph
+    analytics open the engine's databases directly, so the engine cache's
+    rebuild check never ran for them: mid-reindex they read a torn index and
+    returned what was left, an empty answer delivered as a complete one. This
+    is that check, applied where they start.
+
+    ``rebuilding`` raises :class:`IndexRebuilding`. ``absent`` raises
+    :class:`~lemoncrow.infra.code_intel.store.CodeIntelUnavailable`: the probe
+    cannot tell a workspace that was never indexed from one whose index was
+    emptied for an engine migration and has not repopulated yet, and neither
+    has anything to enumerate. Both fail loud; neither returns empty.
+
+    The probe is re-read at most once per :data:`DEFAULT_RECHECK_SECONDS`, the
+    staleness bound the engine cache already accepts, so a hot query path does
+    not open SQLite an extra time per call.
+    """
+    root = Path(repo_root).expanduser().resolve()
+    state = _readiness.state_for(root)
+    if state.status == STATUS_REBUILDING:
+        raise IndexRebuilding(root, state.detail)
+    if state.status == STATUS_ABSENT:
+        raise CodeIntelUnavailable(
+            f"code index for {root} is unavailable ({state.detail}): the workspace has not been "
+            "indexed, or its index is being migrated and has not repopulated yet -- run "
+            "`lc code index`, or retry shortly"
+        )
+    return state
+
+
+def reset_readiness_probes() -> None:
+    """Forget every throttled readiness probe, so the next gate re-reads disk."""
+    _readiness.clear()
