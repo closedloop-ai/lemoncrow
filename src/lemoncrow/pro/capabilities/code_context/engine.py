@@ -691,6 +691,11 @@ _CALL_GRAPH_ESSENTIAL_KEYS = [
     "direction",
     "related",
     "related_count",
+    # A consumer decides whether the list is whole from these, so trimming a
+    # large response must never drop them.
+    "truncated",
+    "related_total",
+    "related_total_exact",
     "data_status",
     "provenance",
 ]
@@ -698,7 +703,6 @@ _CALL_GRAPH_OPTIONAL_KEYS = [
     "depth",
     "related",
     "related_count",
-    "truncated",
     "edges",
     "edge_count",
     "data_status",
@@ -706,6 +710,9 @@ _CALL_GRAPH_OPTIONAL_KEYS = [
     "message",
     "snapshot",
 ]
+# Row ceiling of one symbol's caller lookup (`_find_callers_local`). A lookup that
+# returns this many rows may have stopped early, so traversal treats it as cut.
+_CALLER_LOOKUP_ROW_CAP = 1000
 _BLAME_ESSENTIAL_KEYS = [
     "symbol_name",
     "file_path",
@@ -7426,6 +7433,9 @@ class CodeContextEngine:
             traversal = CallGraphTraversalResult(
                 nodes=nodes,
                 edges=edges,
+                # Rows were read to limit + 1, so a cut set counts only what was read.
+                related_symbol_ids=sorted(nodes_by_id),
+                related_total_exact=not truncated,
                 truncated=truncated,
                 data_status="available" if edges else "empty",
                 message=None if edges else "no related call edges were found",
@@ -10599,6 +10609,7 @@ class CodeContextEngine:
                 limit=limit,
                 snapshot=snapshot,
                 lookup_neighbors=lambda current_symbol_id: lookup(symbol_id=current_symbol_id),
+                neighbor_cap=_CALLER_LOOKUP_ROW_CAP if direction == "callers" else None,
             )
             if traversal.data_status == "unavailable" and direction == "callers":
                 fallback = self._fallback_callers_from_references(
@@ -10614,10 +10625,16 @@ class CodeContextEngine:
             nodes_by_identity: dict[tuple[str, str, int, int, str], CallGraphNode] = {}
             edges_by_key: dict[tuple[str, str, int], CallGraphEdge] = {}
             merged_truncated = False
+            # The edge store is name-keyed, so same-named targets share callers:
+            # union the totals by symbol id, never sum them.
+            related_ids: set[str] = set()
+            merged_exact = True
             status_rank = {"unavailable": 0, "empty": 1, "available": 2}
             merged_status = "unavailable"
             for current in traversals:
                 merged_truncated = merged_truncated or current.truncated
+                related_ids.update(current.related_symbol_ids)
+                merged_exact = merged_exact and current.related_total_exact
                 if status_rank[current.data_status] > status_rank[merged_status]:
                     merged_status = current.data_status
                 for node in current.nodes:
@@ -10660,6 +10677,8 @@ class CodeContextEngine:
             traversal = CallGraphTraversalResult(
                 nodes=merged_nodes,
                 edges=merged_edges,
+                related_symbol_ids=sorted(related_ids),
+                related_total_exact=merged_exact,
                 truncated=merged_truncated,
                 data_status=cast(Any, merged_status),
                 message=merged_message,
@@ -10684,6 +10703,7 @@ class CodeContextEngine:
             edges_before = len(cast(list[dict[str, Any]], payload.get("edges", [])))
             payload["related"] = cast(list[dict[str, Any]], payload.get("related", []))[:max_related]
             payload["edges"] = cast(list[dict[str, Any]], payload.get("edges", []))[:max_related]
+            # Only the returned rows are recounted; related_total stays the pre-limit count.
             payload["related_count"] = len(cast(list[dict[str, Any]], payload.get("related", [])))
             payload["edge_count"] = len(cast(list[dict[str, Any]], payload.get("edges", [])))
             payload["truncated"] = (
@@ -12837,9 +12857,9 @@ class CodeContextEngine:
                 FROM call_edges
                 WHERE repo_id = ? AND callee_short_name = ?
                 ORDER BY caller_file_path, caller_start_line
-                LIMIT 1000
+                LIMIT ?
                 """,
-                (self.repo_id, target_name),
+                (self.repo_id, target_name, _CALLER_LOOKUP_ROW_CAP),
             ).fetchall()
         if not rows:
             return []
@@ -13060,6 +13080,7 @@ class CodeContextEngine:
         nodes_by_id: dict[str, CallGraphNode] = {}
         edges: list[CallGraphEdge] = []
         seen_edges: set[tuple[str, str, int]] = set()
+        related_ids: set[str] = set()
         truncated = False
         for reference in references:
             if reference.file_path == target_file and target_start <= reference.line <= target_end:
@@ -13067,6 +13088,7 @@ class CodeContextEngine:
             node = self._caller_node_from_reference(reference, target_symbol_id=target_symbol_id)
             if node is None:
                 continue
+            related_ids.add(node.symbol_id)
             if node.symbol_id not in nodes_by_id:
                 if len(nodes_by_id) >= limit:
                     truncated = True
@@ -13088,6 +13110,8 @@ class CodeContextEngine:
             return CallGraphTraversalResult(
                 nodes=[],
                 edges=[],
+                related_symbol_ids=[],
+                related_total_exact=False,
                 truncated=False,
                 data_status="unavailable",
                 message="routed call edge data is unavailable",
@@ -13096,6 +13120,10 @@ class CodeContextEngine:
         return CallGraphTraversalResult(
             nodes=ordered_nodes,
             edges=ordered_edges,
+            related_symbol_ids=sorted(related_ids),
+            # References come through a row-capped lookup whose saturation is not
+            # visible here, so this count is never claimed exact.
+            related_total_exact=False,
             truncated=truncated,
             data_status="available",
             message="fallback caller graph derived from symbol references",

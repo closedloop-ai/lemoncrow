@@ -1,12 +1,14 @@
 """No enumerative response claims completeness over data it never had.
 
-PRD-739 FR1, FR3 and FR6. A consumer decides whether a list is whole by one
+PRD-739 FR1, FR2, FR3 and FR6. A consumer decides whether a list is whole by one
 predicate -- ``objective == "exhaustive" and truncated is False`` -- and a
 reviewer who sees it pass writes "nothing else calls this". So every
 enumerative operation here gets its missing-data case built for real: a call
 graph that was never built, an import table with no rows, an index that is
 mid-rebuild or holds nothing. Each response must fail the predicate or be an
-error. An empty answer that passes it is the failure being pinned.
+error. An empty answer that passes it is the failure being pinned. A list cut
+by ``limit`` or trimmed to a token budget must still carry the fields the
+predicate reads, and a total counted before the limit.
 
 Requests go through the registered MCP handlers, and once through the JSON-RPC
 dispatcher, rather than the infra functions: a handler that caught the error
@@ -17,6 +19,7 @@ Organised by surface, so later contract checks extend this file.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 from collections.abc import Callable, Iterator
@@ -29,6 +32,7 @@ from lemoncrow.gateway.adapters import mcp_server
 from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE, OBJECTIVE_PARTIAL
 from lemoncrow.infra.code_intel.freshness import IndexRebuilding, reset_readiness_probes
 from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, INTEL_DB, CodeIntelUnavailable, workspace_dir
+from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 from lemoncrow.pro.capabilities.code_context.call_graph import build_call_graph_payload, traverse_call_graph
 
 _REPO_ID = "contract00000001"
@@ -244,6 +248,56 @@ def test_relations_with_unavailable_edge_data_is_partial_not_exhaustive(op: str)
     assert unavailable["objective"] == OBJECTIVE_PARTIAL
     # Looked up and none found is an answer, and keeps the op's claim.
     assert empty["objective"] == OBJECTIVE_EXHAUSTIVE
+
+
+_FAN = 30
+
+
+def _fan_repo(root: Path) -> Path:
+    """An indexed repository where ``hub`` has ``_FAN`` callers and ``_FAN`` callees."""
+    root.mkdir(parents=True)
+    (root / "leaves.py").write_text(
+        "".join(f"def leaf_{index}() -> int:\n    return {index}\n\n\n" for index in range(_FAN)), encoding="utf-8"
+    )
+    calls = " + ".join(f"leaf_{index}()" for index in range(_FAN))
+    (root / "hub.py").write_text(f"from leaves import *\n\n\ndef hub() -> int:\n    return {calls}\n", encoding="utf-8")
+    (root / "callers.py").write_text(
+        "from hub import hub\n\n\n"
+        + "".join(f"def caller_{index}() -> int:\n    return hub()\n\n\n" for index in range(_FAN)),
+        encoding="utf-8",
+    )
+    CodeContextEngine(root).index_repo()
+    return root
+
+
+@pytest.mark.parametrize("limit", [5, 100], ids=["cut-by-limit", "whole"])
+@pytest.mark.parametrize("kind", ["callers", "callees"])
+def test_relations_states_its_completeness_fields_at_every_response_size(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str, limit: int
+) -> None:
+    """The response a reviewer reads, cut or whole, after trimming to its budget."""
+    root = _fan_repo(tmp_path / "repo")
+    monkeypatch.setenv("LEMONCROW_WORKSPACE_ROOT", str(root))
+
+    response = mcp_server._handle(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "relations", "arguments": {"symbol": "hub", "kind": kind, "limit": limit}},
+        }
+    )
+
+    assert isinstance(response, dict)
+    body = json.loads(response["result"]["content"][0]["text"])
+    # The engine trimmed this response to fit: `depth` is the first key it drops.
+    assert "depth" not in body
+    assert body["objective"] == OBJECTIVE_EXHAUSTIVE
+    assert body["truncated"] is (limit < _FAN)
+    assert body["related_total"] == _FAN
+    assert body["related_total_exact"] is True
+    assert body["related_count"] == min(limit, _FAN)
+    assert _claims_complete(body) is (limit >= _FAN)
 
 
 # --------------------------------------------------------------------------- #
