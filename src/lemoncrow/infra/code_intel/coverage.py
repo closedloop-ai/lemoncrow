@@ -12,13 +12,21 @@ Five states, per path:
     In ``files`` but the bytes on disk have moved on -- including the case where
     the file has been deleted and the index has not caught up.
 ``missing``
-    On disk, in a language the index supports, and simply not there.
+    Not in ``files``: either not on disk at all, or on disk and selected by the
+    indexer's file scan but absent from the last index run.
 ``excluded``
-    On disk but outside what the indexer takes: git-ignored, or a file type the
-    language registry does not recognise.
+    On disk but passed over by one of the indexer's file-selection rules, which
+    the verdict names in ``rule`` (see :data:`EXCLUSION_RULES`).
 ``unparsed``
     In ``files`` with zero rows in ``symbols`` -- indexed as a file, but no
     symbols were extracted from it.
+
+Excluded and missing are decided by the indexer's own scan rather than a guess
+at it: an on-disk path the index does not hold is ``missing`` exactly when
+:func:`~lemoncrow.pro.capabilities.repo_map.graph.iter_source_files` selects it
+and the free-tier cap would keep it. One rule cannot be read back:
+``exclude_globs`` passed to an index run are not persisted, so a path they kept
+out reports ``missing``, with a reason saying an index-time exclude may apply.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ from lemoncrow.infra.code_intel.languages import language_for_path
 from lemoncrow.infra.code_intel.store import CodeIntelStore, FileRow
 
 __all__ = [
+    "EXCLUSION_RULES",
     "STATES",
     "CoverageReport",
     "PathCoverage",
@@ -43,10 +52,35 @@ __all__ = [
 
 STATES: tuple[str, ...] = ("indexed", "stale", "missing", "excluded", "unparsed")
 
-# The engine's own ignore rules live in the closed indexer. This module states
-# which rules IT applied instead of pretending to know the engine's, and reports
-# that under `exclusion_source` so a caller can weigh the answer.
+RULE_SKIPPED_DIRECTORY = "skipped-directory"
+RULE_LEMONCROW_IGNORE = "lemoncrow-ignore"
+RULE_GIT_IGNORE = "git-ignore"
+RULE_UNRECOGNISED_FILE_TYPE = "unrecognised-file-type"
+RULE_FREE_TIER_FILE_CAP = "free-tier-file-cap"
+RULE_SOURCE_FILE_SCAN = "source-file-scan"
+
+#: The indexer's file-selection rules a verdict applies, first match wins. The
+#: free-tier cap only ever applies to a path the scan selected, and every other
+#: rule only to a path it did not. ``source-file-scan`` is the remainder: the
+#: scan passed the path over and no narrower rule says why (an extension in the
+#: wrong case, an untracked file inside a submodule).
+EXCLUSION_RULES: tuple[str, ...] = (
+    RULE_SKIPPED_DIRECTORY,
+    RULE_LEMONCROW_IGNORE,
+    RULE_GIT_IGNORE,
+    RULE_UNRECOGNISED_FILE_TYPE,
+    RULE_FREE_TIER_FILE_CAP,
+    RULE_SOURCE_FILE_SCAN,
+)
+
+# Kept verbatim for consumers that captured it (PLN-1677 N0). It predates the
+# indexer's rules being readable here; `exclusion_rules` lists the rules this
+# check applies now, and each excluded verdict names its own.
 _EXCLUSION_SOURCE = "git-ignore + unrecognised-file-type"
+
+# `exclude_globs` given to an index run are not persisted, so a path the scan
+# selects but the index does not hold may be excluded that way or not yet indexed.
+_NOT_IN_LAST_RUN = "not in the last index run (an index-time exclude may apply)"
 
 _HASH_READ_CHUNK = 1 << 20
 
@@ -60,15 +94,20 @@ class PathCoverage:
     reason: str
     language: str | None
     symbols: int
+    #: The :data:`EXCLUSION_RULES` entry behind an ``excluded`` verdict, else ``None``.
+    rule: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "path": self.path,
             "state": self.state,
             "reason": self.reason,
             "language": self.language,
             "symbols": self.symbols,
         }
+        if self.rule is not None:
+            payload["rule"] = self.rule
+        return payload
 
 
 @dataclass(frozen=True)
@@ -80,6 +119,7 @@ class CoverageReport:
     exclusion_source: str
     totals: dict[str, int]
     paths: tuple[PathCoverage, ...]
+    exclusion_rules: tuple[str, ...] = EXCLUSION_RULES
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,9 +129,25 @@ class CoverageReport:
             "repo_root": self.repo_root,
             "engine_index_version": self.engine_index_version,
             "exclusion_source": self.exclusion_source,
+            "exclusion_rules": list(self.exclusion_rules),
             "totals": dict(self.totals),
             "paths": [entry.to_dict() for entry in self.paths],
         }
+
+
+@dataclass(frozen=True)
+class _IndexSelection:
+    """What the indexer's file scan takes from this checkout as it stands."""
+
+    #: Repo-relative paths :func:`iter_source_files` selects.
+    selected: frozenset[str]
+    #: The subset the free-tier cap keeps; all of *selected* when uncapped.
+    kept: frozenset[str]
+    #: The ``.lemoncrow/.ignore`` spec the scan applied, or ``None``.
+    ignore_spec: Any | None
+
+
+_NO_SELECTION = _IndexSelection(selected=frozenset(), kept=frozenset(), ignore_spec=None)
 
 
 def _sha256(path: Path) -> str | None:
@@ -155,6 +211,62 @@ def _relative(root: Path, raw: str) -> str:
     return candidate.as_posix()
 
 
+def _relative_set(root: Path, files: list[Path]) -> frozenset[str]:
+    relative: set[str] = set()
+    for path in files:
+        try:
+            relative.add(path.relative_to(root).as_posix())
+        except ValueError:
+            continue  # a symlink resolving outside the checkout
+    return frozenset(relative)
+
+
+def _index_selection(root: Path) -> _IndexSelection:
+    """Run the indexer's own file scan, then its free-tier cap.
+
+    Mirrors ``CodeContextEngine._index_repo_unsafe`` with no ``exclude_globs``:
+    the same :func:`iter_source_files` call, then, without the
+    ``context_engine`` feature, the first ``_FREE_TIER_MAX_FILES`` paths of the
+    sorted scan. Imported lazily, because the scan lists and pattern-matches
+    every git-visible file and only runs when a queried path is not indexed.
+    """
+    from lemoncrow.core.capabilities import licensing
+    from lemoncrow.pro.capabilities.repo_map.graph import iter_source_files, load_lemoncrow_ignore_spec
+
+    files = iter_source_files(root)
+    kept = files
+    if not licensing.has_feature("context_engine"):
+        from lemoncrow.pro.capabilities.code_context.engine import _FREE_TIER_MAX_FILES
+
+        if len(files) > _FREE_TIER_MAX_FILES:
+            kept = sorted(files)[:_FREE_TIER_MAX_FILES]
+    return _IndexSelection(
+        selected=_relative_set(root, files),
+        kept=_relative_set(root, kept),
+        ignore_spec=load_lemoncrow_ignore_spec(root),
+    )
+
+
+def _exclusion(rel: str, selection: _IndexSelection, ignored: set[str]) -> tuple[str, str]:
+    """``(rule, reason)`` for an on-disk path the indexer's scan passed over.
+
+    Tried in a fixed order and the first match wins, so a git-ignored file
+    under ``data/`` names the skipped directory.
+    """
+    from lemoncrow.pro.capabilities.repo_map.graph import should_skip_relative_path
+
+    for part in Path(rel).parts:
+        if should_skip_relative_path(part):
+            return RULE_SKIPPED_DIRECTORY, f"skipped directory: {part}"
+    if selection.ignore_spec is not None and selection.ignore_spec.match_file(rel):
+        return RULE_LEMONCROW_IGNORE, ".lemoncrow/.ignore"
+    if rel in ignored:
+        return RULE_GIT_IGNORE, "git-ignored"
+    if language_for_path(rel) is None:
+        return RULE_UNRECOGNISED_FILE_TYPE, "unrecognised file type"
+    return RULE_SOURCE_FILE_SCAN, "not selected by the index's source-file scan"
+
+
 def _disk_matches(root: Path, rel: str, row: FileRow) -> bool:
     """True when the indexed row still describes what is on disk.
 
@@ -181,6 +293,13 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
     already in the index -- not a filesystem walk, which would drag in build
     output and virtualenvs the indexer never looked at.
 
+    An on-disk path the index does not hold is judged against the indexer's own
+    file scan, run once and only when such a path is asked about. It is
+    ``excluded``, naming the first rule that passed it over, or ``missing`` when
+    the scan selects it. Index-time ``exclude_globs`` are not persisted, so a
+    path one of them kept out cannot be told apart from a path not yet indexed:
+    it reports ``missing``, with a reason saying an index-time exclude may apply.
+
     Raises :class:`~lemoncrow.infra.code_intel.freshness.IndexRebuilding` while
     the index is mid-write, and
     :class:`~lemoncrow.infra.code_intel.store.CodeIntelUnavailable` when it is
@@ -197,11 +316,12 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
 
     if paths is None:
         candidates = sorted(set(indexed) | _tracked_files(root))
-        ignored: set[str] = set()
     else:
         candidates = sorted({_relative(root, raw) for raw in paths})
-        on_disk_unindexed = [rel for rel in candidates if rel not in indexed and (root / rel).exists()]
-        ignored = _ignored_files(root, on_disk_unindexed)
+
+    unindexed_on_disk = [rel for rel in candidates if rel not in indexed and (root / rel).exists()]
+    selection = _index_selection(root) if unindexed_on_disk else _NO_SELECTION
+    ignored = _ignored_files(root, [rel for rel in unindexed_on_disk if rel not in selection.selected])
 
     entries: list[PathCoverage] = []
     totals: dict[str, int] = dict.fromkeys(STATES, 0)
@@ -230,12 +350,13 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
                 entry = PathCoverage(rel, "indexed", "up to date", row.language, symbols)
         elif not exists:
             entry = PathCoverage(rel, "missing", "not on disk and not indexed", language_name, 0)
-        elif rel in ignored:
-            entry = PathCoverage(rel, "excluded", "git-ignored", language_name, 0)
-        elif language is None:
-            entry = PathCoverage(rel, "excluded", "unrecognised file type", None, 0)
+        elif rel not in selection.selected:
+            rule, reason = _exclusion(rel, selection, ignored)
+            entry = PathCoverage(rel, "excluded", reason, language_name, 0, rule)
+        elif rel not in selection.kept:
+            entry = PathCoverage(rel, "excluded", "free-tier file cap", language_name, 0, RULE_FREE_TIER_FILE_CAP)
         else:
-            entry = PathCoverage(rel, "missing", "on disk, supported language, not indexed", language_name, 0)
+            entry = PathCoverage(rel, "missing", _NOT_IN_LAST_RUN, language_name, 0)
 
         entries.append(entry)
         totals[entry.state] += 1

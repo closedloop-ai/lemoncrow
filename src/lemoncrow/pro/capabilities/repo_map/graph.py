@@ -100,6 +100,9 @@ def _load_lemoncrow_ignore_spec(repo_root: Path) -> Any | None:
     return pathspec.PathSpec.from_lines("gitignore", lines)
 
 
+load_lemoncrow_ignore_spec = _load_lemoncrow_ignore_spec
+
+
 def iter_source_files(
     repo_root: Path,
     include_globs: list[str] | None = None,
