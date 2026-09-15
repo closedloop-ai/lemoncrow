@@ -183,6 +183,17 @@ def test_non_git_directory_is_an_error_not_an_empty_report(tmp_path: Path) -> No
         analyze_changes(repo_root=tmp_path)
 
 
+def test_option_shaped_base_ref_is_refused_and_writes_nothing(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    _init_repo(repo, {"a.py": _ALPHA})
+    (repo / "a.py").write_text(_ALPHA + "# edited\n", encoding="utf-8")
+    target = tmp_path / "written_by_git_diff.txt"
+
+    with pytest.raises(GitUnavailable, match="starts with '-'"):
+        analyze_changes(base_ref=f"--output={target}", repo_root=repo)
+    assert not target.exists()
+
+
 def test_edited_body_reports_its_symbol_and_callers(
     workspace_root: Path,
     make_workspace: WorkspaceFactory,
