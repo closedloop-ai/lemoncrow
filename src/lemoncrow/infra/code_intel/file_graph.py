@@ -30,7 +30,8 @@ from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Any
 
-from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
+from lemoncrow.infra.code_intel.completeness import DATA_AVAILABLE, DATA_UNAVAILABLE, objective_for_data
+from lemoncrow.infra.code_intel.freshness import require_ready
 from lemoncrow.infra.code_intel.store import CodeIntelStore, IndexSnapshot
 
 __all__ = ["FileGraph", "open_file_graph"]
@@ -141,6 +142,18 @@ class FileGraph:
         self.repo_root: Path = repo_root
         self._store: CodeIntelStore = store
         self._snapshot: IndexSnapshot = store.snapshot()
+        # `imports` comes from the engine's import pass. Indexed files with no
+        # import row at all means that pass produced nothing, and every answer
+        # below would read "nothing imports anything". Fail-safe like the
+        # call-graph check: a repository whose files genuinely import nothing
+        # (docs, config) reads as partial too, which costs a grep rather than a
+        # false "no importers".
+        self._import_gap: str | None = (
+            f"imports has no rows for the {self._snapshot.files} indexed files: the import pass has "
+            "not produced a graph, so no dependency was examined"
+            if self._snapshot.files > 0 and self._snapshot.imports == 0
+            else None
+        )
         self._files: dict[str, str] = {row.file_path: row.language for row in store.files()}
         self._edges: _Edges = self._build_edges()
         self._import_languages: frozenset[str] = frozenset(
@@ -241,15 +254,20 @@ class FileGraph:
 
         Every operation here enumerates rather than ranks -- the import graph is
         walked exhaustively and only the *returned list* is ever cut -- so the
-        objective is stamped once, for all five.
+        objective is stamped once, for all five: exhaustive over an import table
+        that has rows, partial over one that has none.
         """
-        return {
-            "objective": OBJECTIVE_EXHAUSTIVE,
+        envelope: dict[str, Any] = {
+            "objective": objective_for_data(self._import_gap is None),
             "analyzed_files": len(self._files),
             "resolved_edges": self._edges.resolved,
             "unresolved_edges": self._edges.unresolved,
             "engine_index_version": self._snapshot.index_version,
+            "data_status": DATA_AVAILABLE if self._import_gap is None else DATA_UNAVAILABLE,
         }
+        if self._import_gap is not None:
+            envelope["reason"] = self._import_gap
+        return envelope
 
     def _scope(self, paths: list[str] | None) -> frozenset[str] | None:
         """Normalise a caller's path filter to repo-relative prefixes."""
@@ -476,6 +494,13 @@ class FileGraph:
 
 
 def open_file_graph(repo_root: Path | str = ".") -> FileGraph:
-    """Open a :class:`FileGraph` over *repo_root*'s code index."""
+    """Open a :class:`FileGraph` over *repo_root*'s code index.
+
+    Raises :class:`~lemoncrow.infra.code_intel.freshness.IndexRebuilding` while
+    the index is mid-write and
+    :class:`~lemoncrow.infra.code_intel.store.CodeIntelUnavailable` when it is
+    absent or empty, rather than analysing nothing.
+    """
     root = Path(repo_root).expanduser().resolve()
+    require_ready(root)
     return FileGraph(CodeIntelStore(root), root)

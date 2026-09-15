@@ -45,7 +45,8 @@ from lemoncrow.infra.code_intel.clones import (
     open_clone_table,
     signature_coverage,
 )
-from lemoncrow.infra.code_intel.completeness import MATCH_NAME, objective_for_coverage
+from lemoncrow.infra.code_intel.completeness import DATA_AVAILABLE, DATA_UNAVAILABLE, MATCH_NAME, objective_for_data
+from lemoncrow.infra.code_intel.freshness import require_ready
 from lemoncrow.infra.code_intel.store import CodeIntelStore
 
 __all__ = [
@@ -315,6 +316,11 @@ class QueryResult:
     stale_symbols: int | None = None
     superseded_rows: int | None = None
     built_from_index_version: int | None = None
+    #: Whether the rows this select reads were there to be read. ``unavailable``
+    #: means empty ``rows`` are not evidence of absence -- the call graph an
+    #: intel-backed select reads was never built -- and ``reason`` says what.
+    data_status: str = DATA_AVAILABLE
+    reason: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -329,7 +335,11 @@ class QueryResult:
             # `objective: "exhaustive"`, which passes the completeness predicate
             # while asserting this code has no duplicates. `coverage` said
             # otherwise, but the contract does not oblige anyone to read it.
-            "objective": objective_for_coverage(self.coverage, self.superseded_rows),
+            #
+            # Downgraded, too, when the rows were never there to read: an
+            # intel-backed select over a call graph that was not built returns
+            # zero rows, exactly what a name nothing calls returns.
+            "objective": objective_for_data(self.data_status == DATA_AVAILABLE, self.coverage, self.superseded_rows),
             "select": self.select,
             "where": self.where,
             "order_by": self.order_by,
@@ -340,7 +350,10 @@ class QueryResult:
             "truncated": self.truncated,
             "scan_capped": self.scan_capped,
             "engine_index_version": self.engine_index_version,
+            "data_status": self.data_status,
         }
+        if self.reason is not None:
+            payload["reason"] = self.reason
         if self.match_kind is not None:
             payload["match_kind"] = self.match_kind
         if self.coverage is not None:
@@ -518,6 +531,11 @@ def code_query(
     malformed regex, or a container where a scalar belongs. Rejecting is the
     point: a silently-dropped predicate widens the result set, and a caller
     reading a list it believes was filtered cannot detect that.
+
+    Raises :class:`~lemoncrow.infra.code_intel.freshness.IndexRebuilding` while
+    the index is mid-write and
+    :class:`~lemoncrow.infra.code_intel.store.CodeIntelUnavailable` when it is
+    absent, instead of returning the empty rows either would produce.
     """
     spec = SELECTS.get(select)
     if spec is None:
@@ -540,6 +558,10 @@ def code_query(
         # `prose: 1` (or any language_* predicate) to see it.
         requested["prose"] = 0
     predicates = _build_predicates(spec, requested)
+    # After validation, so a malformed query is reported as one whatever state
+    # the index is in; before the store opens, so a torn or empty index raises
+    # instead of answering. `describe` never reaches this function.
+    require_ready(repo_root)
 
     with CodeIntelStore(repo_root) as store:
         index_version = store.engine_state("index_version")
@@ -562,6 +584,11 @@ def code_query(
         else:
             conn = store.intel
         repo_id = store.repo_id_or_none()
+        # Intel-backed selects read a call graph built by a later pass than the
+        # symbol index. Over one that was never built they return zero rows --
+        # what a name nothing calls also returns -- so the result says the data
+        # was missing instead of letting that pass as exhaustive.
+        data_gap = store.call_graph_gap() if spec.database == "intel" else None
         if conn is None or repo_id is None:
             if sidecar_conn is not None:
                 sidecar_conn.close()
@@ -576,6 +603,8 @@ def code_query(
                 scan_capped=False,
                 match_kind=MATCH_NAME if spec.name_keyed else None,
                 engine_index_version=index_version,
+                data_status=DATA_UNAVAILABLE,
+                reason=data_gap or "the index holds no rows for this workspace",
             )
 
         try:
@@ -658,4 +687,6 @@ def code_query(
         stale_symbols=stale_symbols,
         superseded_rows=superseded_rows,
         built_from_index_version=built_from,
+        data_status=DATA_AVAILABLE if data_gap is None else DATA_UNAVAILABLE,
+        reason=data_gap,
     )

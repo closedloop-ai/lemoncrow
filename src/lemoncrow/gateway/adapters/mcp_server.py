@@ -162,11 +162,17 @@ from lemoncrow.gateway.adapters.mcp.tools_commodity import (  # noqa: F401  (reg
     tool_web_fetch,
 )
 from lemoncrow.gateway.adapters.mcp_branding import icon_metadata
-from lemoncrow.infra.code_intel.completeness import CODE_OP_MATCH_KINDS, CODE_OP_OBJECTIVES, OBJECTIVE_RANKED
+from lemoncrow.infra.code_intel.completeness import (
+    CODE_OP_MATCH_KINDS,
+    CODE_OP_OBJECTIVES,
+    OBJECTIVE_PARTIAL,
+    OBJECTIVE_RANKED,
+)
 from lemoncrow.infra.code_intel.freshness import (  # noqa: F401  (IndexRebuilding re-exported for handlers/tests)
     FRESHNESS_REBUILT,
     IndexRebuilding,
     VersionedEngineCache,
+    reset_readiness_probes,
 )
 from lemoncrow.infra.runtime.run_ledger import (
     RunLedger,
@@ -1131,6 +1137,7 @@ def _reset_runtime_cache_for_testing() -> None:
     _COMPACT_ADVISE_CACHE.clear()
     _last_blocked_plan_hash_by_session.clear()
     _code_engine_cache.clear()
+    reset_readiness_probes()
     _scoped_context_cache.clear()
 
 
@@ -8994,7 +9001,12 @@ def _maybe_attach_code_rendered(op: str, payload: dict[str, Any], *, render_comp
     # top-N read as a complete set is how a confident wrong finding gets filed.
     objective = CODE_OP_OBJECTIVES.get(op)
     if objective is not None:
-        result.setdefault("objective", objective)
+        # Edge data that was never there to look up is not "no edges found":
+        # `empty` keeps the op's claim, `unavailable` cannot make it.
+        if result.get("data_status") == "unavailable":
+            result["objective"] = OBJECTIVE_PARTIAL
+        else:
+            result.setdefault("objective", objective)
 
     # ...and say how the edges were matched. Exhaustive is necessary, not
     # sufficient: both edge stores are name-keyed, so a complete enumeration of

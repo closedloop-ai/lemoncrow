@@ -72,12 +72,15 @@ from typing import Any
 __all__ = [
     "CODE_OP_MATCH_KINDS",
     "CODE_OP_OBJECTIVES",
+    "DATA_AVAILABLE",
+    "DATA_UNAVAILABLE",
     "MATCH_NAME",
     "MATCH_RESOLVED",
     "OBJECTIVE_EXHAUSTIVE",
     "OBJECTIVE_PARTIAL",
     "OBJECTIVE_RANKED",
     "objective_for_coverage",
+    "objective_for_data",
     "with_match_kind",
     "with_objective",
 ]
@@ -90,7 +93,7 @@ OBJECTIVE_EXHAUSTIVE = "exhaustive"
 
 #: Exhaustive over what was examined -- but what was examined is not everything.
 #:
-#: Only derived surfaces can be in this state. They answer from stored results,
+#: Derived surfaces reach this state through coverage. They answer from stored results,
 #: so the question "was the whole subject looked at" is separate from "was the
 #: whole answer returned", and ``truncated`` only ever spoke to the second.
 #:
@@ -103,6 +106,13 @@ OBJECTIVE_EXHAUSTIVE = "exhaustive"
 #: consumer honouring the documented predicate got a false negative. So the
 #: field the contract *does* make authoritative carries it: below full
 #: coverage the objective is no longer exhaustive.
+#:
+#: The second way to examine less than everything is for the data the answer
+#: depends on to be unavailable. A reverse lookup over a call graph that was
+#: never built returns ``[]`` -- the value a symbol with no callers returns --
+#: and ``code_changes`` reported that as zero callers for every changed symbol,
+#: exhaustive and untruncated. :func:`objective_for_data` makes that partial
+#: before coverage is consulted.
 OBJECTIVE_PARTIAL = "partial"
 
 #: Engine-backed ``code`` ops we have evidence for. ``pattern`` and ``node`` are
@@ -139,6 +149,16 @@ CODE_OP_MATCH_KINDS: dict[str, str] = {
 }
 
 
+#: The data an enumeration depends on was there to be read. Mirrors the engine's
+#: call-graph ``data_status``, whose third value, ``"empty"``, means "looked up
+#: and none found" -- a real answer, which stays exhaustive.
+DATA_AVAILABLE = "available"
+
+#: The data an enumeration depends on was never built, so an empty result is not
+#: evidence of absence. See :func:`objective_for_data`.
+DATA_UNAVAILABLE = "unavailable"
+
+
 def objective_for_coverage(coverage: float | None, superseded: int | None = None) -> str:
     """The objective a stored-result surface may claim about this answer.
 
@@ -159,6 +179,24 @@ def objective_for_coverage(coverage: float | None, superseded: int | None = None
     if coverage < 1.0 or (superseded or 0) > 0:
         return OBJECTIVE_PARTIAL
     return OBJECTIVE_EXHAUSTIVE
+
+
+def objective_for_data(available: bool, coverage: float | None = None, superseded: int | None = None) -> str:
+    """The objective an enumerative answer may claim, given whether its data existed.
+
+    *available* false means the lookup had nothing to read -- the call graph or
+    import table the answer depends on was never built -- so an empty result is
+    not evidence of absence, and the answer is :data:`OBJECTIVE_PARTIAL`
+    whatever else is true. Otherwise this defers to
+    :func:`objective_for_coverage`.
+
+    Unavailable is not empty. Edges that were looked up with none found are a
+    real answer and stay exhaustive; only data that was never there to look up
+    downgrades the claim.
+    """
+    if not available:
+        return OBJECTIVE_PARTIAL
+    return objective_for_coverage(coverage, superseded)
 
 
 def with_objective(payload: dict[str, Any], objective: str) -> dict[str, Any]:

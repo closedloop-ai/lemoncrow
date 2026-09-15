@@ -15,6 +15,8 @@ from pathlib import Path
 
 import pytest
 
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE, OBJECTIVE_PARTIAL
+from lemoncrow.infra.code_intel.freshness import IndexRebuilding
 from lemoncrow.infra.code_intel.query import (
     MAX_LIMIT,
     ORDER_BY,
@@ -23,7 +25,7 @@ from lemoncrow.infra.code_intel.query import (
     code_query,
     describe_schema,
 )
-from lemoncrow.infra.code_intel.store import CodeIntelStore
+from lemoncrow.infra.code_intel.store import CodeIntelStore, CodeIntelUnavailable
 
 WorkspaceFactory = Callable[..., Path]
 
@@ -398,11 +400,50 @@ def test_missing_intel_database_degrades_to_empty_not_an_error(
     assert result.match_kind == "name"
 
 
-def test_empty_index_degrades_to_empty(make_workspace: WorkspaceFactory) -> None:
-    root = make_workspace(index_version=2)
-    result = code_query(select="symbols", repo_root=root)
-    assert result.rows == ()
-    assert result.engine_index_version == 2
+def test_intel_select_without_intel_db_is_partial(make_workspace: WorkspaceFactory) -> None:
+    root = make_workspace(files=_FILES, symbols=_SYMBOLS, with_intel=False)
+    for select in ("callers", "callees", "references"):
+        payload = code_query(select=select, repo_root=root).to_dict()
+        assert payload["rows"] == []
+        assert payload["data_status"] == "unavailable"
+        assert "intel.sqlite is absent" in payload["reason"]
+        assert payload["objective"] == OBJECTIVE_PARTIAL, select
+    # The engine-backed select reads code_context.sqlite and keeps its claim.
+    assert code_query(select="symbols", repo_root=root).to_dict()["objective"] == OBJECTIVE_EXHAUSTIVE
+
+
+def test_intel_select_over_a_call_graph_never_built_is_partial(make_workspace: WorkspaceFactory) -> None:
+    """intel.sqlite exists with empty tables until the engine's call-graph pass runs."""
+    root = make_workspace(files=_FILES, symbols=_SYMBOLS)
+    payload = code_query(select="callers", repo_root=root).to_dict()
+    assert payload["data_status"] == "unavailable"
+    assert payload["objective"] == OBJECTIVE_PARTIAL
+
+
+def test_intel_select_that_matches_nothing_over_a_built_graph_stays_exhaustive(repo: Path) -> None:
+    """No rows is an answer when the edges were there to look up."""
+    payload = code_query(select="callers", where={"callee": "nothing_calls_this"}, repo_root=repo).to_dict()
+    assert payload["rows"] == []
+    assert payload["data_status"] == "available"
+    assert payload["objective"] == OBJECTIVE_EXHAUSTIVE
+
+
+def test_rebuilding_index_raises(repo: Path, tear_index: Callable[[Path], None]) -> None:
+    tear_index(repo)
+    with pytest.raises(IndexRebuilding):
+        code_query(select="symbols", repo_root=repo)
+
+
+def test_absent_index_raises_unavailable(tmp_path: Path, make_workspace: WorkspaceFactory) -> None:
+    """Never indexed, or emptied for a migration: neither has anything to enumerate."""
+    never_indexed = tmp_path / "never-indexed"
+    never_indexed.mkdir()
+    with pytest.raises(CodeIntelUnavailable):
+        code_query(select="symbols", repo_root=never_indexed)
+
+    emptied = make_workspace(index_version=2)
+    with pytest.raises(CodeIntelUnavailable, match=r"not been indexed.*being migrated"):
+        code_query(select="symbols", repo_root=emptied)
 
 
 def test_result_serializes_to_plain_json_types(repo: Path) -> None:

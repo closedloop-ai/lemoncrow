@@ -18,7 +18,11 @@ from __future__ import annotations
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
+
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_PARTIAL
 from lemoncrow.infra.code_intel.file_graph import open_file_graph
+from lemoncrow.infra.code_intel.store import CodeIntelUnavailable
 
 WorkspaceFactory = Callable[..., Path]
 
@@ -254,10 +258,24 @@ def test_paths_restrict_the_report_not_the_graph(make_workspace: WorkspaceFactor
     assert scoped["analyzed_files"] == full["analyzed_files"]
 
 
-def test_an_empty_index_analyses_cleanly(make_workspace: WorkspaceFactory) -> None:
+def test_an_empty_index_raises_rather_than_analysing_nothing(make_workspace: WorkspaceFactory) -> None:
     root = make_workspace()
+    with pytest.raises(CodeIntelUnavailable):
+        open_file_graph(root)
+
+
+def test_empty_imports_table_is_partial(make_workspace: WorkspaceFactory) -> None:
+    """Files indexed, import pass never ran: every kind would describe a graph with no edges."""
+    root = make_workspace(files=[{"file_path": path} for path in _FILES])
     with open_file_graph(root) as graph:
-        result = graph.dead_code()
-    assert result["dead_files"] == []
-    assert result["analyzed_files"] == 0
-    assert result["resolved_edges"] == 0
+        payloads = [
+            graph.blast_radius("src/base.py"),
+            graph.dead_code(),
+            graph.cycles(),
+            graph.coupling(),
+            graph.topology(),
+        ]
+    for payload in payloads:
+        assert payload["data_status"] == "unavailable"
+        assert "imports has no rows" in payload["reason"]
+        assert payload["objective"] == OBJECTIVE_PARTIAL

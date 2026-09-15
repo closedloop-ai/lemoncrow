@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from lemoncrow.infra.code_intel.coverage import STATES, CoverageReport, check_coverage
+from lemoncrow.infra.code_intel.freshness import IndexRebuilding
 
 WorkspaceFactory = Callable[..., Path]
 
@@ -131,7 +132,10 @@ def test_absolute_paths_are_normalised_to_repo_relative(workspace_root: Path, ma
 def test_git_ignored_files_are_excluded_not_missing(workspace_root: Path, make_workspace: WorkspaceFactory) -> None:
     _write(workspace_root, ".gitignore", "build/\n")
     _write(workspace_root, "build/generated.py", "def alpha():\n    return 1\n")
-    root = make_workspace()
+    # An index with no files is absent, and absent raises; index one real file so
+    # the verdict under test is the git-ignore rule, not the index's readiness.
+    indexed = _write(workspace_root, "src/a.py", "def beta():\n    return 2\n")
+    root = make_workspace(files=[indexed], symbols=[{"file_path": "src/a.py", "symbol_name": "beta"}])
     _git_init(root)
 
     report = check_coverage(paths=["build/generated.py"], repo_root=root)
@@ -159,3 +163,14 @@ def test_report_states_which_exclusion_rules_it_applied(make_workspace: Workspac
     report = check_coverage(paths=["src/a.py"], repo_root=root)
     assert report.exclusion_source == "git-ignore + unrecognised-file-type"
     assert report.repo_root == str(root)
+
+
+def test_rebuilding_index_raises(make_workspace: WorkspaceFactory, tear_index: Callable[[Path], None]) -> None:
+    """Verdicts judged against a torn index would call real, indexed files missing."""
+    root = make_workspace(
+        files=[{"file_path": "src/a.py"}],
+        symbols=[{"file_path": "src/a.py", "symbol_name": "alpha"}],
+    )
+    tear_index(root)
+    with pytest.raises(IndexRebuilding):
+        check_coverage(paths=["src/a.py"], repo_root=root)
