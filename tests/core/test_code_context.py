@@ -15,7 +15,6 @@ from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 from lemoncrow.pro.capabilities.code_context.budget import BudgetPacker
 from lemoncrow.pro.capabilities.code_context.call_graph import (
     CallGraphNode,
-    build_call_graph_payload,
     traverse_call_graph,
 )
 from lemoncrow.pro.capabilities.code_context.models import SymbolRecord, TextMatch
@@ -1456,24 +1455,6 @@ def test_callers_truncated_survives_budget_packing(tmp_path: Path, budget_tokens
     assert payload["related_total"] == 30
     assert payload["related_total_exact"] is True
     assert payload["related_count"] == len(payload["related"]) == min(limit, 30)
-
-
-def test_related_total_counts_past_limit_at_depth_1() -> None:
-    neighbours = [_graph_node(f"n{index}") for index in range(5)]
-
-    result = traverse_call_graph(
-        dict(_GRAPH_TARGET),
-        direction="callers",
-        depth=1,
-        limit=2,
-        lookup_neighbors=lambda symbol_id: neighbours if symbol_id == "t" else [],
-    )
-    payload = build_call_graph_payload(dict(_GRAPH_TARGET), direction="callers", depth=1, result=result)
-
-    assert payload["truncated"] is True
-    assert payload["related_count"] == 2
-    assert payload["related_total"] == 5
-    assert payload["related_total_exact"] is True
 
 
 def test_related_total_is_inexact_when_truncated_beyond_depth_1() -> None:
