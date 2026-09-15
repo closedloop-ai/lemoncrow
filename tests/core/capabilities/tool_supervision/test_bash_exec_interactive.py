@@ -49,7 +49,13 @@ def test_state_persists_across_sends() -> None:
         assert first["status"] == "running"
         assert first["sent"] is True
         second = bx.send_managed_input(sid, "print(x + 1)", wait=10.0)
-        assert "42" in str(second["stdout"])
+        output = str(second["stdout"])
+        if "42" not in output:
+            # A send returns once output goes quiet, so a slow interpreter (a loaded
+            # CI runner) can answer after it returns; the documented follow-up empty
+            # send waits for that output.
+            output += str(bx.send_managed_input(sid, "", wait=10.0)["stdout"])
+        assert "42" in output
     finally:
         _cancel(sid)
 
