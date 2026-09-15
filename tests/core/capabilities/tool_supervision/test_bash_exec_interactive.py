@@ -32,6 +32,19 @@ def _cancel(session_id: str) -> None:
         pass
 
 
+def _send_until(session_id: str, text: str, marker: str) -> str:
+    """Send *text*, draining once if *marker* is not back yet; returns the stdout.
+
+    A send returns once output goes quiet, so a slow interpreter (a loaded CI
+    runner, a cold `python3 -i`) can answer after it returns; the documented
+    follow-up empty send waits for that output.
+    """
+    output = str(bx.send_managed_input(session_id, text, wait=10.0)["stdout"])
+    if marker not in output:
+        output += str(bx.send_managed_input(session_id, "", wait=10.0)["stdout"])
+    return output
+
+
 def _poll_until_terminal(session_id: str, timeout_s: float = 10.0) -> dict[str, object]:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
@@ -48,14 +61,7 @@ def test_state_persists_across_sends() -> None:
         first = bx.send_managed_input(sid, "x = 41", wait=10.0)
         assert first["status"] == "running"
         assert first["sent"] is True
-        second = bx.send_managed_input(sid, "print(x + 1)", wait=10.0)
-        output = str(second["stdout"])
-        if "42" not in output:
-            # A send returns once output goes quiet, so a slow interpreter (a loaded
-            # CI runner) can answer after it returns; the documented follow-up empty
-            # send waits for that output.
-            output += str(bx.send_managed_input(sid, "", wait=10.0)["stdout"])
-        assert "42" in output
+        assert "42" in _send_until(sid, "print(x + 1)", "42")
     finally:
         _cancel(sid)
 
@@ -63,11 +69,11 @@ def test_state_persists_across_sends() -> None:
 def test_send_returns_only_the_delta() -> None:
     sid = _open_python_session()
     try:
-        first = bx.send_managed_input(sid, "print('first-marker')", wait=10.0)
-        assert "first-marker" in str(first["stdout"])
-        second = bx.send_managed_input(sid, "print('second-marker')", wait=10.0)
-        assert "second-marker" in str(second["stdout"])
-        assert "first-marker" not in str(second["stdout"])
+        first = _send_until(sid, "print('first-marker')", "first-marker")
+        assert "first-marker" in first
+        second = _send_until(sid, "print('second-marker')", "second-marker")
+        assert "second-marker" in second
+        assert "first-marker" not in second
     finally:
         _cancel(sid)
 
@@ -117,8 +123,7 @@ def test_send_input_is_policy_gated() -> None:
         assert result["blocked"] is True
         assert result["blocked_reason"]
         # The session itself is untouched and still usable.
-        follow_up = bx.send_managed_input(sid, "print('still-alive')", wait=10.0)
-        assert "still-alive" in str(follow_up["stdout"])
+        assert "still-alive" in _send_until(sid, "print('still-alive')", "still-alive")
     finally:
         _cancel(sid)
 
