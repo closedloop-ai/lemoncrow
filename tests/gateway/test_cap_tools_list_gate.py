@@ -121,9 +121,11 @@ def _stub_handler(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     monkeypatch.setitem(mcp_server.TOOLS, name, spec)
 
 
-@pytest.mark.parametrize("name", ["graph", "blame"])
+@pytest.mark.parametrize("name", ["blame", "graph", "grep", "orient", "search", "statusline_segment"])
 def test_broker_calls_tools_that_are_hidden_under_the_core_profile(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
-    """A tool hidden from tools/list must still be reachable through the broker.
+    """A read-only tool hidden from tools/list must still be reachable through the broker.
+
+    The parametrization is every allow-listed tool the core profile hides.
 
     The old guard refused a tool as "already exposed" whenever it sat in
     _CORE_MCP_TOOLS, even when HIDDEN_LLM_TOOLS meant nothing ever advertised
@@ -192,8 +194,11 @@ def test_advertised_relations_is_not_also_broker_reachable(monkeypatch: pytest.M
 def test_broker_search_returns_hidden_tools(monkeypatch: pytest.MonkeyPatch) -> None:
     """`search` used to filter to *visible* tools, so it could never match."""
     monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    from lemoncrow.gateway.adapters import mcp_server
+
     found = {match["name"] for match in _broker({"action": "search", "query": ""})["matches"]}
     assert found
+    assert found <= mcp_server._BROKER_READ_ONLY
     assert "blame" in {match["name"] for match in _broker({"action": "search", "query": "blame"})["matches"]}
 
 
@@ -216,13 +221,13 @@ def test_broker_runs_an_already_advertised_tool_and_points_at_the_direct_route(
     and the reviewer that hit this had to hand-drive raw JSON-RPC.
     """
     monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
-    assert "read" in {tool["name"] for tool in _list()}
-    _stub_handler(monkeypatch, "read")
+    assert "relations" in {tool["name"] for tool in _list()}
+    _stub_handler(monkeypatch, "relations")
 
-    result = _broker({"action": "call", "name": "read", "arguments": {"files": ["x.py"]}})
+    result = _broker({"action": "call", "name": "relations", "arguments": {"symbol": "merge"}})
 
-    assert result["called"] == "read"
-    assert result["args"] == {"files": ["x.py"]}
+    assert result["called"] == "relations"
+    assert result["args"] == {"symbol": "merge"}
     assert "reconnect" in result["broker_note"]
 
 
@@ -235,20 +240,126 @@ def test_broker_note_is_absent_when_the_tool_is_genuinely_hidden(monkeypatch: py
     assert "broker_note" not in _broker({"action": "call", "name": "blame", "arguments": {}})
 
 
-@pytest.mark.parametrize("name", sorted({"agent", "codemod", "mcp", "sql", "tool", "workflow"}))
-def test_broker_deny_list_holds(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
-    """Denied tools are refused by `call` AND absent from `search`.
+# --------------------------------------------------------------------------- #
+# PRD-739 FR4 -- the broker reaches read-only tools only                       #
+# --------------------------------------------------------------------------- #
 
-    search must never surface something call would then refuse.
+# Every registered tool the broker refuses (PLN-2027 PR 3). The broker reads only
+# its allow-list; these sets exist so that a new tool fails
+# test_every_registered_tool_is_classified until someone decides where it goes.
+# Each one executes commands, writes files or LemonCrow state (index, cache,
+# memory, session, review data), reaches the network, or calls other tools.
+_BROKER_DENIED = frozenset(
+    {
+        "agent",
+        "bash",
+        "cache",
+        "codemod",
+        "compact",
+        "edit",
+        "index",
+        "mcp",
+        "memory",
+        "rescue",
+        "review_evidence",
+        "review_feedback_addressed",
+        "review_rationale",
+        "sql",
+        "tool",
+        "trace",
+        "verify",
+        "web_fetch",
+        "workflow",
+    }
+)
+# Denied until shown read-only, and the code shows otherwise: `scan` runs the
+# ast-grep binary, `context` records the task on the session ledger.
+_BROKER_DENIED_UNTIL_SHOWN_READ_ONLY = frozenset({"context", "scan"})
+_GRAPH_KINDS_REFUSED = frozenset({"index_docs", "pr_risk", "recall_docs"})
+
+
+def test_every_registered_tool_is_classified() -> None:
+    """Each registered tool sits in exactly one class, so a new one fails here until classified."""
+    from lemoncrow.gateway.adapters import mcp_server
+    from lemoncrow.gateway.adapters.mcp.broker_policy import GRAPH_READ_ONLY_KINDS
+
+    classes = (mcp_server._BROKER_READ_ONLY, _BROKER_DENIED, _BROKER_DENIED_UNTIL_SHOWN_READ_ONLY)
+    registered = set(mcp_server.TOOLS) | {"tool"}  # `tool` is the broker itself, not a TOOLS key
+    assert sorted(name for name in registered if sum(name in cls for cls in classes) != 1) == []
+    assert set().union(*classes) == registered
+    # `graph` is allowed kind by kind, and every kind is classified too.
+    assert GRAPH_READ_ONLY_KINDS | _GRAPH_KINDS_REFUSED == mcp_server._GRAPH_KINDS
+    assert not GRAPH_READ_ONLY_KINDS & _GRAPH_KINDS_REFUSED
+
+
+@pytest.mark.parametrize("name", sorted(_BROKER_DENIED | _BROKER_DENIED_UNTIL_SHOWN_READ_ONLY))
+def test_broker_refuses_execution_write_and_network_tools(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
+    """Refused by `call` AND absent from `search`, advertised or not.
+
+    search must never surface something call would then refuse. The handler is
+    stubbed, so a broken guard shows up as a call that returned rather than as a
+    shell that ran.
     """
     from lemoncrow.gateway.adapters import mcp_server
 
     monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    if name in mcp_server.TOOLS:
+        _stub_handler(monkeypatch, name)
     with pytest.raises(mcp_server._ToolArgumentError, match="not reachable through the broker"):
         _broker({"action": "call", "name": name, "arguments": {}})
 
     found = {match["name"] for match in _broker({"action": "search", "query": name})["matches"]}
     assert name not in found
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"kind": "index_docs"},
+        {"kind": "recall_docs", "query": "design"},
+        {"kind": "pr_risk", "paths": ["a.py"]},
+        {"kind": "dead_code", "enable": True},
+    ],
+    ids=["index_docs", "recall_docs", "pr_risk", "enable"],
+)
+def test_broker_refuses_graph_write_kinds(monkeypatch: pytest.MonkeyPatch, arguments: dict) -> None:
+    """`graph` runs through the broker for the kinds that only read; the rest are refused by kind."""
+    from lemoncrow.gateway.adapters import mcp_server
+
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    _stub_handler(monkeypatch, "graph")
+    with pytest.raises(mcp_server._ToolArgumentError, match="not reachable through the broker"):
+        _broker({"action": "call", "name": "graph", "arguments": arguments})
+
+    # Per kind, not per tool: a read-only kind still runs.
+    assert _broker({"action": "call", "name": "graph", "arguments": {"kind": "dead_code"}})["called"] == "graph"
+
+
+def test_broker_refusal_names_read_only_alternatives(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Over JSON-RPC, a refusal is an argument error that says where to go instead; the session carries on."""
+    from lemoncrow.gateway.adapters import mcp_server
+
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    _stub_handler(monkeypatch, "bash")
+
+    def call_broker(request_id: int, arguments: dict) -> dict:
+        response = mcp_server._handle(
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "method": "tools/call",
+                "params": {"name": "tool", "arguments": arguments},
+            }
+        )
+        assert isinstance(response, dict)
+        return response
+
+    refused = call_broker(1, {"action": "call", "name": "bash", "arguments": {"command": "true"}})
+    assert "Read-only alternatives: read, code_search, relations, code_query." in refused["error"]["message"]
+
+    followup = call_broker(2, {"action": "search", "query": "blame"})
+    assert "error" not in followup
+    assert "blame" in str(followup["result"])
 
 
 def test_broker_rejects_an_unregistered_name(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -80,6 +80,8 @@ from lemoncrow.gateway.adapters.mcp.bash import (  # noqa: F401  (registers bash
 from lemoncrow.gateway.adapters.mcp.bash import (
     tool_bash as tool_bash,
 )
+from lemoncrow.gateway.adapters.mcp.broker_policy import BROKER_READ_ONLY as _BROKER_READ_ONLY
+from lemoncrow.gateway.adapters.mcp.broker_policy import broker_refusal as _broker_refusal
 from lemoncrow.gateway.adapters.mcp.deferral import (  # noqa: F401  (re-exported for back-compat)
     _defer_bash_enabled,
     _defer_web_fetch_enabled,
@@ -325,7 +327,7 @@ _CORE_MCP_TOOLS = frozenset(
     }
 )
 
-# Tools the shadowed ``core/environment.py`` hides that we advertise anyway.
+# Tools upstream's ``core/environment.py`` hides that the fork advertises anyway.
 #
 # `relations` is the only *enumerative* symbol tool. Hidden, an agent under the
 # core profile sees exactly one code-intel tool -- `code_search` -- which ranks;
@@ -337,8 +339,9 @@ _CORE_MCP_TOOLS = frozenset(
 # symbol, not a diff -- it would have to make the edit first and then ask what
 # broke, which is backwards.
 #
-# HIDDEN_LLM_TOOLS lives in a module that resolves from a compiled `.so` when an
-# engine is vendored, so the override belongs here, in live source.
+# Fork policy differs from upstream's HIDDEN_LLM_TOOLS. The override lives here,
+# in live source, rather than as an edit to core/environment.py, so upstream's
+# changes to that set do not conflict on every merge.
 _FORCE_VISIBLE_TOOLS: frozenset[str] = frozenset({"relations"})
 
 # --------------------------------------------------------------------------- #
@@ -10133,9 +10136,8 @@ def tool_statusline_segment(format: str = "segment") -> str:
     - ``format="json"``: the raw savings report payload, JSON-encoded.
 
     Hidden from tools/list (see HIDDEN_LLM_TOOLS) but reachable by exact name
-    through the `tool` broker (anything not currently advertised is, unless it
-    is in _BROKER_DENIED), which is how the lemoncrow skill answers "what are
-    my savings?" without a shell.
+    through the `tool` broker (it is on the broker's read-only allow-list), which
+    is how the lemoncrow skill answers "what are my savings?" without a shell.
     """
     fmt = (format or "segment").strip().lower()
     if fmt in {"markdown", "md", "json"}:
@@ -11374,28 +11376,26 @@ _TOOL_BROKER_DESCRIPTION = (
     "search for those. Use search once for a rare capability, then call its exact name."
 )
 
-# Tools the broker must never reach, whatever the advertised surface says.
-# `tool` itself would recurse; the other four spawn subagents, proxy arbitrary
-# external servers, run arbitrary SQL, or rewrite the tree en masse -- reaching
-# any of those through a generic escape hatch is not a fallback, it is a
-# footgun. Everything else that is merely unadvertised is fair game: the broker
-# exists precisely so a hidden tool is still reachable by exact name.
-_BROKER_DENIED = frozenset({"agent", "codemod", "mcp", "sql", "tool", "workflow"})
+# The broker reaches read-only tools only (PRD-739 FR4). Agents that hold it read
+# diffs written by PR authors, so a shell, a writer, an outbound fetch or another
+# agent must not be one call away. _BROKER_READ_ONLY and the per-call refusal
+# (graph is allowed kind by kind) live in the fork-only broker_policy module.
 
 
 def _broker_reachable(tool_name: str, spec: dict[str, Any]) -> bool:
     """True when the broker may search for, and call, *tool_name*.
 
-    The guard is "is it advertised right now", not "is it in the core profile".
-    The two are not the same question, and conflating them is what limited this
-    broker to a single reachable tool: `relations` and `grep` are in both
-    ``_CORE_MCP_TOOLS`` and ``HIDDEN_LLM_TOOLS``, so the old code refused them
-    as "already exposed" while nothing ever advertised them.
+    Only allow-listed (read-only) tools qualify. Among those, the guard is "is it
+    advertised right now", not "is it in the core profile". The two are not the
+    same question, and conflating them is what limited this broker to a single
+    reachable tool: `relations` and `grep` are in both ``_CORE_MCP_TOOLS`` and
+    ``HIDDEN_LLM_TOOLS``, so the old code refused them as "already exposed"
+    while nothing ever advertised them.
 
     search and call share this predicate on purpose -- search must never return
     a tool that call would then refuse.
     """
-    if tool_name in _BROKER_DENIED:
+    if tool_name not in _BROKER_READ_ONLY:
         return False
     return not _tool_advertised_now(tool_name, spec)
 
@@ -11427,16 +11427,18 @@ def _tool_broker_handler(args: dict[str, Any]) -> dict[str, Any] | Any:
         target = str(args.get("name") or "").strip()
         if not target:
             raise _ToolArgumentError("tool call requires an exact name")
-        # Deny first: the answer must not depend on whether the name happens to
-        # be registered. `tool` itself is not in TOOLS at all.
-        if target in _BROKER_DENIED:
-            raise _ToolArgumentError(f"{target!r} is not reachable through the broker")
-        call_spec = TOOLS.get(target)
-        if call_spec is None:
+        # An unregistered name is a typo. A registered name off the read-only
+        # allow-list -- or `tool` itself, which is not in TOOLS -- is refused
+        # before anything runs, with read-only alternatives in the message.
+        if target not in TOOLS and target != "tool":
             raise _ToolArgumentError(f"unknown tool: {target}")
         arguments = args.get("arguments") or {}
         if not isinstance(arguments, dict):
             raise _ToolArgumentError("tool arguments must be an object")
+        refusal = _broker_refusal(target, arguments)
+        if refusal is not None:
+            raise _ToolArgumentError(refusal)
+        call_spec = TOOLS[target]
         handler = cast(Callable[[dict[str, Any]], Any], call_spec["handler"])
         result = handler(arguments)
         # An advertised tool used to be refused here as "call it directly" --
