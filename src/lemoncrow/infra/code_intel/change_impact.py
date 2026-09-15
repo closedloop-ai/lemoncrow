@@ -75,7 +75,7 @@ _TEST_FILE_SUFFIXES = ("_test.py", "_test.go", ".test.ts", ".test.tsx", ".test.j
 
 
 class GitUnavailable(RuntimeError):
-    """*repo_root* is not a git worktree, or git could not be run there."""
+    """*repo_root* is not a git worktree, git could not be run there, or the ref is unusable."""
 
 
 @dataclass(frozen=True)
@@ -258,7 +258,7 @@ def _diff_ref(repo_root: Path, base_ref: str) -> str:
     independently. Falls back to *base_ref* itself when there is no common
     ancestor (unrelated histories, or a ref that is not a commit).
     """
-    merge_base = _git(repo_root, "merge-base", base_ref, "HEAD")
+    merge_base = _git(repo_root, "merge-base", "--end-of-options", base_ref, "HEAD")
     if merge_base.returncode == 0 and merge_base.stdout.strip():
         return merge_base.stdout.strip()
     return base_ref
@@ -331,13 +331,21 @@ def parse_diff(diff_text: str) -> list[FileChange]:
 def collect_changes(
     repo_root: Path, base_ref: str = "HEAD", paths: list[str] | None = None
 ) -> tuple[str, list[FileChange]]:
-    """Run the diff and parse it. Returns ``(diff_ref, changes)``."""
+    """Run the diff and parse it. Returns ``(diff_ref, changes)``.
+
+    *base_ref* is caller-supplied, so one that starts with ``-`` is refused
+    before git sees it: git would parse it as an option (``--output=<file>``
+    makes ``git diff`` write anywhere). ``--end-of-options`` backs that up on
+    every git call that takes the ref.
+    """
+    if base_ref.startswith("-"):
+        raise GitUnavailable(f"base_ref {base_ref!r} is not a ref: it starts with '-'")
     if not (repo_root / ".git").exists():
         probe = _git(repo_root, "rev-parse", "--git-dir")
         if probe.returncode != 0:
             raise GitUnavailable(f"{repo_root} is not a git worktree")
     diff_ref = _diff_ref(repo_root, base_ref)
-    args = ["diff", "--unified=0", "--no-color", "--find-renames", diff_ref]
+    args = ["diff", "--unified=0", "--no-color", "--find-renames", "--end-of-options", diff_ref]
     if paths:
         args.extend(["--", *paths])
     result = _git(repo_root, *args)
