@@ -691,6 +691,11 @@ _CALL_GRAPH_ESSENTIAL_KEYS = [
     "direction",
     "related",
     "related_count",
+    # A consumer decides whether the list is whole from these, so trimming a
+    # large response must never drop them.
+    "truncated",
+    "related_total",
+    "related_total_exact",
     "data_status",
     "provenance",
 ]
@@ -698,7 +703,6 @@ _CALL_GRAPH_OPTIONAL_KEYS = [
     "depth",
     "related",
     "related_count",
-    "truncated",
     "edges",
     "edge_count",
     "data_status",
@@ -706,6 +710,9 @@ _CALL_GRAPH_OPTIONAL_KEYS = [
     "message",
     "snapshot",
 ]
+# Row ceiling of one symbol's caller lookup (`_find_callers_local`). A lookup that
+# returns this many rows may have stopped early, so traversal treats it as cut.
+_CALLER_LOOKUP_ROW_CAP = 1000
 _BLAME_ESSENTIAL_KEYS = [
     "symbol_name",
     "file_path",
@@ -7325,7 +7332,9 @@ class CodeContextEngine:
 
         placeholders = ",".join("?" for _ in names)
         target_rows: dict[str, list[sqlite3.Row]] = {name: [] for name in names}
-        caller_rows: dict[str, list[sqlite3.Row]] = {name: [] for name in names}
+        # Kept rows are keyed by caller symbol id; ``related_ids`` counts every caller, kept or not.
+        caller_rows: dict[str, dict[str, sqlite3.Row]] = {name: {} for name in names}
+        related_ids: dict[str, set[str]] = {name: set() for name in names}
         with self._connect() as conn:
             self._init_schema(conn)
             rows = conn.execute(
@@ -7366,11 +7375,24 @@ class CodeContextEngine:
                 """,
                 (self.repo_id, *names),
             ).fetchall()
-            # Keep one extra unique row per name to preserve truncation metadata.
+            # The edge query has no LIMIT, so every caller is counted before the limit.
+            # Keep one extra unique caller per name to preserve truncation metadata.
             for row in edge_rows:
                 name = str(row["callee_short_name"])
-                if name in caller_rows and len(caller_rows[name]) <= bounded_limit:
-                    caller_rows[name].append(row)
+                if name not in caller_rows:
+                    continue
+                hydrated_id = row["hydrated_symbol_id"]
+                if hydrated_id is not None:
+                    caller_id = str(hydrated_id)
+                else:
+                    cf = str(row["caller_file_path"])
+                    cs = int(row["caller_start_line"])
+                    cq = str(row["caller_qualified_name"])
+                    caller_id = "local-call::" + hashlib.sha1(f"{cf}:{cs}:{cq}".encode()).hexdigest()[:16]
+                related_ids[name].add(caller_id)
+                kept = caller_rows[name]
+                if caller_id not in kept and len(kept) <= bounded_limit:
+                    kept[caller_id] = row
 
         payloads: dict[str, dict[str, Any]] = {}
         for name in names:
@@ -7382,15 +7404,14 @@ class CodeContextEngine:
                 symbol = _row_to_symbol(dict(row))
                 targets.append({**symbol.model_dump(mode="json"), "provenance": _LOCAL_PROVENANCE})
             nodes_by_id: dict[str, CallGraphNode] = {}
-            for row in caller_rows.get(name, ()):
+            for caller_id, row in caller_rows[name].items():
                 cf = str(row["caller_file_path"])
                 cs = int(row["caller_start_line"])
                 cn = str(row["caller_symbol_name"])
                 cq = str(row["caller_qualified_name"])
-                hydrated_id = row["hydrated_symbol_id"]
-                if hydrated_id is not None:
+                if row["hydrated_symbol_id"] is not None:
                     node = CallGraphNode(
-                        symbol_id=str(hydrated_id),
+                        symbol_id=caller_id,
                         symbol_name=cn,
                         qualified_name=str(row["hydrated_qualified_name"] or cq),
                         file_path=cf,
@@ -7400,9 +7421,8 @@ class CodeContextEngine:
                         provenance="local_index",
                     )
                 else:
-                    synthetic_id = "local-call::" + hashlib.sha1(f"{cf}:{cs}:{cq}".encode()).hexdigest()[:16]
                     node = CallGraphNode(
-                        symbol_id=synthetic_id,
+                        symbol_id=caller_id,
                         symbol_name=cn,
                         qualified_name=cq,
                         file_path=cf,
@@ -7411,7 +7431,7 @@ class CodeContextEngine:
                         end_line=int(row["caller_end_line"]),
                         provenance="local_index",
                     )
-                nodes_by_id.setdefault(node.symbol_id, node)
+                nodes_by_id[caller_id] = node
 
             all_nodes = sorted(nodes_by_id.values(), key=lambda item: (item.file_path, item.start_line, item.symbol_id))
             truncated = len(all_nodes) > bounded_limit
@@ -7426,6 +7446,9 @@ class CodeContextEngine:
             traversal = CallGraphTraversalResult(
                 nodes=nodes,
                 edges=edges,
+                # Every call edge for the name was read, so the pre-limit count is exact.
+                related_symbol_ids=sorted(related_ids[name]),
+                related_total_exact=True,
                 truncated=truncated,
                 data_status="available" if edges else "empty",
                 message=None if edges else "no related call edges were found",
@@ -10599,6 +10622,7 @@ class CodeContextEngine:
                 limit=limit,
                 snapshot=snapshot,
                 lookup_neighbors=lambda current_symbol_id: lookup(symbol_id=current_symbol_id),
+                neighbor_cap=_CALLER_LOOKUP_ROW_CAP if direction == "callers" else None,
             )
             if traversal.data_status == "unavailable" and direction == "callers":
                 fallback = self._fallback_callers_from_references(
@@ -10614,10 +10638,16 @@ class CodeContextEngine:
             nodes_by_identity: dict[tuple[str, str, int, int, str], CallGraphNode] = {}
             edges_by_key: dict[tuple[str, str, int], CallGraphEdge] = {}
             merged_truncated = False
+            # The edge store is name-keyed, so same-named targets share callers:
+            # union the totals by symbol id, never sum them.
+            related_ids: set[str] = set()
+            merged_exact = True
             status_rank = {"unavailable": 0, "empty": 1, "available": 2}
             merged_status = "unavailable"
             for current in traversals:
                 merged_truncated = merged_truncated or current.truncated
+                related_ids.update(current.related_symbol_ids)
+                merged_exact = merged_exact and current.related_total_exact
                 if status_rank[current.data_status] > status_rank[merged_status]:
                     merged_status = current.data_status
                 for node in current.nodes:
@@ -10660,6 +10690,8 @@ class CodeContextEngine:
             traversal = CallGraphTraversalResult(
                 nodes=merged_nodes,
                 edges=merged_edges,
+                related_symbol_ids=sorted(related_ids),
+                related_total_exact=merged_exact,
                 truncated=merged_truncated,
                 data_status=cast(Any, merged_status),
                 message=merged_message,
@@ -10684,6 +10716,7 @@ class CodeContextEngine:
             edges_before = len(cast(list[dict[str, Any]], payload.get("edges", [])))
             payload["related"] = cast(list[dict[str, Any]], payload.get("related", []))[:max_related]
             payload["edges"] = cast(list[dict[str, Any]], payload.get("edges", []))[:max_related]
+            # Only the returned rows are recounted; related_total stays the pre-limit count.
             payload["related_count"] = len(cast(list[dict[str, Any]], payload.get("related", [])))
             payload["edge_count"] = len(cast(list[dict[str, Any]], payload.get("edges", [])))
             payload["truncated"] = (
@@ -12837,9 +12870,9 @@ class CodeContextEngine:
                 FROM call_edges
                 WHERE repo_id = ? AND callee_short_name = ?
                 ORDER BY caller_file_path, caller_start_line
-                LIMIT 1000
+                LIMIT ?
                 """,
-                (self.repo_id, target_name),
+                (self.repo_id, target_name, _CALLER_LOOKUP_ROW_CAP),
             ).fetchall()
         if not rows:
             return []
@@ -13060,6 +13093,7 @@ class CodeContextEngine:
         nodes_by_id: dict[str, CallGraphNode] = {}
         edges: list[CallGraphEdge] = []
         seen_edges: set[tuple[str, str, int]] = set()
+        related_ids: set[str] = set()
         truncated = False
         for reference in references:
             if reference.file_path == target_file and target_start <= reference.line <= target_end:
@@ -13067,6 +13101,7 @@ class CodeContextEngine:
             node = self._caller_node_from_reference(reference, target_symbol_id=target_symbol_id)
             if node is None:
                 continue
+            related_ids.add(node.symbol_id)
             if node.symbol_id not in nodes_by_id:
                 if len(nodes_by_id) >= limit:
                     truncated = True
@@ -13088,6 +13123,8 @@ class CodeContextEngine:
             return CallGraphTraversalResult(
                 nodes=[],
                 edges=[],
+                related_symbol_ids=[],
+                related_total_exact=False,
                 truncated=False,
                 data_status="unavailable",
                 message="routed call edge data is unavailable",
@@ -13096,6 +13133,10 @@ class CodeContextEngine:
         return CallGraphTraversalResult(
             nodes=ordered_nodes,
             edges=ordered_edges,
+            related_symbol_ids=sorted(related_ids),
+            # References come through a row-capped lookup whose saturation is not
+            # visible here, so this count is never claimed exact.
+            related_total_exact=False,
             truncated=truncated,
             data_status="available",
             message="fallback caller graph derived from symbol references",

@@ -13,6 +13,10 @@ import pytest
 from lemoncrow.infra.code_intel.astgrep import PatternMatch, PatternSearchResult
 from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 from lemoncrow.pro.capabilities.code_context.budget import BudgetPacker
+from lemoncrow.pro.capabilities.code_context.call_graph import (
+    CallGraphNode,
+    traverse_call_graph,
+)
 from lemoncrow.pro.capabilities.code_context.models import SymbolRecord, TextMatch
 from lemoncrow.pro.capabilities.code_context.output_policy import TRUNCATION_MARKER
 from lemoncrow.pro.code_intel.cross_lang.runner import CrossLangRunner
@@ -1408,6 +1412,129 @@ def test_tool_callers_batch_matches_scalar_ambiguity_and_related_sites(tmp_path:
         (item["name"], item["path"], item["line"]) for item in scalar["related"]
     }
     assert batch["target"]["path"] == scalar["target"]["path"]
+
+
+def _write_fan_in_repo(root: Path, *, callers: int) -> None:
+    """``target`` in its own module, called once from each of *callers* modules."""
+    (root / "src").mkdir()
+    (root / "src" / "target.py").write_text("def target() -> int:\n    return 1\n", encoding="utf-8")
+    for index in range(callers):
+        (root / "src" / f"caller_{index}.py").write_text(
+            f"from src.target import target\n\n\ndef caller_{index}() -> int:\n    return target()\n",
+            encoding="utf-8",
+        )
+
+
+def _graph_node(symbol_id: str) -> CallGraphNode:
+    return CallGraphNode(
+        symbol_id=symbol_id,
+        symbol_name=symbol_id,
+        qualified_name=symbol_id,
+        file_path=f"{symbol_id}.py",
+        kind="function",
+        start_line=1,
+        end_line=2,
+    )
+
+
+_GRAPH_TARGET = {"symbol_id": "t", "symbol_name": "t", "qualified_name": "t", "file_path": "t.py"}
+
+
+@pytest.mark.parametrize("budget_tokens", [60, 4000], ids=["tiny-budget", "default-budget"])
+@pytest.mark.parametrize(("limit", "cut"), [(5, True), (100, False)], ids=["cut-by-limit", "whole"])
+def test_callers_truncated_survives_budget_packing(tmp_path: Path, budget_tokens: int, limit: int, cut: bool) -> None:
+    _write_fan_in_repo(tmp_path, callers=30)
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite")
+    engine.index_repo()
+
+    payload = engine.tool_callers(symbol_name="target", limit=limit, budget_tokens=budget_tokens, auto_index=False)
+
+    # The packer trimmed this response: `depth` is the first optional key it drops.
+    assert "depth" not in payload
+    assert payload["truncated"] is cut
+    assert payload["related_total"] == 30
+    assert payload["related_total_exact"] is True
+    assert payload["related_count"] == len(payload["related"]) == min(limit, 30)
+
+
+def test_related_total_is_inexact_when_truncated_beyond_depth_1() -> None:
+    # t <- a, b;  a <- c;  b <- e.  Four symbols reach t within two hops.
+    graph = {"t": [_graph_node("a"), _graph_node("b")], "a": [_graph_node("c")], "b": [_graph_node("e")]}
+
+    def lookup(symbol_id: str) -> list[CallGraphNode]:
+        return graph.get(symbol_id, [])
+
+    whole = traverse_call_graph(dict(_GRAPH_TARGET), direction="callers", depth=2, limit=10, lookup_neighbors=lookup)
+    # limit=1 keeps `a`; `b` is counted but never expanded, so `e` is never seen.
+    cut = traverse_call_graph(dict(_GRAPH_TARGET), direction="callers", depth=2, limit=1, lookup_neighbors=lookup)
+
+    assert (whole.truncated, whole.related_total, whole.related_total_exact) == (False, 4, True)
+    assert (cut.truncated, cut.related_total, cut.related_total_exact) == (True, 3, False)
+
+
+@pytest.mark.parametrize("callers", [2, 3], ids=["below-ceiling", "at-ceiling"])
+def test_callers_lookup_row_ceiling_reads_as_cut(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, callers: int) -> None:
+    """A caller lookup that fills its own row ceiling may have stopped early."""
+    from lemoncrow.pro.capabilities.code_context import engine as engine_module
+
+    monkeypatch.setattr(engine_module, "_CALLER_LOOKUP_ROW_CAP", 3)
+    _write_fan_in_repo(tmp_path, callers=callers)
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite")
+    engine.index_repo()
+
+    payload = engine.tool_callers(symbol_name="target", limit=100, auto_index=False)
+
+    at_ceiling = callers == 3
+    assert payload["related_count"] == callers
+    assert payload["truncated"] is at_ceiling
+    assert payload["related_total_exact"] is not at_ceiling
+
+
+def test_related_total_unions_same_named_targets_instead_of_summing(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    for name in ("a", "b"):
+        (tmp_path / "src" / f"{name}.py").write_text(
+            f"def helper() -> int:\n    return 1\n\ndef run_{name}() -> int:\n    return helper()\n",
+            encoding="utf-8",
+        )
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite")
+    engine.index_repo()
+
+    payload = engine.tool_callers(symbol_name="helper", limit=1, auto_index=False)
+
+    # The edge store is name-keyed, so both helpers report run_a and run_b as
+    # callers. Two distinct callers exist; a per-target sum would say four.
+    assert payload["ambiguity"]["merged_target_count"] == 2
+    assert payload["truncated"] is True
+    assert payload["related_total"] == 2
+    assert payload["related_total_exact"] is True
+
+
+def test_tool_callers_batch_reports_the_pre_limit_total(tmp_path: Path) -> None:
+    _write_fan_in_repo(tmp_path, callers=5)
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite")
+    engine.index_repo()
+
+    whole = engine.tool_callers_batch(["target"], limit=20, auto_index=False)["target"]
+    at_limit = engine.tool_callers_batch(["target"], limit=5, auto_index=False)["target"]
+    cut = engine.tool_callers_batch(["target"], limit=2, auto_index=False)["target"]
+
+    assert (whole["related_total"], whole["related_total_exact"], whole["truncated"]) == (5, True, False)
+    assert (at_limit["related_count"], at_limit["truncated"], at_limit["related_total"]) == (5, False, 5)
+    # Every edge row is read before the limit, so a cut list still reports the whole count.
+    assert (cut["related_count"], cut["truncated"]) == (2, True)
+    assert (cut["related_total"], cut["related_total_exact"]) == (5, True)
+
+
+def test_usages_truncated_survives_budget_packing(tmp_path: Path) -> None:
+    _write_fan_in_repo(tmp_path, callers=30)
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite")
+    engine.index_repo()
+
+    payload = engine.tool_usages(symbol_name="target", limit=5, budget_tokens=60, auto_index=False)
+
+    assert payload["reference_count"] <= 5
+    assert payload["truncated"] is True
 
 
 def test_tool_callees_resolves_indexed_targets_for_ambiguous_callee_name(tmp_path: Path) -> None:

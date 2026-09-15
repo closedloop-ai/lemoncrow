@@ -43,16 +43,28 @@ def traverse_call_graph(
     limit: int,
     lookup_neighbors: Callable[[str], list[CallGraphNode] | None],
     snapshot: bool = False,
+    neighbor_cap: int | None = None,
 ) -> CallGraphTraversalResult:
-    """Traverse routed callers/callees with cycle-safe breadth-first expansion."""
+    """Traverse routed callers/callees with cycle-safe breadth-first expansion.
+
+    Symbols past *limit* are still counted, though never kept or expanded, so the
+    result's ``related_total`` is taken before the limit. At depth 1 every
+    neighbour of the target is seen and the count is exact; past depth 1 a cut
+    walk never expands what it dropped, so the count is a lower bound.
+
+    *neighbor_cap* is the lookup's own row ceiling. A lookup that returns that
+    many rows may have stopped early, so its neighbour set is treated as cut.
+    """
 
     target_symbol_id = str(target["symbol_id"])
     queue: deque[tuple[str, int]] = deque([(target_symbol_id, 1)])
     visited: set[str] = {target_symbol_id}
     nodes_by_id: dict[str, CallGraphNode] = {}
+    related_ids: set[str] = set()
     edge_keys: set[tuple[str, str, int]] = set()
     edges: list[CallGraphEdge] = []
     truncated = False
+    lookup_capped = False
 
     while queue:
         current_symbol_id, current_depth = queue.popleft()
@@ -61,11 +73,17 @@ def traverse_call_graph(
             return CallGraphTraversalResult(
                 nodes=[],
                 edges=[],
+                # Nothing could be looked up, so zero is not a count.
+                related_symbol_ids=[],
+                related_total_exact=False,
                 truncated=False,
                 data_status="unavailable",
                 message="routed call edge data is unavailable",
                 snapshot=None,
             )
+        if neighbor_cap is not None and len(neighbors) >= neighbor_cap:
+            lookup_capped = True
+            truncated = True
         for neighbor in neighbors:
             if direction == "callers":
                 edge_key = (neighbor.symbol_id, current_symbol_id, current_depth)
@@ -86,6 +104,7 @@ def traverse_call_graph(
                 edges.append(edge)
             if neighbor.symbol_id == target_symbol_id:
                 continue
+            related_ids.add(neighbor.symbol_id)
             if neighbor.symbol_id not in nodes_by_id:
                 if len(nodes_by_id) >= limit:
                     truncated = True
@@ -112,6 +131,8 @@ def traverse_call_graph(
     return CallGraphTraversalResult(
         nodes=ordered_nodes,
         edges=ordered_edges,
+        related_symbol_ids=sorted(related_ids),
+        related_total_exact=not lookup_capped and (depth <= 1 or not truncated),
         truncated=truncated,
         data_status=data_status,
         message=None if ordered_edges else "no related call edges were found",
@@ -126,7 +147,12 @@ def build_call_graph_payload(
     depth: int,
     result: CallGraphTraversalResult,
 ) -> dict[str, Any]:
-    """Shape the public callers/callees response payload."""
+    """Shape the public callers/callees response payload.
+
+    ``related_count`` is the rows returned. ``related_total`` is the distinct
+    related symbols found before ``limit``; ``related_total_exact`` says whether
+    that count is exact or a lower bound.
+    """
 
     return {
         "target": summarize_symbol(target),
@@ -135,6 +161,8 @@ def build_call_graph_payload(
         "related": [item.model_dump(mode="json") for item in result.nodes],
         "edges": [item.model_dump(mode="json") for item in result.edges],
         "related_count": len(result.nodes),
+        "related_total": result.related_total,
+        "related_total_exact": result.related_total_exact,
         "edge_count": len(result.edges),
         "truncated": result.truncated,
         "data_status": result.data_status,

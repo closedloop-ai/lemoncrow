@@ -182,16 +182,35 @@ class CallGraphEdge(BaseModel):
 
 
 class CallGraphTraversalResult(BaseModel):
-    """Traversal output plus cheap snapshot metadata."""
+    """Traversal output plus cheap snapshot metadata.
+
+    ``nodes`` is what survived ``limit``. ``related_symbol_ids`` is every distinct
+    related symbol the traversal saw, kept or not, so :attr:`related_total` is
+    counted before the limit, and a multi-target merge can union it without
+    double-counting a caller that same-named targets share. The ids are excluded
+    from serialization: consumers read the count.
+
+    ``related_total_exact`` is false when that count is only a lower bound: a
+    ``depth`` > 1 walk was cut (symbols past the cap were never expanded), a
+    neighbour lookup stopped at its own row ceiling, or there was no edge data to
+    count.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     nodes: list[CallGraphNode]
     edges: list[CallGraphEdge]
+    related_symbol_ids: list[str] = Field(exclude=True)
+    related_total_exact: bool
     truncated: bool = False
     data_status: CallGraphDataStatus = "available"
     message: str | None = None
     snapshot: dict[str, Any] | None = None
+
+    @property
+    def related_total(self) -> int:
+        """Distinct related symbols found before ``limit`` was applied."""
+        return len(self.related_symbol_ids)
 
 
 # --------------------------------------------------------------------------- #

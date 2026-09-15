@@ -10995,6 +10995,13 @@ def tool_relations(
     (default usages); `depth` extends callers/callees transitively. The COUNTS for
     these already ride along on `grep` definition matches — use this only to expand
     a count into the concrete list.
+
+    callers/callees: `related_count` is the rows returned; `related_total` is the
+    distinct related symbols found before `limit`, a lower bound when
+    `related_total_exact` is false. Rows are enclosing-symbol spans (the calling or
+    called definition), not call sites.
+    usages: `reference_count` is the rows returned.
+    `truncated` (and, for callers/callees, both totals) survives response trimming.
     """
     target = _parse_symbol(symbol)
     rel = kind.strip().lower()
