@@ -402,9 +402,36 @@ def test_read_identical_content_different_files_not_cross_deduped(workspace: Pat
 def test_bash_multi_id_poll_returns_block_per_id(workspace: Path) -> None:
     import re
 
-    start = _text(_call("bash", {"command": ["echo P1", "echo P2"], "bg": True}))
+    # Keep both running past the first poll: a command that has already exited is
+    # reported inline instead of as an id (see the next test).
+    start = _text(
+        _call(
+            "bash",
+            {
+                "command": [
+                    "echo P1; python3 -c 'import time; time.sleep(1)'",
+                    "echo P2; python3 -c 'import time; time.sleep(1)'",
+                ],
+                "bg": True,
+            },
+        )
+    )
     ids = re.findall(r"\d+: id=(\w+)", start)
     assert len(ids) == 2
     out = _text(_call("bash", {"id": ids}))
     assert f"## lc:id={ids[0]}" in out and f"## lc:id={ids[1]}" in out
     assert "P1" in out and "P2" in out
+
+
+def test_bash_bg_batch_shows_output_of_a_command_that_exited_before_first_poll(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lemoncrow.gateway.adapters.mcp import bash as bash_adapter
+
+    # What _run_bash_tool hands back for a bg command reaped inline: no session_id.
+    finished = {"stdout": "P1", "stderr": "", "exit_code": 0, "truncated": False, "lines_omitted": 0}
+    monkeypatch.setattr(bash_adapter, "_run_bash_tool", lambda *_args, **_kwargs: dict(finished))
+    out = _text(_call("bash", {"command": ["echo P1", "echo P1"], "bg": True}))
+    assert "id=?" not in out
+    assert out.count("done exit=0") == 2
+    assert "P1" in out

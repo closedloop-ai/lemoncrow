@@ -1212,8 +1212,21 @@ def tool_bash(
                 input_text=None,
                 idle_ttl=idle_ttl,
             )
-            sid = str(res.get("session_id") or "?") if isinstance(res, dict) else "?"
-            lines.append(f"{i}: id={sid} running")
+            if not isinstance(res, dict):
+                lines.append(f"{i}: id=? running")
+                continue
+            sid = str(res.get("session_id") or "")
+            if sid:
+                lines.append(f"{i}: id={sid} running")
+            elif res.get("blocked"):
+                lines.append(f"{i}: blocked: {res.get('blocked_reason') or res.get('stderr') or ''}")
+            else:
+                # Exited before the first poll (an `echo` on a fast host), so it was
+                # reaped inline: no session is left to poll, and this is the only
+                # place its output will ever appear.
+                done = [f"{i}: done exit={res.get('exit_code')}"]
+                done += [s for s in (str(res.get("stdout") or "").rstrip(), str(res.get("stderr") or "").rstrip()) if s]
+                lines.append("\n".join(done))
         return "\n".join(lines) + "\nbash(id=[...]) waits for all; action='status' peeks; action='kill' stops"
     if commands and not command and action == "run" and not bg and not interactive and not id:
         # Batch: run every command sequentially in its own subshell (matching
