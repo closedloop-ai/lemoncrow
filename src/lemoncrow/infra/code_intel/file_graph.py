@@ -142,18 +142,7 @@ class FileGraph:
         self.repo_root: Path = repo_root
         self._store: CodeIntelStore = store
         self._snapshot: IndexSnapshot = store.snapshot()
-        # `imports` comes from the engine's import pass. Indexed files with no
-        # import row at all means that pass produced nothing, and every answer
-        # below would read "nothing imports anything". Fail-safe like the
-        # call-graph check: a repository whose files genuinely import nothing
-        # (docs, config) reads as partial too, which costs a grep rather than a
-        # false "no importers".
-        self._import_gap: str | None = (
-            f"imports has no rows for the {self._snapshot.files} indexed files: the import pass has "
-            "not produced a graph, so no dependency was examined"
-            if self._snapshot.files > 0 and self._snapshot.imports == 0
-            else None
-        )
+        self._import_gap: str | None = store.import_gap()
         self._files: dict[str, str] = {row.file_path: row.language for row in store.files()}
         self._edges: _Edges = self._build_edges()
         self._import_languages: frozenset[str] = frozenset(

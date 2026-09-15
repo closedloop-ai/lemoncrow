@@ -609,3 +609,33 @@ class CodeIntelStore:
             f"{INTEL_DB} holds no call edges or references for the indexed symbols: "
             "the call-graph pass has not run, or found no calls"
         )
+
+    def import_gap(self) -> str | None:
+        """Why the import graph cannot answer a dependency lookup, or ``None`` when it can.
+
+        ``imports`` comes from the engine's import pass. Indexed files with no
+        import row at all means that pass produced nothing, and every answer
+        built on it would read "nothing imports anything".
+
+        Fail-safe like :meth:`call_graph_gap`: a repository whose files genuinely
+        import nothing (docs, config) reads as missing data too, which costs a
+        grep rather than a false "no importers". The ``imports`` probe is an
+        ``EXISTS`` check, so an index with import rows pays one seek; files are
+        counted only when there is a gap to report.
+        """
+        repo_id = self.repo_id_or_none()
+        if repo_id is None:
+            return None
+        has_imports = self.code.execute(
+            "SELECT EXISTS(SELECT 1 FROM imports WHERE repo_id = ?)",
+            (repo_id,),
+        ).fetchone()[0]
+        if has_imports:
+            return None
+        files = int(self.code.execute("SELECT COUNT(*) FROM files WHERE repo_id = ?", (repo_id,)).fetchone()[0])
+        if files == 0:
+            return None
+        return (
+            f"imports has no rows for the {files} indexed files: the import pass has "
+            "not produced a graph, so no dependency was examined"
+        )
