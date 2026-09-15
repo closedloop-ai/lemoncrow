@@ -208,9 +208,12 @@ def test_match_line_numbers_hard_bounds_catastrophic_single_line() -> None:
     )
     elapsed = time.monotonic() - start
 
-    # Must bail out (no match recorded) within ~2x the budget rather than hang.
+    # Must bail out (no match recorded) rather than hang. Unbounded, this pattern
+    # takes ~2**40 steps (hours), so 10x the budget still proves the bound; 2x
+    # flaked on a loaded CI runner, where the engine's periodic timeout check
+    # overshot to 2.01x.
     assert out == []
-    assert elapsed < budget * 2
+    assert elapsed < budget * 10
 
 
 def test_native_search_file_content_mode_spills_large_payload(tmp_path: Path, monkeypatch: Any) -> None:
