@@ -121,7 +121,7 @@ def _stub_handler(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     monkeypatch.setitem(mcp_server.TOOLS, name, spec)
 
 
-@pytest.mark.parametrize("name", ["blame", "graph", "grep", "orient", "search", "statusline_segment"])
+@pytest.mark.parametrize("name", ["blame", "graph", "grep", "orient"])
 def test_broker_calls_tools_that_are_hidden_under_the_core_profile(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     """A read-only tool hidden from tools/list must still be reachable through the broker.
 
@@ -264,7 +264,9 @@ _BROKER_DENIED = frozenset(
         "review_evidence",
         "review_feedback_addressed",
         "review_rationale",
+        "search",
         "sql",
+        "statusline_segment",
         "tool",
         "trace",
         "verify",

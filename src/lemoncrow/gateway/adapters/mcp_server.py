@@ -10135,9 +10135,10 @@ def tool_statusline_segment(format: str = "segment") -> str:
       that render chat markdown and have no shell to run the CLI.
     - ``format="json"``: the raw savings report payload, JSON-encoded.
 
-    Hidden from tools/list (see HIDDEN_LLM_TOOLS) but reachable by exact name
-    through the `tool` broker (it is on the broker's read-only allow-list), which
-    is how the lemoncrow skill answers "what are my savings?" without a shell.
+    Hidden from tools/list (see HIDDEN_LLM_TOOLS) but callable by exact name,
+    which is how the lemoncrow skill answers "what are my savings?" without a
+    shell. The `tool` broker refuses it: every format writes (the sidecar, or the
+    savings aggregate).
     """
     fmt = (format or "segment").strip().lower()
     if fmt in {"markdown", "md", "json"}:

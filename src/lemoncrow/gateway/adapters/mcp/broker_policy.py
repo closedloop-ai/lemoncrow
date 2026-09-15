@@ -10,14 +10,22 @@ Refused because the code shows a write, execute or network path:
 
 * ``scan`` runs the ast-grep binary in a subprocess.
 * ``context`` records the task on the session ledger.
+* ``statusline_segment`` rewrites the session's statusline sidecar in its
+  default ``segment`` format; ``markdown`` and ``json`` fold unfolded session
+  ledgers into the persisted savings aggregate. The lemoncrow skill calls it
+  directly by name instead.
+* ``search`` stores each query's results in the workspace search cache
+  (``smart_state.json``).
 * ``graph kind=index_docs`` writes the design-doc store; ``recall_docs`` embeds
   its query through the configured embedder (the OpenAI one posts to the
   network) and creates the store schema on connect; ``pr_risk`` folds each
   changed file into the machine-wide semantic file index. ``enable`` only
   switches ``index_docs`` indexing on, and is refused outright.
 
-``statusline_segment`` is allowed although it refreshes its own statusline
-sidecar file: no argument reaches that path or its content.
+Not counted as writes: the code-intel engine building and syncing the workspace
+index, and telemetry, which every engine-backed read triggers on its direct
+route too. ``read`` also folds the file it reads into the semantic file index;
+it stays because it is advertised, so the broker adds no route to that write.
 """
 
 from __future__ import annotations
@@ -37,8 +45,6 @@ BROKER_READ_ONLY: frozenset[str] = frozenset(
         "orient",
         "read",
         "relations",
-        "search",
-        "statusline_segment",
     }
 )
 

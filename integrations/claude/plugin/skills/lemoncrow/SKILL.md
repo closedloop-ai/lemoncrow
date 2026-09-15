@@ -55,10 +55,10 @@ Global scope by default. Add `--workspace <dir>` only if the user names a specif
 
    Unknown key → run `lc settings show`, relay the valid keys.
 
-5. **"what are my savings?" / cost questions** — shell available (Claude Code, Codex CLI): run `lc usage` (add `optimize` for savings analysis, `optimize detail` for the per-operation breakdown) and relay it. No shell (chat-only host): call the broker by exact name — it returns a markdown panel, relay it verbatim:
+5. **"what are my savings?" / cost questions** — shell available (Claude Code, Codex CLI): run `lc usage` (add `optimize` for savings analysis, `optimize detail` for the per-operation breakdown) and relay it. No shell (chat-only host): call the `statusline_segment` tool by exact name, not through the `tool` broker (which refuses it) — it returns a markdown panel, relay it verbatim:
 
    ```json
-   {"name": "tool", "arguments": {"action": "call", "name": "statusline_segment", "arguments": {"format": "markdown"}}}
+   {"name": "statusline_segment", "arguments": {"format": "markdown"}}
    ```
 
    `format` accepts `markdown` (chat panel), `json` (raw report), `segment` (one statusline frame). Never recompute or restate the numbers.
