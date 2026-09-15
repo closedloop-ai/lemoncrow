@@ -364,8 +364,11 @@ def test_bash_command_as_list_recovers_to_batch(workspace: Path) -> None:
 
 
 def test_bash_bg_batch_returns_indexed_id_list(workspace: Path) -> None:
-    out = _text(_call("bash", {"command": ["echo bg1", "echo bg2"], "bg": True}))
+    # Still running at the first poll; an already-exited command is reported inline.
+    slow = "python3 -c 'import time; time.sleep(1)'"
+    out = _text(_call("bash", {"command": [f"echo bg1; {slow}", f"echo bg2; {slow}"], "bg": True}))
     assert "1: id=" in out and "2: id=" in out
+    assert "id=?" not in out
     assert "echo bg1" not in out  # no command echo — caller knows its own list
 
 
