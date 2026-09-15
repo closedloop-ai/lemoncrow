@@ -1516,11 +1516,14 @@ def test_tool_callers_batch_reports_the_pre_limit_total(tmp_path: Path) -> None:
     engine.index_repo()
 
     whole = engine.tool_callers_batch(["target"], limit=20, auto_index=False)["target"]
+    at_limit = engine.tool_callers_batch(["target"], limit=5, auto_index=False)["target"]
     cut = engine.tool_callers_batch(["target"], limit=2, auto_index=False)["target"]
 
     assert (whole["related_total"], whole["related_total_exact"], whole["truncated"]) == (5, True, False)
-    assert (cut["related_count"], cut["truncated"], cut["related_total_exact"]) == (2, True, False)
-    assert cut["related_total"] > cut["related_count"]
+    assert (at_limit["related_count"], at_limit["truncated"], at_limit["related_total"]) == (5, False, 5)
+    # Every edge row is read before the limit, so a cut list still reports the whole count.
+    assert (cut["related_count"], cut["truncated"]) == (2, True)
+    assert (cut["related_total"], cut["related_total_exact"]) == (5, True)
 
 
 def test_usages_truncated_survives_budget_packing(tmp_path: Path) -> None:
