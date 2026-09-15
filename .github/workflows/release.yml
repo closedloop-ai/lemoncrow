@@ -19,6 +19,10 @@ defaults:
 jobs:
   binary-build:
     name: Build release archive (${{ matrix.os }})
+    # Releases ship from upstream only: in a fork a v* tag must not publish a
+    # release (or prune old ones). `release` and `cleanup-old-releases` need this
+    # job, so they skip with it.
+    if: github.repository == 'lemoncrow-lab/lemoncrow'
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:

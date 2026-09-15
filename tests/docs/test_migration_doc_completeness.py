@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 REQUIRED_TOPICS = {
     "stub_embedding",
     "LEMONCROW_MEMORY_BACKEND=letta",
@@ -25,7 +27,9 @@ def _first_existing(*candidates: str) -> Path:
         path = Path(candidate)
         if path.exists():
             return path
-    return Path(candidates[0])
+    # These docs live in the private docs tree; the public mirror (and forks of
+    # it) ship none of the candidates.
+    pytest.skip(f"no copy of {Path(candidates[0]).name} in this checkout")
 
 
 def test_v2_to_v3_migration_guide_covers_operator_steps() -> None:

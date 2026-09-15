@@ -307,8 +307,17 @@ def _run_host_wizard(
         f'  printf "<<%s>>\\n" "$a" >> "{result_file}"\n'
         "done\n"
     )
+    # The answers assume Claude Code and Codex are detected hosts (the skills
+    # prompt is only offered for them). Stub both so the run does not depend on
+    # which agent CLIs this machine happens to have installed.
+    host_stubs = tmp_path / "host-stubs"
+    host_stubs.mkdir(exist_ok=True)
+    for host_cli in ("claude", "codex"):
+        stub = host_stubs / host_cli
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
     env = {
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PATH": f"{host_stubs}{os.pathsep}{os.environ.get('PATH', '/usr/bin:/bin')}",
         "HOME": str(home) if home is not None else os.environ.get("HOME", "/root"),
         "TERM": term,
         "LEMONCROW_INSTALL_DIR": str(LEMONCROW_ROOT),
@@ -464,11 +473,20 @@ def test_local_installer_removes_stale_managed_payload(tmp_path: Path) -> None:
     stale_skill.mkdir(parents=True)
     (stale_skill / "SKILL.md").write_text("---\nname: design-review\ndescription: stale\n---\n", encoding="utf-8")
 
+    # The fixture bundle ships no binary, and install.sh refuses to report success
+    # without a runnable one. Provide it, so the run does not lean on a LemonCrow
+    # already installed on this machine (CI has none).
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_cli = bin_dir / "lemoncrow"
+    fake_cli.write_text("#!/bin/sh\necho 'lemoncrow 0.0.0'\n", encoding="utf-8")
+    fake_cli.chmod(0o755)
+
     env = {
         **os.environ,
         "LEMONCROW_LOCAL_SRC": str(source),
         "LEMONCROW_INSTALL_DIR": str(install_dir),
-        "LEMONCROW_BIN_DIR": str(tmp_path / "bin"),
+        "LEMONCROW_BIN_DIR": str(bin_dir),
         "LEMONCROW_NO_HOSTS": "1",
         "LEMONCROW_NO_PATH": "1",
     }

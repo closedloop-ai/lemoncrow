@@ -1230,9 +1230,9 @@ def test_relocation_never_lands_on_different_content_under_random_drift() -> Non
         if got is None:  # fails closed -- always allowed
             continue
         relocated += 1
-        assert current_text.splitlines()[got[0] - 1 : got[1]] == served_text.splitlines()[start - 1 : end], (
-            f"L{start}-L{end} -> L{got[0]}-L{got[1]} changed the content under the edit"
-        )
+        assert (
+            current_text.splitlines()[got[0] - 1 : got[1]] == served_text.splitlines()[start - 1 : end]
+        ), f"L{start}-L{end} -> L{got[0]}-L{got[1]} changed the content under the edit"
     assert relocated > 1000, f"fuzz degenerated into all-rejections ({relocated} resolved)"
 
 

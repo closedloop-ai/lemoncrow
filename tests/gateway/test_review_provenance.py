@@ -368,7 +368,9 @@ def test_a_tie_is_reported_in_degraded(tmp_path: Path) -> None:
         repo,
         _PACKET_PATHS,
         head_sha="",
-        head_commit_time=None,
+        # The seeded traces are dated off _ANCHOR; a None commit time anchors the
+        # 7-day candidate window at the wall clock, where the fixtures age out.
+        head_commit_time=_ANCHOR,
     )
 
     assert "provenance_ambiguous" in degraded
@@ -390,7 +392,7 @@ def test_a_matched_host_that_records_no_reads_is_named_in_degraded(tmp_path: Pat
         repo,
         _PACKET_PATHS,
         head_sha="",
-        head_commit_time=None,
+        head_commit_time=_ANCHOR,
     )
 
     assert record.status == "matched"

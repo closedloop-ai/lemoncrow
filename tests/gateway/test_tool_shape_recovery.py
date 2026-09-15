@@ -364,8 +364,11 @@ def test_bash_command_as_list_recovers_to_batch(workspace: Path) -> None:
 
 
 def test_bash_bg_batch_returns_indexed_id_list(workspace: Path) -> None:
-    out = _text(_call("bash", {"command": ["echo bg1", "echo bg2"], "bg": True}))
+    # Still running at the first poll; an already-exited command is reported inline.
+    slow = "python3 -c 'import time; time.sleep(1)'"
+    out = _text(_call("bash", {"command": [f"echo bg1; {slow}", f"echo bg2; {slow}"], "bg": True}))
     assert "1: id=" in out and "2: id=" in out
+    assert "id=?" not in out
     assert "echo bg1" not in out  # no command echo — caller knows its own list
 
 
@@ -402,9 +405,46 @@ def test_read_identical_content_different_files_not_cross_deduped(workspace: Pat
 def test_bash_multi_id_poll_returns_block_per_id(workspace: Path) -> None:
     import re
 
-    start = _text(_call("bash", {"command": ["echo P1", "echo P2"], "bg": True}))
+    # Keep both running past the first poll: a command that has already exited is
+    # reported inline instead of as an id (see the next test).
+    start = _text(
+        _call(
+            "bash",
+            {
+                "command": [
+                    "echo P1; python3 -c 'import time; time.sleep(1)'",
+                    "echo P2; python3 -c 'import time; time.sleep(1)'",
+                ],
+                "bg": True,
+            },
+        )
+    )
     ids = re.findall(r"\d+: id=(\w+)", start)
     assert len(ids) == 2
     out = _text(_call("bash", {"id": ids}))
     assert f"## lc:id={ids[0]}" in out and f"## lc:id={ids[1]}" in out
     assert "P1" in out and "P2" in out
+
+
+def test_bash_bg_batch_shows_output_of_a_command_that_exited_before_first_poll(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lemoncrow.gateway.adapters.mcp import bash as bash_adapter
+
+    # What _run_bash_tool hands back for a bg command reaped inline: no session_id.
+    finished = {
+        "stdout": "P1",
+        "stderr": "",
+        "exit_code": 0,
+        "truncated": True,
+        "lines_omitted": 12,
+        "chars_omitted": 5000,
+        "log_file": "/tmp/bg.out",
+    }
+    monkeypatch.setattr(bash_adapter, "_run_bash_tool", lambda *_args, **_kwargs: dict(finished))
+    out = _text(_call("bash", {"command": ["echo P1", "echo P1"], "bg": True}))
+    assert "id=?" not in out
+    assert out.count(": done") == 2
+    assert "P1" in out
+    # The cut stays visible, with a pointer to the full output.
+    assert "[output truncated: 12 lines omitted; full: /tmp/bg.out]" in out
