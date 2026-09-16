@@ -148,6 +148,20 @@ def test_every_build_stage_input_is_public() -> None:
     assert not private, f"scripts/build.sh copies private-only inputs into the public release build: {private}"
 
 
+def test_the_fork_marker_never_reaches_the_public_mirror() -> None:
+    """``_distribution.py`` identifies the fork build, so upstream must not carry it.
+
+    Published, it would make every genuine upstream build compare
+    ``closedloop-ai/lemoncrow`` against ``lemoncrow-lab/lemoncrow``, report itself
+    as a fork and refuse ``lc update`` until the operator passes
+    ``--allow-upstream`` (PRD-739 FR11).
+    """
+    prefixes = mirror.load_public_prefixes()
+    assert mirror.is_public("src/lemoncrow/_distribution.py", prefixes) is False
+    # The deny is that one file, not a subtree: its importer still publishes.
+    assert mirror.is_public("src/lemoncrow/gateway/cli/commands/update.py", prefixes) is True
+
+
 def test_public_workflows_are_rewritten_to_github_workflows() -> None:
     assert mirror.public_output_path(".github/public-workflows/tests.yml") == ".github/workflows/tests.yml"
     assert mirror.public_output_path(".github/public-workflows") == ".github/workflows"

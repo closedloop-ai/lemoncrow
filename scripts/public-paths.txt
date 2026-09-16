@@ -125,3 +125,9 @@ requirements-audit.txt
 
 # Tests that intentionally validate private documentation and cannot run in the public checkout.
 !tests/gateway/test_host_trace_confidence.py
+
+# The fork marker. Its presence -- and the repository it names -- is what makes a
+# build a fork build, so publishing it would make every upstream build report
+# itself as the fork and refuse `lc update` (PRD-739 FR11). update.py treats the
+# module's absence as "this is upstream", which is exactly what the mirror is.
+!src/lemoncrow/_distribution.py
