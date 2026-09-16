@@ -39,10 +39,12 @@ from lemoncrow.core.foundation.update_state import write_update_state
 
 try:
     from lemoncrow._distribution import DISTRIBUTION_REPO, UPSTREAM_REPO
-except ImportError:
+except ModuleNotFoundError:
     # scripts/public-paths.txt keeps the module out of the public mirror, so its
     # absence IS the upstream build: same repo either side of the comparison,
-    # and every fork guard below stays inert.
+    # and every fork guard below stays inert. Narrower than ImportError on
+    # purpose: a module that is present but fails to import is a broken fork
+    # build, and disarming the guard for it would hide the breakage.
     UPSTREAM_REPO = "lemoncrow-lab/lemoncrow"
     DISTRIBUTION_REPO = UPSTREAM_REPO
 

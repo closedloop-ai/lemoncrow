@@ -316,3 +316,19 @@ def test_absent_distribution_module_reads_as_an_upstream_build(monkeypatch: pyte
     finally:
         monkeypatch.undo()
         importlib.reload(update_mod)
+
+
+def test_broken_distribution_module_fails_loudly_instead_of_disarming(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Absence means upstream; a module that is present but broken means neither.
+
+    Falling back for a failed import would leave a fork build silently claiming to
+    be upstream, with every guard inert -- the one outcome this feature exists to
+    prevent. Only ``ModuleNotFoundError`` may reach the fallback.
+    """
+    monkeypatch.setitem(sys.modules, "lemoncrow._distribution", object())  # present, no constants
+    try:
+        with pytest.raises(ImportError):
+            importlib.reload(update_mod)
+    finally:
+        monkeypatch.undo()
+        importlib.reload(update_mod)
