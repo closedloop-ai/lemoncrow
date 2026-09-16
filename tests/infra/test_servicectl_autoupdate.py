@@ -9,11 +9,22 @@ installer in a loop before the first one lands.
 
 from __future__ import annotations
 
+import importlib
+import logging
 from pathlib import Path
 
 import pytest
 
 from lemoncrow.infra.runtime import servicectl_lifecycle as svc
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# The public mirror omits src/lemoncrow/_distribution.py (scripts/public-paths.txt),
+# so the checkout upstream builds from has no fork identity for these to assert.
+_fork_checkout_only = pytest.mark.skipif(
+    not (_REPO_ROOT / "src" / "lemoncrow" / "_distribution.py").exists(),
+    reason="upstream checkout: no lemoncrow._distribution, so no fork build to guard",
+)
 
 
 def test_is_dev_install_marker(tmp_path: Path) -> None:
@@ -45,6 +56,7 @@ def test_update_via_release_respects_explicit_opt_out(monkeypatch: pytest.Monkey
     import shutil
 
     monkeypatch.setenv("LEMONCROW_AUTO_UPDATE_RELEASE", "0")
+    monkeypatch.setattr(svc, "_is_fork_build", lambda: False)  # reach past the FR11 guard
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/bash")
 
     def _boom(*_a: object, **_k: object) -> object:
@@ -89,6 +101,7 @@ def test_update_via_release_launches_detached_installer(monkeypatch: pytest.Monk
     import urllib.request
 
     monkeypatch.setenv("LEMONCROW_AUTO_UPDATE_RELEASE", "1")
+    monkeypatch.setattr(svc, "_is_fork_build", lambda: False)  # an upstream build: nothing to protect
     monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/bash")
     monkeypatch.setattr(shutil, "copyfileobj", lambda _src, _dst: None)
     monkeypatch.setattr(svc, "_github_latest_version", lambda: "2.0.0")
@@ -118,6 +131,68 @@ def test_update_via_release_launches_detached_installer(monkeypatch: pytest.Monk
     assert isinstance(kwargs, dict)
     assert kwargs["start_new_session"] is True
     assert kwargs["env"]["LEMONCROW_NON_INTERACTIVE"] == "1"  # type: ignore[index]
+
+
+# --------------------------------------------------------------------------- #
+# fork build: the daemon never installs an upstream release (PRD-739 FR11)     #
+# --------------------------------------------------------------------------- #
+
+
+@_fork_checkout_only
+def test_release_update_does_not_run_the_upstream_installer_on_a_fork_build(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """FR11 leaves a daemon one behaviour: refuse, and say what to run instead.
+
+    Everything else here is set up to make the installer launch -- opted in, a
+    newer release, bash present -- so the fork check is the only thing stopping
+    it. It runs for real rather than monkeypatched, so flipping its comparison
+    lets the installer through and fails here.
+    """
+    import shutil
+
+    monkeypatch.setenv("LEMONCROW_AUTO_UPDATE_RELEASE", "1")
+    monkeypatch.setattr(shutil, "which", lambda _name: "/usr/bin/bash")
+    monkeypatch.setattr(svc, "_github_latest_version", lambda: "99.0.0")
+    monkeypatch.setattr(svc, "_lemoncrow_version", lambda: "1.0.0")
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise AssertionError("must not run the upstream installer on a fork build")
+
+    monkeypatch.setattr(svc.subprocess, "Popen", _boom)
+
+    with caplog.at_level(logging.INFO):
+        assert svc._update_via_release() is False
+
+    assert f"cd <your {svc.DISTRIBUTION_REPO} clone> && git pull && bash scripts/local.sh" in caplog.text
+
+
+@_fork_checkout_only
+def test_servicectl_and_update_read_one_upstream_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """One source, not the same literal typed in two files.
+
+    The literal was duplicated here under a comment asking the next reader to
+    keep it in step with update.py by hand, and update.py then stopped holding a
+    literal at all. Equality alone cannot catch that -- two copies of the same
+    string are equal. Rebinding the constant both modules read has to move both
+    of them, and their fork verdicts with it.
+    """
+    from lemoncrow import _distribution
+    from lemoncrow.gateway.cli.commands import update as update_cli
+
+    assert svc._GH_REPO == update_cli._GH_REPO == _distribution.UPSTREAM_REPO
+
+    monkeypatch.setattr(_distribution, "UPSTREAM_REPO", "sentinel-upstream/lemoncrow")
+    try:
+        importlib.reload(svc)
+        importlib.reload(update_cli)
+        assert svc._GH_REPO == "sentinel-upstream/lemoncrow"
+        assert update_cli._GH_REPO == "sentinel-upstream/lemoncrow"
+        assert svc._is_fork_build() is update_cli._is_fork_build() is True
+    finally:
+        monkeypatch.undo()
+        importlib.reload(svc)
+        importlib.reload(update_cli)
 
 
 # --------------------------------------------------------------------------- #

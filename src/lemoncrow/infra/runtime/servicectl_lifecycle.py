@@ -435,10 +435,28 @@ def _git_project_root() -> Path | None:
     return None
 
 
-# Distribution channel -- keep in lockstep with scripts/install.sh and
-# src/lemoncrow/gateway/cli/commands/update.py.
-_GH_REPO = "lemoncrow-lab/lemoncrow"
+# Distribution channel. Both constants come from ``lemoncrow._distribution``, so
+# this module and ``lemoncrow.gateway.cli.commands.update`` cannot disagree about
+# which repository a release update installs. They used to hold the same literal
+# twice under a comment asking the next reader to keep them in step by hand, and
+# update.py stopped holding a literal at all.
+try:
+    from lemoncrow._distribution import DISTRIBUTION_REPO, UPSTREAM_REPO
+except ModuleNotFoundError:
+    # scripts/public-paths.txt keeps the module out of the public mirror, so its
+    # absence IS the upstream build: same repo either side of the comparison, and
+    # the fork guard below stays inert. Narrower than ImportError on purpose: a
+    # module that is present but fails to import is a broken fork build, and
+    # disarming the guard for it would hide the breakage.
+    UPSTREAM_REPO = "lemoncrow-lab/lemoncrow"
+    DISTRIBUTION_REPO = UPSTREAM_REPO
+
+_GH_REPO = UPSTREAM_REPO
 _RELEASE_LATEST_URL = f"https://github.com/{_GH_REPO}/releases/latest/download"
+
+
+def _is_fork_build() -> bool:
+    return DISTRIBUTION_REPO != UPSTREAM_REPO
 
 
 def _github_latest_version() -> str | None:
@@ -601,12 +619,30 @@ def _update_via_release() -> bool:
     process, reinstalls the uv tool from ``lemoncrow-distribution-*.tar.gz``, and
     its own ``run_setup`` restarts the stack on the new code.
 
+    Refuses outright on a fork build: see the guard below.
+
     Returns True if an installer was launched (a newer release exists and the
     download succeeded), else False.
     """
     import shutil
     import tempfile
     import urllib.request
+
+    # PRD-739 FR11: no update path replaces a fork build with an upstream release
+    # unless the operator is told and agrees. A daemon has nobody to ask, so on a
+    # fork build this arm refuses and names the command that updates the fork
+    # instead. LEMONCROW_AUTO_UPDATE_RELEASE is not that agreement -- it says
+    # "auto-update from releases", not "replace my fork with upstream" -- and
+    # `lc update` is where the choice is offered, interactively or with
+    # --allow-upstream.
+    if _is_fork_build():
+        logger.info(
+            f"Auto-update: skipping the {UPSTREAM_REPO} release installer -- this is a "
+            f"{DISTRIBUTION_REPO} build, and installing upstream would replace it and the "
+            f"tools only it ships. Update the fork instead: "
+            f"cd <your {DISTRIBUTION_REPO} clone> && git pull && bash scripts/local.sh"
+        )
+        return False
 
     # Opt-in: this path downloads and executes an installer script from the
     # release channel, so it stays OFF unless LEMONCROW_AUTO_UPDATE_RELEASE is
