@@ -11,6 +11,12 @@ LemonCrow is distributed in exactly two ways, so updates have exactly two paths:
 
 There is deliberately no PyPI path: LemonCrow is not published to PyPI. The sole
 distribution channel is GitHub Releases.
+
+Those releases are upstream's. On a fork build (see ``lemoncrow._distribution``)
+the release path would therefore swap the fork's tools for an upstream release,
+so it refuses without ``--allow-upstream`` or an interactive confirmation
+(PRD-739 FR11). The git path is unaffected: it already pulls the fork's own
+``origin``.
 """
 
 from __future__ import annotations
@@ -29,11 +35,12 @@ from pathlib import Path
 import click
 
 from lemoncrow import __version__ as current_version
+from lemoncrow._distribution import DISTRIBUTION_REPO, UPSTREAM_REPO
 from lemoncrow.core.foundation.update_state import write_update_state
 
 # Single source of truth for the distribution channel. Keep these in lockstep
 # with scripts/install.sh and .github/workflows/release.yml.
-_GH_REPO = "lemoncrow-lab/lemoncrow"
+_GH_REPO = UPSTREAM_REPO
 _RELEASE_LATEST_URL = f"https://github.com/{_GH_REPO}/releases/latest/download"
 _INSTALLER_ASSET = "install.sh"
 
@@ -92,6 +99,25 @@ def _detect_method() -> tuple[str, str | None]:
     if git_root is not None:
         return ("git", str(git_root))
     return ("release", None)
+
+
+def _is_fork_build() -> bool:
+    """True when this build is distributed from somewhere other than upstream."""
+    return DISTRIBUTION_REPO != UPSTREAM_REPO
+
+
+def _fork_update_command() -> str:
+    """The command that updates a fork build in place, in place of ``lc update``."""
+    return f"git -C <your {DISTRIBUTION_REPO} clone> pull && bash scripts/local.sh"
+
+
+def _echo_upstream_release_warning(remote_version: str) -> None:
+    click.echo(f"\n  ! Release updates come from {UPSTREAM_REPO} (upstream), not {DISTRIBUTION_REPO}.")
+    click.echo(f"    Installing {remote_version} would replace this fork build and the tools only it ships.")
+
+
+def _echo_fork_update_hint() -> None:
+    click.echo(f"  ◇ Update the fork instead: {_fork_update_command()}")
 
 
 # ---------------------------------------------------------------------------
@@ -287,8 +313,14 @@ def _reconcile_companions(project_root: str) -> None:
 @click.option("--check", "check_only", is_flag=True, help="Only check for updates, do not apply.")
 @click.option("--force", "force_update", is_flag=True, help="Reinstall even if same version.")
 @click.option("--json", "as_json", is_flag=True, help="Output JSON (requires --check).")
+@click.option(
+    "--allow-upstream",
+    "allow_upstream",
+    is_flag=True,
+    help="Allow a release update to replace this fork build with an upstream release.",
+)
 @click.pass_context
-def update_cmd(ctx: click.Context, check_only: bool, force_update: bool, as_json: bool) -> None:
+def update_cmd(ctx: click.Context, check_only: bool, force_update: bool, as_json: bool, allow_upstream: bool) -> None:
     """Check for and apply LemonCrow updates.
 
     Detects your install method (git checkout or GitHub-release install) and
@@ -305,6 +337,7 @@ def update_cmd(ctx: click.Context, check_only: bool, force_update: bool, as_json
     if not as_json:
         click.echo(f"  Current version: {current_version}")
         click.echo(f"  Install method:  {method}")
+        click.echo(f"  Distribution:    {DISTRIBUTION_REPO}")
 
     # 2. Check remote version
     if method == "git" and project_root:
@@ -336,6 +369,7 @@ def update_cmd(ctx: click.Context, check_only: bool, force_update: bool, as_json
                         "remote_version": remote_version,
                         "method": method,
                         "update_available": update_available,
+                        "distribution": DISTRIBUTION_REPO,
                     }
                 )
             )
@@ -344,6 +378,9 @@ def update_cmd(ctx: click.Context, check_only: bool, force_update: bool, as_json
             click.echo("  ◇ Run `lc update` to apply.")
         else:
             click.echo("\n  ✓ Already up-to-date.")
+        if not as_json and method == "release" and _is_fork_build():
+            _echo_upstream_release_warning(remote_version)
+            _echo_fork_update_hint()
         if update_available:
             ctx.exit(1)
         return
@@ -353,6 +390,18 @@ def update_cmd(ctx: click.Context, check_only: bool, force_update: bool, as_json
         return
 
     # 4. Apply
+    if method == "release" and _is_fork_build() and not allow_upstream:
+        _echo_upstream_release_warning(remote_version)
+        try:
+            confirmed = click.confirm("  Continue and install the upstream release?", default=False)
+        except click.Abort:
+            confirmed = False
+        if not confirmed:
+            click.echo(f"\n  ✗ Refused — still on the {DISTRIBUTION_REPO} build.")
+            _echo_fork_update_hint()
+            click.echo("  ◇ Re-run with --allow-upstream to switch to upstream anyway.")
+            ctx.exit(1)
+
     click.echo(f"\n  ◆ Updating {current_version} → {remote_version} ({method} install)...")
     previous = current_version
 

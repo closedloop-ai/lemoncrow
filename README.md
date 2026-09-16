@@ -516,6 +516,8 @@ cd lemoncrow
 bash scripts/local.sh
 ```
 
+Running the closedloop-ai fork? See [the fork build](docs/setup/closedloop-fork.md) — it installs from a fork clone and keeps `lc update` from replacing it with an upstream release.
+
 ---
 
 ## License
