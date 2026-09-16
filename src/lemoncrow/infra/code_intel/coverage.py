@@ -12,29 +12,57 @@ Five states, per path:
     In ``files`` but the bytes on disk have moved on -- including the case where
     the file has been deleted and the index has not caught up.
 ``missing``
-    On disk, in a language the index supports, and simply not there.
+    Not in ``files``: either not on disk at all, or on disk and selected by the
+    indexer's file scan but absent from the last index run.
 ``excluded``
-    On disk but outside what the indexer takes: git-ignored, or a file type the
-    language registry does not recognise.
+    On disk but passed over by one of the indexer's file-selection rules, which
+    the verdict names in ``rule`` (see :data:`EXCLUSION_RULES`).
 ``unparsed``
     In ``files`` with zero rows in ``symbols`` -- indexed as a file, but no
     symbols were extracted from it.
+
+Excluded and missing are decided by the indexer's own scan rather than a guess
+at it: an on-disk path the index does not hold is ``missing`` exactly when
+:func:`~lemoncrow.pro.capabilities.repo_map.graph.iter_source_files` selects it
+and the free-tier cap would keep it. One rule cannot be read back:
+``exclude_globs`` passed to an index run are not persisted, so a path they kept
+out reports ``missing``, with a reason saying an index-time exclude may apply --
+or ``excluded`` under ``free-tier-file-cap`` when that cap is engaged too, since
+the cap is counted here over the whole scan where the index run counted it over
+what the excludes left.
+
+Both directions hold, because the index applies these same rules on the way in
+(:mod:`lemoncrow.infra.code_intel.inclusion`, on each of its two entry points):
+a path this report calls ``excluded`` has no rows in the index to find.
 """
 
 from __future__ import annotations
 
 import hashlib
-import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.freshness import require_ready
+from lemoncrow.infra.code_intel.inclusion import (
+    EXCLUSION_RULES,
+    REASON_SOURCE_FILE_SCAN,
+    RULE_FREE_TIER_FILE_CAP,
+    RULE_SOURCE_FILE_SCAN,
+    exclusion_rule,
+    free_tier_selection,
+    git_ignored,
+    load_lemoncrow_ignore_spec,
+    run_git,
+    source_file_patterns,
+)
 from lemoncrow.infra.code_intel.languages import language_for_path
 from lemoncrow.infra.code_intel.store import CodeIntelStore, FileRow
 
 __all__ = [
+    "EXCLUSION_RULES",
     "STATES",
     "CoverageReport",
     "PathCoverage",
@@ -43,10 +71,14 @@ __all__ = [
 
 STATES: tuple[str, ...] = ("indexed", "stale", "missing", "excluded", "unparsed")
 
-# The engine's own ignore rules live in the closed indexer. This module states
-# which rules IT applied instead of pretending to know the engine's, and reports
-# that under `exclusion_source` so a caller can weigh the answer.
+# Kept verbatim for consumers that captured it (PLN-1677 N0). It predates the
+# indexer's rules being readable here; `exclusion_rules` lists the rules this
+# check applies now, and each excluded verdict names its own.
 _EXCLUSION_SOURCE = "git-ignore + unrecognised-file-type"
+
+# `exclude_globs` given to an index run are not persisted, so a path the scan
+# selects but the index does not hold may be excluded that way or not yet indexed.
+_NOT_IN_LAST_RUN = "not in the last index run (an index-time exclude may apply)"
 
 _HASH_READ_CHUNK = 1 << 20
 
@@ -60,15 +92,20 @@ class PathCoverage:
     reason: str
     language: str | None
     symbols: int
+    #: The :data:`EXCLUSION_RULES` entry behind an ``excluded`` verdict, else ``None``.
+    rule: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "path": self.path,
             "state": self.state,
             "reason": self.reason,
             "language": self.language,
             "symbols": self.symbols,
         }
+        if self.rule is not None:
+            payload["rule"] = self.rule
+        return payload
 
 
 @dataclass(frozen=True)
@@ -80,6 +117,7 @@ class CoverageReport:
     exclusion_source: str
     totals: dict[str, int]
     paths: tuple[PathCoverage, ...]
+    exclusion_rules: tuple[str, ...] = EXCLUSION_RULES
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -89,9 +127,25 @@ class CoverageReport:
             "repo_root": self.repo_root,
             "engine_index_version": self.engine_index_version,
             "exclusion_source": self.exclusion_source,
+            "exclusion_rules": list(self.exclusion_rules),
             "totals": dict(self.totals),
             "paths": [entry.to_dict() for entry in self.paths],
         }
+
+
+@dataclass(frozen=True)
+class _IndexSelection:
+    """What the indexer's file scan takes from this checkout as it stands."""
+
+    #: Repo-relative paths :func:`iter_source_files` selects.
+    selected: frozenset[str]
+    #: The subset the free-tier cap keeps; all of *selected* when uncapped.
+    kept: frozenset[str]
+    #: The ``.lemoncrow/.ignore`` spec the scan applied, or ``None``.
+    ignore_spec: Any | None
+
+
+_NO_SELECTION = _IndexSelection(selected=frozenset(), kept=frozenset(), ignore_spec=None)
 
 
 def _sha256(path: Path) -> str | None:
@@ -105,40 +159,8 @@ def _sha256(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-def _git(root: Path, *args: str, stdin: str | None = None) -> str | None:
-    """Run git in *root*, returning stdout or ``None`` when git cannot answer.
-
-    Fail-open by design: a non-git directory or a missing git binary must
-    degrade the exclusion rule, not break the whole report.
-    """
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(root), *args],
-            input=stdin,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    # check-ignore exits 1 when nothing matched, which is a real answer.
-    if completed.returncode not in (0, 1):
-        return None
-    return completed.stdout
-
-
 def _tracked_files(root: Path) -> set[str]:
-    output = _git(root, "ls-files", "-z")
-    if output is None:
-        return set()
-    return {entry for entry in output.split("\0") if entry}
-
-
-def _ignored_files(root: Path, candidates: list[str]) -> set[str]:
-    if not candidates:
-        return set()
-    output = _git(root, "check-ignore", "--stdin", "-z", stdin="\0".join(candidates))
+    output = run_git(root, "ls-files", "-z")
     if output is None:
         return set()
     return {entry for entry in output.split("\0") if entry}
@@ -153,6 +175,60 @@ def _relative(root: Path, raw: str) -> str:
         except ValueError:
             return candidate.as_posix()
     return candidate.as_posix()
+
+
+def _relative_set(root: Path, files: list[Path]) -> frozenset[str]:
+    relative: set[str] = set()
+    for path in files:
+        try:
+            relative.add(path.relative_to(root).as_posix())
+        except ValueError:
+            continue  # a symlink resolving outside the checkout
+    return frozenset(relative)
+
+
+def _index_selection(root: Path) -> _IndexSelection:
+    """Run the indexer's own file scan, then its free-tier cap.
+
+    Mirrors ``CodeContextEngine._index_repo_unsafe`` with no ``exclude_globs``:
+    the same :func:`iter_source_files` call, then, without the
+    ``context_engine`` feature, the same :func:`free_tier_selection` over it.
+    Imported lazily, because the scan lists and pattern-matches every
+    git-visible file and only runs when a queried path is not indexed.
+    """
+    from lemoncrow.core.capabilities import licensing
+    from lemoncrow.pro.capabilities.repo_map.graph import iter_source_files
+
+    files = iter_source_files(root)
+    kept = files
+    if not licensing.has_feature("context_engine"):
+        from lemoncrow.pro.capabilities.code_context.engine import _FREE_TIER_MAX_FILES
+
+        kept = free_tier_selection(files, cap=_FREE_TIER_MAX_FILES)
+    return _IndexSelection(
+        selected=_relative_set(root, files),
+        kept=_relative_set(root, kept),
+        ignore_spec=load_lemoncrow_ignore_spec(root),
+    )
+
+
+def _exclusion(
+    rel: str,
+    selection: _IndexSelection,
+    ignored: frozenset[str],
+    patterns: Sequence[str],
+) -> tuple[str, str]:
+    """``(rule, reason)`` for an on-disk path the indexer's scan passed over.
+
+    The rules the index itself applies (:func:`exclusion_rule`) name all of them
+    the index can name, its own glob gate included. The fallback is what is left
+    when the scan passed a path over for a reason no rule sees -- an untracked
+    file inside a submodule, which ``git ls-files --others`` does not recurse.
+    """
+    return exclusion_rule(rel, ignore_spec=selection.ignore_spec, ignored=ignored, patterns=patterns) or (
+        RULE_SOURCE_FILE_SCAN,
+        REASON_SOURCE_FILE_SCAN,
+    )
 
 
 def _disk_matches(root: Path, rel: str, row: FileRow) -> bool:
@@ -181,6 +257,15 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
     already in the index -- not a filesystem walk, which would drag in build
     output and virtualenvs the indexer never looked at.
 
+    An on-disk path the index does not hold is judged against the indexer's own
+    file scan, run once and only when such a path is asked about. It is
+    ``excluded``, naming the first rule that passed it over, or ``missing`` when
+    the scan selects it. Index-time ``exclude_globs`` are not persisted, so a
+    path one of them kept out cannot be told apart from a path not yet indexed:
+    it reports ``missing``, with a reason saying an index-time exclude may apply,
+    or ``free-tier-file-cap`` when that cap is engaged as well -- the cap counts
+    the whole scan here, where the index run counted only what the excludes left.
+
     Raises :class:`~lemoncrow.infra.code_intel.freshness.IndexRebuilding` while
     the index is mid-write, and
     :class:`~lemoncrow.infra.code_intel.store.CodeIntelUnavailable` when it is
@@ -197,11 +282,13 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
 
     if paths is None:
         candidates = sorted(set(indexed) | _tracked_files(root))
-        ignored: set[str] = set()
     else:
         candidates = sorted({_relative(root, raw) for raw in paths})
-        on_disk_unindexed = [rel for rel in candidates if rel not in indexed and (root / rel).exists()]
-        ignored = _ignored_files(root, on_disk_unindexed)
+
+    unindexed_on_disk = [rel for rel in candidates if rel not in indexed and (root / rel).exists()]
+    selection = _index_selection(root) if unindexed_on_disk else _NO_SELECTION
+    ignored = git_ignored(root, [rel for rel in unindexed_on_disk if rel not in selection.selected])
+    patterns = source_file_patterns() if unindexed_on_disk else []
 
     entries: list[PathCoverage] = []
     totals: dict[str, int] = dict.fromkeys(STATES, 0)
@@ -230,12 +317,13 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
                 entry = PathCoverage(rel, "indexed", "up to date", row.language, symbols)
         elif not exists:
             entry = PathCoverage(rel, "missing", "not on disk and not indexed", language_name, 0)
-        elif rel in ignored:
-            entry = PathCoverage(rel, "excluded", "git-ignored", language_name, 0)
-        elif language is None:
-            entry = PathCoverage(rel, "excluded", "unrecognised file type", None, 0)
+        elif rel not in selection.selected:
+            rule, reason = _exclusion(rel, selection, ignored, patterns)
+            entry = PathCoverage(rel, "excluded", reason, language_name, 0, rule)
+        elif rel not in selection.kept:
+            entry = PathCoverage(rel, "excluded", "free-tier file cap", language_name, 0, RULE_FREE_TIER_FILE_CAP)
         else:
-            entry = PathCoverage(rel, "missing", "on disk, supported language, not indexed", language_name, 0)
+            entry = PathCoverage(rel, "missing", _NOT_IN_LAST_RUN, language_name, 0)
 
         entries.append(entry)
         totals[entry.state] += 1

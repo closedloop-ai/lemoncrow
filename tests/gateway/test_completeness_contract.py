@@ -29,7 +29,7 @@ from typing import Any, cast
 import pytest
 
 from lemoncrow.gateway.adapters import mcp_server
-from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE, OBJECTIVE_PARTIAL
+from lemoncrow.infra.code_intel.completeness import MATCH_NAME, MATCH_RESOLVED, OBJECTIVE_EXHAUSTIVE, OBJECTIVE_PARTIAL
 from lemoncrow.infra.code_intel.freshness import IndexRebuilding, reset_readiness_probes
 from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, INTEL_DB, CodeIntelUnavailable, workspace_dir
 from lemoncrow.pro.capabilities.code_context import CodeContextEngine
@@ -423,3 +423,102 @@ def test_the_dispatcher_returns_an_unready_index_as_a_tool_error_not_an_empty_re
     result = response["result"]
     assert result["isError"] is True
     assert "being migrated" in result["content"][0]["text"]
+
+
+# --------------------------------------------------------------------------- #
+# match precision
+# --------------------------------------------------------------------------- #
+
+Respond = Callable[[Path, pytest.MonkeyPatch], dict[str, Any]]
+
+
+def _match_kinds(value: Any) -> list[Any]:
+    """Every ``match_kind`` in a response, at the top level and on every row."""
+    if isinstance(value, dict):
+        found = [value["match_kind"]] if "match_kind" in value else []
+        for child in value.values():
+            found.extend(_match_kinds(child))
+        return found
+    if isinstance(value, list):
+        return [kind for child in value for kind in _match_kinds(child)]
+    return []
+
+
+def _relations_response(kind: str) -> Respond:
+    """The JSON body a reviewer reads from ``relations``, trimmed to its budget."""
+
+    def respond(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        root = _fan_repo(tmp_path / "fan")
+        monkeypatch.setenv("LEMONCROW_WORKSPACE_ROOT", str(root))
+        response = mcp_server._handle(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "relations", "arguments": {"symbol": "hub", "kind": kind}},
+            }
+        )
+        assert isinstance(response, dict)
+        body = json.loads(response["result"]["content"][0]["text"])
+        assert isinstance(body, dict)
+        return body
+
+    return respond
+
+
+def _over_an_index(invoke: Invoke) -> Respond:
+    """*invoke* over an index whose call graph and import table both hold data."""
+
+    def respond(tmp_path: Path, _monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+        return invoke(_write_index(_repo_with_an_edit(tmp_path), imports=True, call_edges=True))
+
+    return respond
+
+
+def _code_query(select: str) -> Invoke:
+    return lambda root: _tool("code_query", {"select": select, "repo_root": str(root)})
+
+
+_MATCH_PRECISION: list[Any] = [
+    # Symbol-edge enumerations read name-keyed edge stores.
+    *(
+        pytest.param(_relations_response(kind), MATCH_NAME, id=f"relations-{kind}")
+        for kind in ("callers", "callees", "usages")
+    ),
+    *(
+        pytest.param(_over_an_index(_code_query(select)), MATCH_NAME, id=f"code_query-{select}")
+        for select in ("callers", "callees", "references")
+    ),
+    pytest.param(
+        _over_an_index(lambda root: _tool("code_changes", {"repo_root": str(root)})), MATCH_NAME, id="code_changes"
+    ),
+    # Not symbol matches, so no match_kind at all (PRD-739 FR10 scope).
+    pytest.param(
+        _over_an_index(lambda root: _tool("code_coverage_check", {"paths": ["a.py", "b.py"], "repo_root": str(root)})),
+        None,
+        id="code_coverage_check",
+    ),
+    pytest.param(_over_an_index(_code_query("importers")), None, id="code_query-importers"),
+    *(pytest.param(_over_an_index(_graph(kind)), None, id=f"graph-{kind}") for kind in _FILE_GRAPH_KINDS),
+]
+
+
+@pytest.mark.parametrize(("respond", "expected"), _MATCH_PRECISION)
+def test_no_response_claims_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, respond: Respond, expected: str | None
+) -> None:
+    """Every symbol-edge enumeration says it matched by name, and no response says resolved.
+
+    Both edge stores are keyed by name, so nothing could make ``resolved`` true
+    until a resolution sidecar exists. Coverage and file-graph responses are not
+    symbol matches and carry no ``match_kind``.
+    """
+    payload = respond(tmp_path, monkeypatch)
+    kinds = _match_kinds(payload)
+
+    assert MATCH_RESOLVED not in kinds
+    if expected is None:
+        assert kinds == []
+    else:
+        assert payload["match_kind"] == expected
+        assert set(kinds) == {expected}

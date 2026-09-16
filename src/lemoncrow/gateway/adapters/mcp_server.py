@@ -10025,7 +10025,10 @@ def tool_code_coverage_check(
 
     Tells an empty search result apart from an unindexed file. Omit `paths` for
     the whole repo. Every response carries the engine `index_version` it was
-    judged against, and `exclusion_source` names the ignore rules applied.
+    judged against. Verdicts follow the indexer's own file scan, and an
+    `excluded` path names the `rule` that skipped it. Index-time `exclude_globs`
+    are not recorded, so a path one kept out reads `missing`, or
+    `free-tier-file-cap` when that cap is engaged too.
     """
     from lemoncrow.infra.code_intel.coverage import check_coverage
 
@@ -10042,10 +10045,14 @@ def tool_code_changes(
 ) -> dict[str, Any]:
     """Diff since `base_ref`, mapped to changed symbols and the callers they reach.
 
-    Carries "what does this change touch?" past the file boundary. `depth`
-    expands callers by that many hops. The call graph is name-keyed, so every
-    edge carries `match_kind: "name"` and over-reports rather than missing
-    callers; `impacted_total` gives the count before `limit` truncation.
+    Diffs the working tree against `git merge-base <base_ref> HEAD` (the fork
+    point, returned as `diff_ref`), so uncommitted edits to tracked files count
+    (`includes_uncommitted`); untracked files do not. `depth` counts caller hops
+    over a name-keyed call graph: every edge carries `match_kind: "name"` and
+    over-reports rather than missing callers. Each `impacted` row is anchored by
+    `path` and call `line`; `impacted_total` gives the count before `limit`
+    truncation. `risk`: high = deleted with callers, or exported with 5+
+    callers; medium = exported or any caller; low = private with none.
     """
     from lemoncrow.infra.code_intel.change_impact import analyze_changes
 
@@ -11002,7 +11009,8 @@ def tool_relations(
     callers/callees: `related_count` is the rows returned; `related_total` is the
     distinct related symbols found before `limit`, a lower bound when
     `related_total_exact` is false. Rows are enclosing-symbol spans (the calling or
-    called definition), not call sites.
+    called definition), not call sites. For each call's `call_line` and
+    `call_column`, use `code_query select=callers`.
     usages: `reference_count` is the rows returned.
     `truncated` (and, for callers/callees, both totals) survives response trimming.
     """
