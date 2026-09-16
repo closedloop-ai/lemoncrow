@@ -9,7 +9,6 @@ build and the tools only it ships (PRD-739 FR11).
 
 from __future__ import annotations
 
-#: The repository this build is distributed from.
 DISTRIBUTION_REPO = "closedloop-ai/lemoncrow"
 
 #: The repository the published release channel (``scripts/install.sh``) serves.

@@ -102,12 +102,10 @@ def _detect_method() -> tuple[str, str | None]:
 
 
 def _is_fork_build() -> bool:
-    """True when this build is distributed from somewhere other than upstream."""
     return DISTRIBUTION_REPO != UPSTREAM_REPO
 
 
 def _fork_update_command() -> str:
-    """The command that updates a fork build in place, in place of ``lc update``."""
     return f"git -C <your {DISTRIBUTION_REPO} clone> pull && bash scripts/local.sh"
 
 
