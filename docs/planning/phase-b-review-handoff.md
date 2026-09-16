@@ -217,9 +217,6 @@ exclusive) and re-query — expect an `IndexRebuilding` error, not `[]`.
    any workspace without the optional tree-sitter `parsers` extra, and treating it
    as a rebuild made every code tool fail forever on a perfectly valid workspace.
 
-5. **`zstandard` is not installed**, so `lc code export` uses an lzma fallback.
-   Functional, larger archives. Not a bug.
-
 ---
 
 ## Also worth knowing

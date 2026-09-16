@@ -694,7 +694,7 @@ def test_the_mcp_tool_lets_stale_propagate_rather_than_calling_it_a_bad_argument
 
 
 def test_the_cli_reports_an_unindexed_workspace_without_a_traceback(tmp_path: Path) -> None:
-    """Matches `lc code export` / `import`, which sit directly above it."""
+    """An unindexed workspace is a state the user can act on, so it gets a message, not a traceback."""
     from click.testing import CliRunner
 
     from lemoncrow.gateway.cli.commands.code import code_group
