@@ -243,6 +243,38 @@ def test_pr_risk_does_not_claim_an_exhaustive_zero_for_an_unindexed_file(tmp_pat
     assert "reason" not in indexed["factors"]["blast_radius"]
     assert indexed["factors"]["test_gap"]["missing_tests"] is True
 
+    # The envelope reports the mix honestly: one row it could not read makes the
+    # whole answer partial, while a tier is still earned from the row it could.
+    assert result["objective"] == "partial"
+    assert result["overall_tier"] != "unknown"
+
+
+def test_envelope_reports_unknown_when_nothing_could_be_read(tmp_path: Path) -> None:
+    """A report made only of unreadable files must not headline a verdict.
+
+    Each such file scores 0.0, so the maximum over them is 0.0 and the tier table
+    calls that "low" -- the envelope announcing exactly what every row beneath it
+    declines to say. The per-file downgrade made this quieter rather than louder:
+    dropping the unearned test-gap penalty lowered the score the headline reads.
+    """
+    repo = tmp_path / "repo"
+    cache = tmp_path / "cache"
+    _write_graph(repo)
+    _index_all(repo, cache)
+    _index_repo(repo)
+    # Added after the index was built, and the only path asked about.
+    (repo / "src" / "brand_new.py").write_text("def new_fn() -> int:\n    return 1\n", encoding="utf-8")
+
+    result = pr_risk(repo_root=repo, lemoncrow_root=cache, paths=["src/brand_new.py"])
+
+    assert result["objective"] == "partial"
+    assert result["overall_tier"] == "unknown"
+    assert result["files"][0]["objective"] == "partial"
+    # The score is deliberately not asserted to be zero: complexity still reads
+    # the file itself, so a small number is correct. What must not happen is that
+    # number being dressed as a verdict by the tier table.
+    assert result["overall_score"] > 0.0
+
 
 def test_code_health_seam_resolves_a_relative_root_against_the_workspace(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

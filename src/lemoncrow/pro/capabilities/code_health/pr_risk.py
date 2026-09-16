@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.infra.code_intel.completeness import OBJECTIVE_PARTIAL
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE, OBJECTIVE_PARTIAL
 from lemoncrow.infra.code_intel.file_graph import FileGraph, open_file_graph
 from lemoncrow.infra.code_intel.freshness import IndexRebuilding
 from lemoncrow.infra.code_intel.store import CodeIntelUnavailable
@@ -271,10 +271,16 @@ def pr_risk(
             if graph is not None:
                 graph.close()
         overall = round(max((f["score"] for f in per_file), default=0.0), 4)
+        # The envelope has to be as honest as the rows beneath it. A file nothing
+        # was read about scores 0.0, so a report made only of those would
+        # otherwise headline "low" -- a verdict reached without reading anything,
+        # and the quieter for admitting per file that it could not look.
+        partial = [f for f in per_file if f["objective"] == OBJECTIVE_PARTIAL]
         return {
             "kind": "pr_risk",
             "overall_score": overall,
-            "overall_tier": _tier_for(overall),
+            "overall_tier": "unknown" if partial and len(partial) == len(per_file) else _tier_for(overall),
+            "objective": OBJECTIVE_PARTIAL if partial else OBJECTIVE_EXHAUSTIVE,
             "file_count": len(per_file),
             "files": sorted(per_file, key=lambda f: -float(f["score"])),
             "weights": {
