@@ -8767,6 +8767,14 @@ _PRO_CODE_PATH_MODULES: tuple[str, ...] = (
     "lemoncrow.pro.capabilities.scoped_context",
     "lemoncrow.pro.capabilities.lesson_promotion",
     "lemoncrow.pro.capabilities.tool_supervision.tool_output_spill",
+    # The review_* tools import these on a request thread, so warming only the
+    # code-context group still leaves the first review call after start-up
+    # racing a half-built mypyc group (PRD-739 FR13).
+    "lemoncrow.pro.capabilities.review.gitdiff",
+    "lemoncrow.pro.capabilities.review.rationale",
+    "lemoncrow.pro.capabilities.review.evidence_capture",
+    "lemoncrow.pro.capabilities.review.delivery",
+    "lemoncrow.pro.capabilities.review.store",
 )
 _pro_import_lock: threading.RLock = threading.RLock()
 _pro_modules_warmed = False

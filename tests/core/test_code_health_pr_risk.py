@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from lemoncrow.pro.capabilities.code_context.engine import CodeContextEngine
 from lemoncrow.pro.capabilities.code_health.pr_risk import (
     classify_commit_message,
     commit_provenance,
@@ -53,11 +54,17 @@ def _index_all(repo: Path, cache_root: Path) -> None:
         cap.summarize_file(py)
 
 
+def _index_repo(repo: Path) -> None:
+    """Build the repo's own code index -- where the blast radius now comes from."""
+    CodeContextEngine(repo).index_repo()
+
+
 def test_pr_risk_rises_with_blast_radius_and_missing_tests(tmp_path: Path) -> None:
     repo = tmp_path / "repo"
     cache = tmp_path / "cache"
     _write_graph(repo)
     _index_all(repo, cache)
+    _index_repo(repo)
 
     high = pr_risk(repo_root=repo, lemoncrow_root=cache, paths=["src/base.py"])
     low = pr_risk(repo_root=repo, lemoncrow_root=cache, paths=["src/lonely.py"])
@@ -90,12 +97,84 @@ def test_pr_risk_test_gap_lowers_score_when_tests_present(tmp_path: Path) -> Non
     for py in sorted((repo / "src").glob("*.py")):
         cap.summarize_file(py)
     cap.summarize_file(tests / "test_base.py")
+    _index_repo(repo)
 
     result = pr_risk(repo_root=repo, lemoncrow_root=cache, paths=["src/base.py"])
     base_file = result["files"][0]
     # The linked test is discovered, so the test-gap penalty is gone.
     assert base_file["factors"]["test_gap"]["missing_tests"] is False
     assert base_file["factors"]["test_gap"]["factor"] == 0.0
+
+
+def test_pr_risk_blast_uses_repo_import_graph(tmp_path: Path) -> None:
+    """FR12: the blast radius reads this repository's index, not a machine-wide one.
+
+    ``repo_b`` sits beside ``repo_a`` and imports ``repo_a.base``. The semantic
+    file index both are summarised into is keyed by absolute path and resolves
+    that import to repo_a's file, so the old implementation counted repo_b's
+    module as an importer -- and repo_b's *test* as coverage, clearing a test
+    gap repo_a genuinely has.
+    """
+    from lemoncrow.pro.capabilities.semantic_file_memory import SemanticFileMemoryCapability
+
+    cache = tmp_path / "cache"
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    repo_a.mkdir()
+    repo_b.mkdir()
+    (repo_a / "base.py").write_text("def base_fn(x: int) -> int:\n    return x\n", encoding="utf-8")
+    (repo_a / "local.py").write_text(
+        "from base import base_fn\n\ndef local_fn(x: int) -> int:\n    return base_fn(x)\n",
+        encoding="utf-8",
+    )
+    (repo_b / "other.py").write_text(
+        "from repo_a.base import base_fn\n\ndef other_fn(x: int) -> int:\n    return base_fn(x)\n",
+        encoding="utf-8",
+    )
+    (repo_b / "test_other.py").write_text(
+        "from repo_a.base import base_fn\n\ndef test_other() -> None:\n    assert base_fn(1) == 1\n",
+        encoding="utf-8",
+    )
+    for repo in (repo_a, repo_b):
+        _index_repo(repo)
+
+    # One machine-wide index spanning both repositories -- the state the old
+    # implementation read, and the reason this test needs two of them.
+    cap = SemanticFileMemoryCapability(cache)
+    for path in (repo_a / "base.py", repo_a / "local.py", repo_b / "other.py", repo_b / "test_other.py"):
+        cap.summarize_file(path)
+    leaked = cap.change_impact(str(repo_a / "base.py"))
+    assert any(
+        "repo_b" in importer for importer in leaked["direct_importers"]
+    ), "fixture no longer reproduces the cross-repository leak this test guards"
+
+    scored = pr_risk(repo_root=repo_a, lemoncrow_root=cache, paths=["base.py"])["files"][0]
+    blast = scored["factors"]["blast_radius"]
+
+    assert blast["impacted_files"] == 1  # repo_a/local.py, and nothing from repo_b
+    assert not any("repo_b" in str(entry) for entry in blast["affected_tests"])
+    assert scored["factors"]["test_gap"]["missing_tests"] is True
+    assert scored["objective"] == "exhaustive"
+    assert scored["truncated"] is False
+
+
+def test_pr_risk_degrades_when_the_index_is_unavailable(tmp_path: Path) -> None:
+    """An unindexed repo costs the blast factor, not the report.
+
+    ``open_file_graph`` raises rather than analysing nothing, which is right for
+    an enumerative tool. pr_risk's contract is fail-open per factor, so the
+    raise must not reach the caller.
+    """
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "base.py").write_text("def base_fn() -> int:\n    return 1\n", encoding="utf-8")
+
+    scored = pr_risk(repo_root=repo, lemoncrow_root=tmp_path / "cache", paths=["base.py"])["files"][0]
+
+    assert scored["objective"] == "partial"
+    assert scored["factors"]["blast_radius"]["impacted_files"] == 0
+    assert scored["factors"]["blast_radius"]["factor"] == 0.0
+    assert "reason" in scored["factors"]["blast_radius"]
 
 
 def test_pr_risk_empty_paths_yields_zero_fail_open(tmp_path: Path) -> None:

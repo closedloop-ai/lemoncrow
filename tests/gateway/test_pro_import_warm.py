@@ -26,6 +26,7 @@ suite test.
 
 from __future__ import annotations
 
+import importlib
 import threading
 from typing import Any
 
@@ -51,6 +52,25 @@ def cold(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 def test_warm_imports_every_module_on_the_code_path(cold: list[str]) -> None:
     mcp_server._warm_pro_code_modules()
     assert cold == list(mcp_server._PRO_CODE_PATH_MODULES)
+
+
+def test_review_modules_are_warmed() -> None:
+    """FR13: the review surface builds at start-up, not on the first request thread.
+
+    The names are imported for real because ``_warm_pro_code_modules`` swallows a
+    failed import: a misspelt module would warm nothing and say nothing.
+    """
+    review_modules = [
+        "lemoncrow.pro.capabilities.review.gitdiff",
+        "lemoncrow.pro.capabilities.review.rationale",
+        "lemoncrow.pro.capabilities.review.evidence_capture",
+        "lemoncrow.pro.capabilities.review.delivery",
+        "lemoncrow.pro.capabilities.review.store",
+    ]
+
+    assert set(review_modules) <= set(mcp_server._PRO_CODE_PATH_MODULES)
+    for name in review_modules:
+        importlib.import_module(name)
 
 
 def test_warm_runs_once(cold: list[str]) -> None:

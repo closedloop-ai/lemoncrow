@@ -2,16 +2,18 @@
 
 Two read-only, fail-open analyses over the existing substrate:
 
-* :func:`pr_risk` -- fuse blast-radius (``change_impact``), per-file complexity,
-  git churn, and a test-gap signal into a single 0..1 risk score with a tier and
-  the contributing factors. Higher blast radius, higher churn, missing affected
-  tests, and higher complexity all push the score up.
+* :func:`pr_risk` -- fuse blast-radius (the repository's own import graph),
+  per-file complexity, git churn, and a test-gap signal into a single 0..1 risk
+  score with a tier and the contributing factors. Higher blast radius, higher
+  churn, missing affected tests, and higher complexity all push the score up.
 * :func:`commit_provenance` -- classify the commits touching a file/symbol into
   ``bugfix`` / ``refactor`` / ``feature`` / ``perf`` / ``rename`` / ``revert`` /
   ``docs`` / ``test`` / ``chore`` from commit-message + touched-file heuristics.
   Honest: heuristic classification with a tagged 0..1 confidence per commit.
 
-Nothing here mutates state. Git access is via the existing
+The complexity factor summarises the file into the machine-wide semantic index,
+so :func:`pr_risk` writes and stays refused through the read-only tool broker
+(PRD-739 FR4). Git access is via the existing
 :mod:`lemoncrow.pro.code_intel.git_history` walker / pygit2 bootstrap and is
 guarded so a non-git or pygit2-less environment degrades to a churn of 0 rather
 than raising.
@@ -25,7 +27,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from lemoncrow.pro.capabilities.semantic_file_memory.graph_analytics import _is_test_path
+from lemoncrow.infra.code_intel.completeness import OBJECTIVE_PARTIAL
+from lemoncrow.infra.code_intel.file_graph import FileGraph, open_file_graph
+from lemoncrow.infra.code_intel.freshness import IndexRebuilding
+from lemoncrow.infra.code_intel.store import CodeIntelUnavailable
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +128,40 @@ def _file_complexity(cap: Any, file_path: str, repo_root: Path) -> int:
     return 0
 
 
+def _blast_radius_for(graph: FileGraph | None, unavailable: str | None, abs_path: Path) -> dict[str, Any]:
+    """One file's blast radius from *graph*, or the no-data shape when there is none.
+
+    ``open_file_graph`` fails loud on an absent or mid-rebuild index, which is
+    right for an enumerative tool and wrong here: every other factor already
+    degrades on its own, and an index that is merely being rebuilt must cost the
+    blast factor rather than the whole risk report. So a missing graph reads as
+    no data -- no importers, no affected tests, ``partial`` -- with the reason
+    carried beside it.
+    """
+    if graph is None:
+        return {
+            "impacted_files": 0,
+            "affected_tests": [],
+            "missing_tests": True,
+            "risk_level": "low",
+            "objective": OBJECTIVE_PARTIAL,
+            "truncated": False,
+            "reason": unavailable,
+        }
+    result = graph.blast_radius(str(abs_path))
+    return {
+        "impacted_files": int(result["direct_importer_count"]) + int(result["transitive_importer_count"]),
+        "affected_tests": list(result["affected_tests"]),
+        # The count is exact and taken before the lists are cut, so a file with
+        # more affected tests than the cap still reads as covered.
+        "missing_tests": int(result["affected_test_count"]) == 0,
+        "risk_level": str(result["risk_level"]),
+        "objective": str(result["objective"]),
+        "truncated": bool(result["truncated"]),
+        "reason": result.get("reason"),
+    }
+
+
 def pr_risk(
     *,
     repo_root: Path,
@@ -135,56 +174,76 @@ def pr_risk(
     *paths* are the changed files (relative to ``repo_root`` or absolute). Each
     file is scored independently and the overall PR score is the max of the
     per-file scores (the riskiest file dominates a review).
+
+    Blast radius comes from ``repo_root``'s own import graph. It used to come
+    from the machine-wide semantic file index, which spans every repository
+    ``summarize_file`` has ever touched: a sibling checkout importing this
+    repository's module counted as an importer, and one of *that* checkout's
+    tests could clear this file's test gap (PRD-739 FR12).
     """
     from lemoncrow.pro.capabilities.semantic_file_memory import SemanticFileMemoryCapability
 
     try:
         cap = SemanticFileMemoryCapability(lemoncrow_root)
-        per_file: list[dict[str, Any]] = []
-        for raw in paths:
-            abs_path = Path(raw) if Path(raw).is_absolute() else repo_root / raw
-            # Fold the file (and thereby its importers, if present) into the index.
-            if abs_path.is_file():
-                cap.summarize_file(abs_path)
-            impact = cap.change_impact(str(abs_path))
-            impact_total = len(impact.get("direct_importers", [])) + len(impact.get("transitive_importers", []))
-            # Re-derive affected tests with the robust component-based test
-            # detector rather than change_impact's loose substring filter, so a
-            # working directory that merely contains "test" (e.g. a tmp dir named
-            # ``test_run0/``) cannot mask a genuine test gap.
-            importers = list(impact.get("direct_importers", [])) + list(impact.get("transitive_importers", []))
-            affected_tests = [f for f in importers if _is_test_path(f)]
-            test_gap = 1.0 if not affected_tests else 0.0
-            complexity = _file_complexity(cap, raw, repo_root)
-            churn = _file_churn_score(repo_root, str(abs_path), window_days=window_days)
+        graph: FileGraph | None = None
+        degraded: str | None = None
+        if paths:
+            try:
+                graph = open_file_graph(repo_root)
+            except (IndexRebuilding, CodeIntelUnavailable) as exc:
+                degraded = str(exc)
+        try:
+            per_file: list[dict[str, Any]] = []
+            for raw in paths:
+                abs_path = Path(raw) if Path(raw).is_absolute() else repo_root / raw
+                # Seeds the complexity lookup below. The blast radius no longer
+                # reads this index, but the write is still a write, which is why
+                # pr_risk stays refused through the read-only broker.
+                if abs_path.is_file():
+                    cap.summarize_file(abs_path)
+                blast = _blast_radius_for(graph, degraded, abs_path)
+                impact_total = int(blast["impacted_files"])
+                affected_tests = list(blast["affected_tests"])
+                missing_tests = bool(blast["missing_tests"])
+                test_gap = 1.0 if missing_tests else 0.0
+                complexity = _file_complexity(cap, raw, repo_root)
+                churn = _file_churn_score(repo_root, str(abs_path), window_days=window_days)
 
-            blast_f = _blast_factor(impact_total)
-            complexity_f = _complexity_factor(complexity)
-            churn_f = float(churn["score"])
-            score = _W_BLAST * blast_f + _W_CHURN * churn_f + _W_TESTGAP * test_gap + _W_COMPLEXITY * complexity_f
-            score = round(min(1.0, score), 4)
-            per_file.append(
-                {
-                    "path": raw,
-                    "score": score,
-                    "tier": _tier_for(score),
-                    "factors": {
-                        "blast_radius": {
-                            "impacted_files": impact_total,
-                            "affected_tests": affected_tests,
-                            "factor": round(blast_f, 4),
-                        },
-                        "churn": {
-                            "commit_count": churn["commit_count"],
-                            "factor": round(churn_f, 4),
-                            "available": churn["available"],
-                        },
-                        "test_gap": {"missing_tests": not affected_tests, "factor": test_gap},
-                        "complexity": {"score": complexity, "factor": round(complexity_f, 4)},
-                    },
-                    "risk_level": impact.get("risk_level", "low"),
+                blast_f = _blast_factor(impact_total)
+                complexity_f = _complexity_factor(complexity)
+                churn_f = float(churn["score"])
+                score = _W_BLAST * blast_f + _W_CHURN * churn_f + _W_TESTGAP * test_gap + _W_COMPLEXITY * complexity_f
+                score = round(min(1.0, score), 4)
+                blast_factors: dict[str, Any] = {
+                    "impacted_files": impact_total,
+                    "affected_tests": affected_tests,
+                    "factor": round(blast_f, 4),
                 }
-            )
+                if blast["reason"] is not None:
+                    blast_factors["reason"] = blast["reason"]
+                per_file.append(
+                    {
+                        "path": raw,
+                        "score": score,
+                        "tier": _tier_for(score),
+                        "factors": {
+                            "blast_radius": blast_factors,
+                            "churn": {
+                                "commit_count": churn["commit_count"],
+                                "factor": round(churn_f, 4),
+                                "available": churn["available"],
+                            },
+                            "test_gap": {"missing_tests": missing_tests, "factor": test_gap},
+                            "complexity": {"score": complexity, "factor": round(complexity_f, 4)},
+                        },
+                        "risk_level": blast["risk_level"],
+                        "objective": blast["objective"],
+                        "truncated": blast["truncated"],
+                    }
+                )
+        finally:
+            if graph is not None:
+                graph.close()
         overall = round(max((f["score"] for f in per_file), default=0.0), 4)
         return {
             "kind": "pr_risk",
