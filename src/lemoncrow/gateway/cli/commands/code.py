@@ -822,7 +822,7 @@ def _entry_age_days(entry: Path, now: float) -> float:
     return max(0.0, (now - newest) / 86_400.0)
 
 
-def _portable_repo_root(repo_root: str | None) -> Path:
+def _resolve_repo_root(repo_root: str | None) -> Path:
     if repo_root is not None:
         return Path(repo_root).expanduser().resolve()
     from lemoncrow.core.foundation.paths import resolve_workspace_root
@@ -875,7 +875,7 @@ def code_clones_cmd(
 
     try:
         report = build_clones(
-            repo_root=_portable_repo_root(repo_root),
+            repo_root=_resolve_repo_root(repo_root),
             threshold=DEFAULT_THRESHOLD if threshold is None else threshold,
             min_tokens=MIN_TOKENS if min_tokens is None else min_tokens,
         )

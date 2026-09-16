@@ -448,9 +448,9 @@ that would read as "this code has no duplicates".
 `lc code` subcommands that packed a workspace's index into an archive and
 restored it — and removed again under PRD-739 FR15 (PLN-2027 PR 7): the fork
 added the surface, upstream never shipped it, and nothing consumed it. The
-delivery notes, the two deviations recorded against them, and the archive's
-untrusted-input handling went with the code; `git show 8235fdaf` still carries
-them.
+code, including the archive's untrusted-input handling, is at `8235fdaf`; the
+delivery notes and the two deviations recorded against them are at
+`git show 8d77d599:docs/planning/open-code-intel-plan.md`.
 
 ---
 
