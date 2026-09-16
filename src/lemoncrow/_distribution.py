@@ -17,3 +17,23 @@ DISTRIBUTION_REPO = "closedloop-ai/lemoncrow"
 
 #: The repository the published release channel (``scripts/install.sh``) serves.
 UPSTREAM_REPO = "lemoncrow-lab/lemoncrow"
+
+
+def is_fork_build() -> bool:
+    """True when a release installs a different repository than this build came from.
+
+    Lives here, not next to either caller: ``lc update`` and the servicectl
+    auto-updater both guard on it, and a predicate copied into two modules is the
+    drift the shared constants were pulled up here to end.
+    """
+    return DISTRIBUTION_REPO != UPSTREAM_REPO
+
+
+def fork_update_command() -> str:
+    """The command that updates a fork build, for an operator to paste.
+
+    One cwd for both halves: ``git -C <clone> pull`` would leave ``bash
+    scripts/local.sh`` resolving against wherever the operator is standing, and
+    by construction they are not in the clone when this prints.
+    """
+    return f"cd <your {DISTRIBUTION_REPO} clone> && git pull && bash scripts/local.sh"
