@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from lemoncrow.core.foundation._graph import DiGraph
-
 from lemoncrow.infra.code_intel.inclusion import (
     load_lemoncrow_ignore_spec,
     scan_selects,
