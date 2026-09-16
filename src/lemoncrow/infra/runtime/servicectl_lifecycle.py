@@ -437,9 +437,7 @@ def _git_project_root() -> Path | None:
 
 # Distribution channel. Both constants come from ``lemoncrow._distribution``, so
 # this module and ``lemoncrow.gateway.cli.commands.update`` cannot disagree about
-# which repository a release update installs. They used to hold the same literal
-# twice under a comment asking the next reader to keep them in step by hand, and
-# update.py stopped holding a literal at all.
+# which repository a release update installs.
 try:
     from lemoncrow._distribution import DISTRIBUTION_REPO, UPSTREAM_REPO
 except ModuleNotFoundError:

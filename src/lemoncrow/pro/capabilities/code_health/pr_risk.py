@@ -53,10 +53,10 @@ def _tier_for(score: float) -> str:
 
 
 def _blast_factor(impact_total: int) -> float:
-    """Map blast-radius file count to 0..1 with diminishing returns.
+    """Map blast-radius file count to 0..1, saturating at 10 files.
 
-    0 -> 0.0, 1 -> 0.2, 3 -> ~0.5, >=10 -> ~1.0. A log-ish saturating curve so a
-    single importer registers risk without one huge fan-out pinning everything.
+    0 -> 0.0, 1 -> 0.1, 3 -> 0.3, >=10 -> 1.0: linear in the file count up to the
+    cap, so one huge fan-out cannot pin every score at the ceiling.
     """
     if impact_total <= 0:
         return 0.0
@@ -134,9 +134,7 @@ def _blast_radius_for(graph: FileGraph | None, unavailable: str | None, abs_path
     ``open_file_graph`` fails loud on an absent or mid-rebuild index, which is
     right for an enumerative tool and wrong here: every other factor already
     degrades on its own, and an index that is merely being rebuilt must cost the
-    blast factor rather than the whole risk report. So a missing graph reads as
-    no data -- no importers, no affected tests, ``partial`` -- with the reason
-    carried beside it.
+    blast factor rather than the whole risk report.
     """
     if graph is None:
         return {
