@@ -57,6 +57,11 @@ def _blast_factor(impact_total: int) -> float:
 
     0 -> 0.0, 1 -> 0.1, 3 -> 0.3, >=10 -> 1.0: linear in the file count up to the
     cap, so one huge fan-out cannot pin every score at the ceiling.
+
+    Open question: the prose this docstring replaced asked for a saturating curve
+    where a single importer already registers 0.2, and the shipped map has never
+    been that. Changing the shape moves every score across the tier boundaries,
+    so which of the two is wanted is the operator's call, not this change's.
     """
     if impact_total <= 0:
         return 0.0
@@ -128,6 +133,25 @@ def _file_complexity(cap: Any, file_path: str, repo_root: Path) -> int:
     return 0
 
 
+def _no_blast_data(reason: str | None) -> dict[str, Any]:
+    """The shape for a file nothing was read about, claiming nothing.
+
+    ``missing_tests`` is None rather than True: a test gap nobody looked for is
+    not a test gap, and scoring it as one is a penalty applied for ignorance.
+    ``risk_level`` is "unknown" for the same reason -- "low" is a verdict, and no
+    closure was walked to reach it.
+    """
+    return {
+        "impacted_files": 0,
+        "affected_tests": [],
+        "missing_tests": None,
+        "risk_level": "unknown",
+        "objective": OBJECTIVE_PARTIAL,
+        "truncated": False,
+        "reason": reason,
+    }
+
+
 def _blast_radius_for(graph: FileGraph | None, unavailable: str | None, abs_path: Path) -> dict[str, Any]:
     """One file's blast radius from *graph*, or the no-data shape when there is none.
 
@@ -135,18 +159,19 @@ def _blast_radius_for(graph: FileGraph | None, unavailable: str | None, abs_path
     right for an enumerative tool and wrong here: every other factor already
     degrades on its own, and an index that is merely being rebuilt must cost the
     blast factor rather than the whole risk report.
+
+    There are two ways to have no data and only one of them is the missing index.
+    ``blast_radius`` answers for a path it has never seen -- zero importers, zero
+    tests -- and stamps the import table's own ``exhaustive`` on it, so a file the
+    index does not hold reads exactly like one nothing imports. A PR that adds a
+    file is what pr_risk is for, which makes that the common case, so ``indexed``
+    decides the objective per file rather than the table deciding it for all.
     """
     if graph is None:
-        return {
-            "impacted_files": 0,
-            "affected_tests": [],
-            "missing_tests": True,
-            "risk_level": "low",
-            "objective": OBJECTIVE_PARTIAL,
-            "truncated": False,
-            "reason": unavailable,
-        }
+        return _no_blast_data(unavailable)
     result = graph.blast_radius(str(abs_path))
+    if not bool(result["indexed"]):
+        return _no_blast_data("file not in the code index")
     return {
         "impacted_files": int(result["direct_importer_count"]) + int(result["transitive_importer_count"]),
         "affected_tests": list(result["affected_tests"]),
@@ -188,21 +213,24 @@ def pr_risk(
         if paths:
             try:
                 graph = open_file_graph(repo_root)
-            except (IndexRebuilding, CodeIntelUnavailable) as exc:
-                degraded = str(exc)
+            except IndexRebuilding as exc:
+                # Two conditions, not one: a rebuilding index answers this same
+                # call properly in a moment, an absent one needs building. That
+                # is why IndexRebuilding deliberately does not subclass
+                # CodeIntelUnavailable, and the reason has to keep them apart.
+                degraded = f"code index is rebuilding: {exc}"
+            except CodeIntelUnavailable as exc:
+                degraded = f"code index unavailable: {exc}"
         try:
             per_file: list[dict[str, Any]] = []
             for raw in paths:
                 abs_path = Path(raw) if Path(raw).is_absolute() else repo_root / raw
-                # Seeds the complexity lookup below. The blast radius no longer
-                # reads this index, but the write is still a write, which is why
-                # pr_risk stays refused through the read-only broker.
-                if abs_path.is_file():
-                    cap.summarize_file(abs_path)
                 blast = _blast_radius_for(graph, degraded, abs_path)
                 impact_total = int(blast["impacted_files"])
                 affected_tests = list(blast["affected_tests"])
-                missing_tests = bool(blast["missing_tests"])
+                # None where nothing was read: falsy, so an unknown gap adds no
+                # penalty, and distinguishable from a gap that was looked for.
+                missing_tests = blast["missing_tests"]
                 test_gap = 1.0 if missing_tests else 0.0
                 complexity = _file_complexity(cap, raw, repo_root)
                 churn = _file_churn_score(repo_root, str(abs_path), window_days=window_days)
