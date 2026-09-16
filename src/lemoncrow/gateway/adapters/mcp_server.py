@@ -3623,6 +3623,10 @@ def tool_review_rationale(
         raise ValueError("review_rationale currently requires an exact Claude Code session")
     workspace = _workspace_root()
     active_root = _session_worktree_root(workspace) or workspace
+    # The review group is in the mypyc bundle the daemon warms at start-up, and
+    # this import runs on a request thread. Entering it without the lock is the
+    # race the warm list exists to close (PRD-739 FR13).
+    _warm_pro_code_modules()
     from lemoncrow.core.foundation.paths import default_store_root
     from lemoncrow.pro.capabilities.review.gitdiff import detect_repo_root
     from lemoncrow.pro.capabilities.review.rationale import record_author_rationales
@@ -3669,6 +3673,7 @@ def tool_review_evidence(
         raise ValueError("review_evidence currently requires an exact Claude Code session")
     workspace = _workspace_root()
     active_root = _session_worktree_root(workspace) or workspace
+    _warm_pro_code_modules()
     from lemoncrow.core.foundation.paths import default_store_root
     from lemoncrow.pro.capabilities.review.evidence_capture import record_agent_evidence
     from lemoncrow.pro.capabilities.review.gitdiff import detect_repo_root
@@ -3713,6 +3718,7 @@ def tool_review_feedback_addressed(
         raise ValueError("review_feedback_addressed currently requires an exact Claude Code session")
     workspace = _workspace_root()
     active_root = _session_worktree_root(workspace) or workspace
+    _warm_pro_code_modules()
     from lemoncrow.core.foundation.paths import default_store_root
     from lemoncrow.pro.capabilities.review.delivery import mark_feedback_addressed
     from lemoncrow.pro.capabilities.review.gitdiff import detect_repo_root
@@ -9407,8 +9413,7 @@ def _op_graph_code_health(
         verify_design,
     )
 
-    workspace = _workspace_root()
-    repo = (Path(repo_root) if repo_root else workspace).resolve()
+    repo = _code_repo_root(repo_root)
     lemoncrow_root = _lemoncrow_root()
 
     if kind == "design_gaps":

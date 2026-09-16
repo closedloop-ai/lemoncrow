@@ -73,6 +73,31 @@ def test_review_modules_are_warmed() -> None:
         importlib.import_module(name)
 
 
+@pytest.mark.parametrize(
+    "handler",
+    [
+        mcp_server.tool_review_rationale,
+        mcp_server.tool_review_evidence,
+        mcp_server.tool_review_feedback_addressed,
+    ],
+)
+def test_review_tools_warm_before_they_import(handler: Any) -> None:
+    """FR13: the entry points take the lock, or the warm list is not a fix.
+
+    The stdio path warms on the main thread before the reader starts, but the
+    HTTP daemon starts serving while ``_warm_daemon``'s thread is still building
+    the group. A review request arriving in that window enters the same mypyc
+    group from a request thread -- and listing the review modules for the warm is
+    what gives that thread a concurrent importer to collide with.
+    """
+    import inspect
+
+    source = inspect.getsource(handler)
+    warm_at = source.index("_warm_pro_code_modules()")
+    import_at = source.index("from lemoncrow.pro.capabilities.review")
+    assert warm_at < import_at
+
+
 def test_warm_runs_once(cold: list[str]) -> None:
     """Steady state must be a bool read, not a repeated import sweep."""
     mcp_server._warm_pro_code_modules()
