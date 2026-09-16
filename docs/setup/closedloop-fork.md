@@ -29,8 +29,10 @@ lc update --check --json
 ```
 
 `distribution` names the repository the build came from; on the fork build it is
-`closedloop-ai/lemoncrow`. (Both checks need network: the command asks GitHub
-for the latest release.)
+`closedloop-ai/lemoncrow`, and `method` is `git` — a clone install updates from
+the clone. The check needs network, but it reaches the fork: it runs `git fetch`
+against the clone's own `origin`. Only a release install asks the GitHub
+releases API, which serves upstream.
 
 Then list LemonCrow's tools in your host — in Claude Code, `/mcp`, then
 `lemoncrow`. The fork build advertises `code_query`, `code_changes`,
@@ -45,8 +47,11 @@ From the clone:
 git pull && bash scripts/local.sh
 ```
 
-`lc update` does the same thing on a git checkout: it pulls the clone's own
-`origin` — the fork — and re-syncs. That path is unchanged.
+`lc update` pulls that same `origin` — the fork — and syncs the clone's `.venv`,
+and the refusal below never applies to it. It stops there, though: the installed
+`lc` is a snapshot copy of the clone, so it keeps running the old code — while
+reporting the new version — until `scripts/local.sh` reinstalls it. Re-run both
+commands above to move the running `lc`.
 
 On a **release** install, `lc update` re-runs upstream's published `install.sh`,
 which would replace the fork build. It now refuses first:
