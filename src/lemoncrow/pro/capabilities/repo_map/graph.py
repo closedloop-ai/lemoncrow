@@ -9,8 +9,6 @@ from typing import Any
 
 from lemoncrow.core.foundation._graph import DiGraph
 
-# The index's file-selection rules live in infra, and both the scan below and
-# the incremental entry point call down into them -- see inclusion.py.
 from lemoncrow.infra.code_intel.inclusion import (
     load_lemoncrow_ignore_spec,
     scan_selects,

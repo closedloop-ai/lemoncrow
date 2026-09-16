@@ -193,9 +193,8 @@ def _index_selection(root: Path) -> _IndexSelection:
     Mirrors ``CodeContextEngine._index_repo_unsafe`` with no ``exclude_globs``:
     the same :func:`iter_source_files` call, then, without the
     ``context_engine`` feature, the same :func:`free_tier_selection` over it.
-    The scan and the cap value are the engine's, read from it rather than
-    reproduced here. Imported lazily, because the scan lists and pattern-matches
-    every git-visible file and only runs when a queried path is not indexed.
+    Imported lazily, because the scan lists and pattern-matches every
+    git-visible file and only runs when a queried path is not indexed.
     """
     from lemoncrow.core.capabilities import licensing
     from lemoncrow.pro.capabilities.repo_map.graph import iter_source_files

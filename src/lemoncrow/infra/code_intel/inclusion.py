@@ -112,7 +112,6 @@ def should_skip_path(path: Path, *, repo_root: Path | None = None) -> bool:
 
 
 def _build_source_file_patterns() -> tuple[str, ...]:
-    """Glob patterns for every language in the canonical registry."""
     seen: set[str] = set()
     patterns: list[str] = []
     for lang in LANGUAGES:
@@ -129,8 +128,8 @@ def _build_source_file_patterns() -> tuple[str, ...]:
     return tuple(patterns)
 
 
-#: The scan's default patterns. A frozen registry makes this constant, and the
-#: per-path rule ladder consults it once per candidate.
+#: Built once at import: the language registry is frozen, and the rule ladder
+#: consults these patterns on every candidate path.
 SOURCE_FILE_PATTERNS: tuple[str, ...] = _build_source_file_patterns()
 
 

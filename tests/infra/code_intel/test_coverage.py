@@ -181,11 +181,6 @@ def test_rebuilding_index_raises(make_workspace: WorkspaceFactory, tear_index: C
         check_coverage(paths=["src/a.py"], repo_root=root)
 
 
-# --------------------------------------------------------------------------- #
-# excluded vs missing: the indexer's own file-selection rules
-# --------------------------------------------------------------------------- #
-
-
 def _index_one_file(workspace_root: Path, make_workspace: WorkspaceFactory) -> Path:
     """A ready index holding one real file, so the verdict under test is a rule, not readiness."""
     row = _write(workspace_root, "src/a.py", "def alpha():\n    return 1\n")
@@ -236,7 +231,6 @@ def test_free_tier_cap_reports_excluded(workspace_root: Path, monkeypatch: pytes
     ]
     assert (report.paths[2].rule, report.paths[2].reason) == ("free-tier-file-cap", "free-tier file cap")
 
-    # Uncapped, the same unindexed file is simply not in the last index run.
     monkeypatch.setattr("lemoncrow.core.capabilities.licensing.has_feature", lambda _feature: True)
     (entry,) = check_coverage(paths=["src/c.py"], repo_root=workspace_root).paths
     assert (entry.state, entry.reason) == ("missing", "not in the last index run (an index-time exclude may apply)")
@@ -303,10 +297,6 @@ def test_verdicts_agree_with_iter_source_files(workspace_root: Path) -> None:
     assert _state_of(report, "src/app.py") == "indexed"
     assert _state_of(report, "src/new.py") == "missing"
 
-
-# --------------------------------------------------------------------------- #
-# the other direction: the index holds nothing the report calls excluded
-# --------------------------------------------------------------------------- #
 
 _NESTED_WORKTREE = ".claude/worktrees/wt/src/app.py"
 
