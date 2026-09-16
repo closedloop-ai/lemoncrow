@@ -4219,11 +4219,14 @@ class CodeContextEngine:
             if not self._excluded(path, exclude_globs or [])
         ]
         from lemoncrow.core.capabilities import licensing
+        from lemoncrow.infra.code_intel.inclusion import free_tier_selection
 
         capped = False
-        if not licensing.has_feature("context_engine") and len(all_files) > _FREE_TIER_MAX_FILES:
-            all_files = sorted(all_files)[:_FREE_TIER_MAX_FILES]
-            capped = True
+        if not licensing.has_feature("context_engine"):
+            kept = free_tier_selection(all_files, cap=_FREE_TIER_MAX_FILES)
+            capped = len(kept) != len(all_files)
+            all_files = kept
+        if capped:
             logger.warning(
                 "context_engine: repo exceeds the Free-tier cap of %d files; indexing the first %d only "
                 "(LemonCrow Pro removes this cap)",

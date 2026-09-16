@@ -26,7 +26,10 @@ at it: an on-disk path the index does not hold is ``missing`` exactly when
 :func:`~lemoncrow.pro.capabilities.repo_map.graph.iter_source_files` selects it
 and the free-tier cap would keep it. One rule cannot be read back:
 ``exclude_globs`` passed to an index run are not persisted, so a path they kept
-out reports ``missing``, with a reason saying an index-time exclude may apply.
+out reports ``missing``, with a reason saying an index-time exclude may apply --
+or ``excluded`` under ``free-tier-file-cap`` when that cap is engaged too, since
+the cap is counted here over the whole scan where the index run counted it over
+what the excludes left.
 
 Both directions hold, because the index applies these same rules on the way in
 (:mod:`lemoncrow.infra.code_intel.inclusion`, on each of its two entry points):
@@ -36,6 +39,7 @@ a path this report calls ``excluded`` has no rows in the index to find.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -44,11 +48,15 @@ from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.freshness import require_ready
 from lemoncrow.infra.code_intel.inclusion import (
     EXCLUSION_RULES,
+    REASON_SOURCE_FILE_SCAN,
     RULE_FREE_TIER_FILE_CAP,
     RULE_SOURCE_FILE_SCAN,
     exclusion_rule,
+    free_tier_selection,
     git_ignored,
+    load_lemoncrow_ignore_spec,
     run_git,
+    source_file_patterns,
 )
 from lemoncrow.infra.code_intel.languages import language_for_path
 from lemoncrow.infra.code_intel.store import CodeIntelStore, FileRow
@@ -184,20 +192,20 @@ def _index_selection(root: Path) -> _IndexSelection:
 
     Mirrors ``CodeContextEngine._index_repo_unsafe`` with no ``exclude_globs``:
     the same :func:`iter_source_files` call, then, without the
-    ``context_engine`` feature, the first ``_FREE_TIER_MAX_FILES`` paths of the
-    sorted scan. Imported lazily, because the scan lists and pattern-matches
+    ``context_engine`` feature, the same :func:`free_tier_selection` over it.
+    The scan and the cap value are the engine's, read from it rather than
+    reproduced here. Imported lazily, because the scan lists and pattern-matches
     every git-visible file and only runs when a queried path is not indexed.
     """
     from lemoncrow.core.capabilities import licensing
-    from lemoncrow.pro.capabilities.repo_map.graph import iter_source_files, load_lemoncrow_ignore_spec
+    from lemoncrow.pro.capabilities.repo_map.graph import iter_source_files
 
     files = iter_source_files(root)
     kept = files
     if not licensing.has_feature("context_engine"):
         from lemoncrow.pro.capabilities.code_context.engine import _FREE_TIER_MAX_FILES
 
-        if len(files) > _FREE_TIER_MAX_FILES:
-            kept = sorted(files)[:_FREE_TIER_MAX_FILES]
+        kept = free_tier_selection(files, cap=_FREE_TIER_MAX_FILES)
     return _IndexSelection(
         selected=_relative_set(root, files),
         kept=_relative_set(root, kept),
@@ -205,16 +213,22 @@ def _index_selection(root: Path) -> _IndexSelection:
     )
 
 
-def _exclusion(rel: str, selection: _IndexSelection, ignored: frozenset[str]) -> tuple[str, str]:
+def _exclusion(
+    rel: str,
+    selection: _IndexSelection,
+    ignored: frozenset[str],
+    patterns: Sequence[str],
+) -> tuple[str, str]:
     """``(rule, reason)`` for an on-disk path the indexer's scan passed over.
 
-    The rules the index itself applies (:func:`exclusion_rule`) name most of
-    them. ``source-file-scan`` is the remainder: the scan passed the path over
-    and none of those rules says why.
+    The rules the index itself applies (:func:`exclusion_rule`) name all of them
+    the index can name, its own glob gate included. The fallback is what is left
+    when the scan passed a path over for a reason no rule sees -- an untracked
+    file inside a submodule, which ``git ls-files --others`` does not recurse.
     """
-    return exclusion_rule(rel, ignore_spec=selection.ignore_spec, ignored=ignored) or (
+    return exclusion_rule(rel, ignore_spec=selection.ignore_spec, ignored=ignored, patterns=patterns) or (
         RULE_SOURCE_FILE_SCAN,
-        "not selected by the index's source-file scan",
+        REASON_SOURCE_FILE_SCAN,
     )
 
 
@@ -249,7 +263,9 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
     ``excluded``, naming the first rule that passed it over, or ``missing`` when
     the scan selects it. Index-time ``exclude_globs`` are not persisted, so a
     path one of them kept out cannot be told apart from a path not yet indexed:
-    it reports ``missing``, with a reason saying an index-time exclude may apply.
+    it reports ``missing``, with a reason saying an index-time exclude may apply,
+    or ``free-tier-file-cap`` when that cap is engaged as well -- the cap counts
+    the whole scan here, where the index run counted only what the excludes left.
 
     Raises :class:`~lemoncrow.infra.code_intel.freshness.IndexRebuilding` while
     the index is mid-write, and
@@ -273,6 +289,7 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
     unindexed_on_disk = [rel for rel in candidates if rel not in indexed and (root / rel).exists()]
     selection = _index_selection(root) if unindexed_on_disk else _NO_SELECTION
     ignored = git_ignored(root, [rel for rel in unindexed_on_disk if rel not in selection.selected])
+    patterns = source_file_patterns() if unindexed_on_disk else []
 
     entries: list[PathCoverage] = []
     totals: dict[str, int] = dict.fromkeys(STATES, 0)
@@ -302,7 +319,7 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
         elif not exists:
             entry = PathCoverage(rel, "missing", "not on disk and not indexed", language_name, 0)
         elif rel not in selection.selected:
-            rule, reason = _exclusion(rel, selection, ignored)
+            rule, reason = _exclusion(rel, selection, ignored, patterns)
             entry = PathCoverage(rel, "excluded", reason, language_name, 0, rule)
         elif rel not in selection.kept:
             entry = PathCoverage(rel, "excluded", "free-tier file cap", language_name, 0, RULE_FREE_TIER_FILE_CAP)

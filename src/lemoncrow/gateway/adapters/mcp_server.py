@@ -10027,7 +10027,8 @@ def tool_code_coverage_check(
     the whole repo. Every response carries the engine `index_version` it was
     judged against. Verdicts follow the indexer's own file scan, and an
     `excluded` path names the `rule` that skipped it. Index-time `exclude_globs`
-    are not recorded, so a path one kept out reads `missing`.
+    are not recorded, so a path one kept out reads `missing`, or
+    `free-tier-file-cap` when that cap is engaged too.
     """
     from lemoncrow.infra.code_intel.coverage import check_coverage
 

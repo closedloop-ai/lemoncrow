@@ -320,12 +320,18 @@ def _indexed_paths(db_path: Path) -> tuple[set[str], set[str]]:
 
 
 def _edit_reindex_tree(root: Path) -> None:
-    """A checkout with a gitignored nested copy of itself, as `.claude/worktrees/` is."""
+    """A checkout with a gitignored nested copy of itself, as `.claude/worktrees/` is.
+
+    ``src/SHOUT.PY`` is tracked and resolves to Python by suffix, so only the
+    scan's own case-sensitive glob gate keeps it out -- the rule with no
+    narrower rule behind it.
+    """
     _write(root, ".gitignore", ".claude/\n")
     _write(root, "src/app.py", "def app():\n    return 1\n")
     _write(root, "prompts/prompt.txt", "Review this diff.\n")
+    _write(root, "src/SHOUT.PY", "def shout():\n    return 1\n")
     _write(root, _NESTED_WORKTREE, "def app():\n    return 1\n")
-    _git_init(root, ".gitignore", "src/app.py", "prompts/prompt.txt")
+    _git_init(root, ".gitignore", "src/app.py", "prompts/prompt.txt", "src/SHOUT.PY")
 
 
 def test_an_excluded_path_never_enters_the_index(workspace_root: Path) -> None:
@@ -344,12 +350,16 @@ def test_an_excluded_path_never_enters_the_index(workspace_root: Path) -> None:
     engine.index_repo()
 
     # Exactly what an edit to each of these paths does.
-    engine._reindex_files([_NESTED_WORKTREE, "prompts/prompt.txt", "src/app.py"])
+    engine._reindex_files([_NESTED_WORKTREE, "prompts/prompt.txt", "src/SHOUT.PY", "src/app.py"])
 
-    queried = [_NESTED_WORKTREE, "prompts/prompt.txt", "src/app.py"]
+    queried = [_NESTED_WORKTREE, "prompts/prompt.txt", "src/SHOUT.PY", "src/app.py"]
     report = check_coverage(paths=queried, repo_root=root)
     excluded = {entry.path: entry.rule for entry in report.paths if entry.state == "excluded"}
-    assert excluded == {_NESTED_WORKTREE: "git-ignore", "prompts/prompt.txt": "unrecognised-file-type"}
+    assert excluded == {
+        _NESTED_WORKTREE: "git-ignore",
+        "prompts/prompt.txt": "unrecognised-file-type",
+        "src/SHOUT.PY": "source-file-scan",
+    }
 
     files, symbols = _indexed_paths(engine.db_path)
     assert files & set(excluded) == set()
