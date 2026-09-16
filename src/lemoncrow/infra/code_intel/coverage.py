@@ -27,18 +27,29 @@ at it: an on-disk path the index does not hold is ``missing`` exactly when
 and the free-tier cap would keep it. One rule cannot be read back:
 ``exclude_globs`` passed to an index run are not persisted, so a path they kept
 out reports ``missing``, with a reason saying an index-time exclude may apply.
+
+Both directions hold, because the index applies these same rules on the way in
+(:mod:`lemoncrow.infra.code_intel.inclusion`, on each of its two entry points):
+a path this report calls ``excluded`` has no rows in the index to find.
 """
 
 from __future__ import annotations
 
 import hashlib
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.freshness import require_ready
+from lemoncrow.infra.code_intel.inclusion import (
+    EXCLUSION_RULES,
+    RULE_FREE_TIER_FILE_CAP,
+    RULE_SOURCE_FILE_SCAN,
+    exclusion_rule,
+    git_ignored,
+    run_git,
+)
 from lemoncrow.infra.code_intel.languages import language_for_path
 from lemoncrow.infra.code_intel.store import CodeIntelStore, FileRow
 
@@ -51,27 +62,6 @@ __all__ = [
 ]
 
 STATES: tuple[str, ...] = ("indexed", "stale", "missing", "excluded", "unparsed")
-
-RULE_SKIPPED_DIRECTORY = "skipped-directory"
-RULE_LEMONCROW_IGNORE = "lemoncrow-ignore"
-RULE_GIT_IGNORE = "git-ignore"
-RULE_UNRECOGNISED_FILE_TYPE = "unrecognised-file-type"
-RULE_FREE_TIER_FILE_CAP = "free-tier-file-cap"
-RULE_SOURCE_FILE_SCAN = "source-file-scan"
-
-#: The indexer's file-selection rules a verdict applies, first match wins. The
-#: free-tier cap only ever applies to a path the scan selected, and every other
-#: rule only to a path it did not. ``source-file-scan`` is the remainder: the
-#: scan passed the path over and no narrower rule says why (an extension in the
-#: wrong case, an untracked file inside a submodule).
-EXCLUSION_RULES: tuple[str, ...] = (
-    RULE_SKIPPED_DIRECTORY,
-    RULE_LEMONCROW_IGNORE,
-    RULE_GIT_IGNORE,
-    RULE_UNRECOGNISED_FILE_TYPE,
-    RULE_FREE_TIER_FILE_CAP,
-    RULE_SOURCE_FILE_SCAN,
-)
 
 # Kept verbatim for consumers that captured it (PLN-1677 N0). It predates the
 # indexer's rules being readable here; `exclusion_rules` lists the rules this
@@ -161,40 +151,8 @@ def _sha256(path: Path) -> str | None:
     return digest.hexdigest()
 
 
-def _git(root: Path, *args: str, stdin: str | None = None) -> str | None:
-    """Run git in *root*, returning stdout or ``None`` when git cannot answer.
-
-    Fail-open by design: a non-git directory or a missing git binary must
-    degrade the exclusion rule, not break the whole report.
-    """
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(root), *args],
-            input=stdin,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    # check-ignore exits 1 when nothing matched, which is a real answer.
-    if completed.returncode not in (0, 1):
-        return None
-    return completed.stdout
-
-
 def _tracked_files(root: Path) -> set[str]:
-    output = _git(root, "ls-files", "-z")
-    if output is None:
-        return set()
-    return {entry for entry in output.split("\0") if entry}
-
-
-def _ignored_files(root: Path, candidates: list[str]) -> set[str]:
-    if not candidates:
-        return set()
-    output = _git(root, "check-ignore", "--stdin", "-z", stdin="\0".join(candidates))
+    output = run_git(root, "ls-files", "-z")
     if output is None:
         return set()
     return {entry for entry in output.split("\0") if entry}
@@ -247,24 +205,17 @@ def _index_selection(root: Path) -> _IndexSelection:
     )
 
 
-def _exclusion(rel: str, selection: _IndexSelection, ignored: set[str]) -> tuple[str, str]:
+def _exclusion(rel: str, selection: _IndexSelection, ignored: frozenset[str]) -> tuple[str, str]:
     """``(rule, reason)`` for an on-disk path the indexer's scan passed over.
 
-    Tried in a fixed order and the first match wins, so a git-ignored file
-    under ``data/`` names the skipped directory.
+    The rules the index itself applies (:func:`exclusion_rule`) name most of
+    them. ``source-file-scan`` is the remainder: the scan passed the path over
+    and none of those rules says why.
     """
-    from lemoncrow.pro.capabilities.repo_map.graph import should_skip_relative_path
-
-    for part in Path(rel).parts:
-        if should_skip_relative_path(part):
-            return RULE_SKIPPED_DIRECTORY, f"skipped directory: {part}"
-    if selection.ignore_spec is not None and selection.ignore_spec.match_file(rel):
-        return RULE_LEMONCROW_IGNORE, ".lemoncrow/.ignore"
-    if rel in ignored:
-        return RULE_GIT_IGNORE, "git-ignored"
-    if language_for_path(rel) is None:
-        return RULE_UNRECOGNISED_FILE_TYPE, "unrecognised file type"
-    return RULE_SOURCE_FILE_SCAN, "not selected by the index's source-file scan"
+    return exclusion_rule(rel, ignore_spec=selection.ignore_spec, ignored=ignored) or (
+        RULE_SOURCE_FILE_SCAN,
+        "not selected by the index's source-file scan",
+    )
 
 
 def _disk_matches(root: Path, rel: str, row: FileRow) -> bool:
@@ -321,7 +272,7 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
 
     unindexed_on_disk = [rel for rel in candidates if rel not in indexed and (root / rel).exists()]
     selection = _index_selection(root) if unindexed_on_disk else _NO_SELECTION
-    ignored = _ignored_files(root, [rel for rel in unindexed_on_disk if rel not in selection.selected])
+    ignored = git_ignored(root, [rel for rel in unindexed_on_disk if rel not in selection.selected])
 
     entries: list[PathCoverage] = []
     totals: dict[str, int] = dict.fromkeys(STATES, 0)

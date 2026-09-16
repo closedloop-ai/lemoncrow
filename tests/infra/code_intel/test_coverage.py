@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -301,3 +302,79 @@ def test_verdicts_agree_with_iter_source_files(workspace_root: Path) -> None:
     assert {entry.path: entry.rule for entry in report.paths if entry.state == "excluded"} == _EXPECTED_RULES
     assert _state_of(report, "src/app.py") == "indexed"
     assert _state_of(report, "src/new.py") == "missing"
+
+
+# --------------------------------------------------------------------------- #
+# the other direction: the index holds nothing the report calls excluded
+# --------------------------------------------------------------------------- #
+
+_NESTED_WORKTREE = ".claude/worktrees/wt/src/app.py"
+
+
+def _indexed_paths(db_path: Path) -> tuple[set[str], set[str]]:
+    """``(files, files with symbols)`` the engine's index actually holds."""
+    with sqlite3.connect(db_path) as conn:
+        files = {str(row[0]) for row in conn.execute("SELECT file_path FROM files")}
+        symbols = {str(row[0]) for row in conn.execute("SELECT DISTINCT file_path FROM symbols")}
+    return files, symbols
+
+
+def _edit_reindex_tree(root: Path) -> None:
+    """A checkout with a gitignored nested copy of itself, as `.claude/worktrees/` is."""
+    _write(root, ".gitignore", ".claude/\n")
+    _write(root, "src/app.py", "def app():\n    return 1\n")
+    _write(root, "prompts/prompt.txt", "Review this diff.\n")
+    _write(root, _NESTED_WORKTREE, "def app():\n    return 1\n")
+    _git_init(root, ".gitignore", "src/app.py", "prompts/prompt.txt")
+
+
+def test_an_excluded_path_never_enters_the_index(workspace_root: Path) -> None:
+    """A path the report calls ``excluded`` has no rows in the index.
+
+    The whole-repo scan honours the rules already. The incremental path an edit
+    takes (``_reindex_files``) re-extracts whatever it is handed, which is how a
+    gitignored nested worktree put a second copy of a repository into the parent
+    checkout's index -- every caller and usage lookup then answering twice.
+    """
+    from lemoncrow.pro.capabilities.code_context import CodeContextEngine
+
+    root = workspace_root.resolve()
+    _edit_reindex_tree(root)
+    engine = CodeContextEngine(root, autosync_enabled=False)
+    engine.index_repo()
+
+    # Exactly what an edit to each of these paths does.
+    engine._reindex_files([_NESTED_WORKTREE, "prompts/prompt.txt", "src/app.py"])
+
+    queried = [_NESTED_WORKTREE, "prompts/prompt.txt", "src/app.py"]
+    report = check_coverage(paths=queried, repo_root=root)
+    excluded = {entry.path: entry.rule for entry in report.paths if entry.state == "excluded"}
+    assert excluded == {_NESTED_WORKTREE: "git-ignore", "prompts/prompt.txt": "unrecognised-file-type"}
+
+    files, symbols = _indexed_paths(engine.db_path)
+    assert files & set(excluded) == set()
+    assert symbols & set(excluded) == set()
+    assert _state_of(report, "src/app.py") == "indexed"
+
+
+def test_on_demand_indexing_still_takes_a_new_source_file(workspace_root: Path) -> None:
+    """The rules must not cost the index a file it is supposed to hold.
+
+    A file written after the last index run is exactly what the incremental
+    entry point exists for, so it still lands -- untracked and all, matching the
+    scan's own ``--others --exclude-standard`` pass.
+    """
+    from lemoncrow.pro.capabilities.code_context import CodeContextEngine
+
+    root = workspace_root.resolve()
+    _edit_reindex_tree(root)
+    engine = CodeContextEngine(root, autosync_enabled=False)
+    engine.index_repo()
+
+    _write(root, "src/added.py", "def added():\n    return 1\n")
+    engine._reindex_files(["src/added.py"])
+
+    files, symbols = _indexed_paths(engine.db_path)
+    assert "src/added.py" in files
+    assert "src/added.py" in symbols
+    assert _state_of(check_coverage(paths=["src/added.py"], repo_root=root), "src/added.py") == "indexed"

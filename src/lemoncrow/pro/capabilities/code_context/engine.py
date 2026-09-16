@@ -13439,6 +13439,15 @@ class CodeContextEngine:
                 existing_paths.append(resolved)
         if not rels:
             return
+        if existing_paths:
+            # The same file-selection rules the whole-repo scan applies: without
+            # them an edit under a gitignored path -- a nested git worktree in
+            # .claude/, say -- indexed a second copy of the repository here. The
+            # per-rel delete below still runs, so a file that becomes excluded
+            # leaves the index on the next touch.
+            from lemoncrow.infra.code_intel.inclusion import indexable_paths
+
+            existing_paths = indexable_paths(self.repo_root, existing_paths)
 
         def _reindex_locked() -> None:
             with self._index_write_lock(block=True) as acquired:
