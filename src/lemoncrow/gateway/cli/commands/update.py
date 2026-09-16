@@ -35,8 +35,16 @@ from pathlib import Path
 import click
 
 from lemoncrow import __version__ as current_version
-from lemoncrow._distribution import DISTRIBUTION_REPO, UPSTREAM_REPO
 from lemoncrow.core.foundation.update_state import write_update_state
+
+try:
+    from lemoncrow._distribution import DISTRIBUTION_REPO, UPSTREAM_REPO
+except ImportError:
+    # scripts/public-paths.txt keeps the module out of the public mirror, so its
+    # absence IS the upstream build: same repo either side of the comparison,
+    # and every fork guard below stays inert.
+    UPSTREAM_REPO = "lemoncrow-lab/lemoncrow"
+    DISTRIBUTION_REPO = UPSTREAM_REPO
 
 # Single source of truth for the distribution channel. Keep these in lockstep
 # with scripts/install.sh and .github/workflows/release.yml.
@@ -106,7 +114,10 @@ def _is_fork_build() -> bool:
 
 
 def _fork_update_command() -> str:
-    return f"git -C <your {DISTRIBUTION_REPO} clone> pull && bash scripts/local.sh"
+    # One cwd for both halves: `git -C <clone> pull` would leave `bash
+    # scripts/local.sh` resolving against wherever the operator is standing,
+    # and by construction they are not in the clone when this prints.
+    return f"cd <your {DISTRIBUTION_REPO} clone> && git pull && bash scripts/local.sh"
 
 
 def _echo_upstream_release_warning(remote_version: str) -> None:

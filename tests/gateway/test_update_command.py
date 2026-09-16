@@ -8,7 +8,9 @@ away from ``scripts/install.sh``.
 
 from __future__ import annotations
 
+import importlib
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -173,6 +175,14 @@ def test_update_has_no_pypi_or_legacy_binary_channel() -> None:
 # --------------------------------------------------------------------------- #
 
 
+# The public mirror omits src/lemoncrow/_distribution.py (scripts/public-paths.txt),
+# so the checkout upstream builds from has no fork identity for these to assert.
+_fork_checkout_only = pytest.mark.skipif(
+    not (_REPO_ROOT / "src" / "lemoncrow" / "_distribution.py").exists(),
+    reason="upstream checkout: no lemoncrow._distribution, so no fork build to guard",
+)
+
+
 def _fork_release_install(monkeypatch: pytest.MonkeyPatch) -> None:
     """A release install of the fork build, with an upstream release available."""
     monkeypatch.setattr(update_mod, "_detect_method", lambda: ("release", None))
@@ -181,6 +191,7 @@ def _fork_release_install(monkeypatch: pytest.MonkeyPatch) -> None:
     assert update_mod._is_fork_build(), "this checkout must identify as a fork build"
 
 
+@_fork_checkout_only
 def test_check_reports_fork_distribution(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _fork_release_install(monkeypatch)
 
@@ -200,6 +211,7 @@ def test_check_reports_fork_distribution(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert update_mod.UPSTREAM_REPO in human.output  # --check names where a release update would come from
 
 
+@_fork_checkout_only
 def test_release_update_refused_on_fork_build_without_confirmation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -220,9 +232,15 @@ def test_release_update_refused_on_fork_build_without_confirmation(
     assert res.exit_code == 1, res.output
     assert calls == {}, "a refused update must neither run the installer nor record update state"
     assert f"Refused — still on the {update_mod.DISTRIBUTION_REPO} build." in res.output
-    assert update_mod._fork_update_command() in res.output
+    hint = update_mod._fork_update_command()
+    assert hint in res.output
+    # Pasteable from anywhere: `git -C <clone> pull && bash scripts/local.sh`
+    # would run the installer in whatever directory the operator is standing in,
+    # and this hint prints precisely to operators who are not in the clone.
+    assert hint.startswith("cd <your ")
 
 
+@_fork_checkout_only
 def test_release_update_allowed_with_allow_upstream(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _fork_release_install(monkeypatch)
 
@@ -264,3 +282,37 @@ def test_git_update_unchanged_on_fork_build(monkeypatch: pytest.MonkeyPatch, tmp
     assert res.exit_code == 0, res.output
     assert calls["pulled"] == str(project_root)
     assert "--allow-upstream" not in res.output
+
+
+def test_absent_distribution_module_reads_as_an_upstream_build(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Upstream ships no ``lemoncrow._distribution``, and absence must mean upstream.
+
+    The mirror denies the module (scripts/public-paths.txt), so upstream's copy of
+    this command imports it and fails. That import may not crash ``lc update``, and
+    what it falls back to may not leave a fork guard armed: an upstream build has
+    nothing to protect and would be refusing its own release channel.
+    """
+    monkeypatch.setitem(sys.modules, "lemoncrow._distribution", None)  # blocks the import
+    try:
+        importlib.reload(update_mod)
+        assert update_mod.DISTRIBUTION_REPO == update_mod.UPSTREAM_REPO == "lemoncrow-lab/lemoncrow"
+        assert update_mod._is_fork_build() is False
+
+        monkeypatch.setattr(update_mod, "_detect_method", lambda: ("release", None))
+        monkeypatch.setattr(update_mod, "current_version", "1.0.0")
+        monkeypatch.setattr(update_mod, "_github_latest_version", lambda: "1.4.0")
+        calls: dict[str, object] = {}
+        monkeypatch.setattr(update_mod, "_update_via_release", lambda: calls.setdefault("applied", True))
+
+        def _record(**kwargs: object) -> None:
+            calls["state"] = kwargs
+
+        monkeypatch.setattr(update_mod, "write_update_state", _record)
+
+        res = _invoke(tmp_path)  # no stdin: reaching a fork confirmation prompt would abort
+        assert res.exit_code == 0, res.output
+        assert calls.get("applied") is True
+        assert "Release updates come from" not in res.output
+    finally:
+        monkeypatch.undo()
+        importlib.reload(update_mod)
