@@ -435,11 +435,14 @@ def _git_project_root() -> Path | None:
     return None
 
 
-# Distribution channel. Both constants come from ``lemoncrow._distribution``, so
-# this module and ``lemoncrow.gateway.cli.commands.update`` cannot disagree about
-# which repository a release update installs.
+# Distribution channel. The constants, the fork predicate and the operator hint
+# all come from ``lemoncrow._distribution``, so this module and
+# ``lemoncrow.gateway.cli.commands.update`` cannot disagree about which
+# repository a release installs, whether this build is a fork, or what to tell
+# an operator to run instead. Importing update.py itself would drag click and
+# the whole CLI import graph into a long-running daemon.
 try:
-    from lemoncrow._distribution import DISTRIBUTION_REPO, UPSTREAM_REPO
+    from lemoncrow._distribution import DISTRIBUTION_REPO, UPSTREAM_REPO, fork_update_command, is_fork_build
 except ModuleNotFoundError:
     # scripts/public-paths.txt keeps the module out of the public mirror, so its
     # absence IS the upstream build: same repo either side of the comparison, and
@@ -449,12 +452,15 @@ except ModuleNotFoundError:
     UPSTREAM_REPO = "lemoncrow-lab/lemoncrow"
     DISTRIBUTION_REPO = UPSTREAM_REPO
 
+    def is_fork_build() -> bool:
+        return False
+
+    def fork_update_command() -> str:
+        raise AssertionError("upstream build: no fork to update")
+
+
 _GH_REPO = UPSTREAM_REPO
 _RELEASE_LATEST_URL = f"https://github.com/{_GH_REPO}/releases/latest/download"
-
-
-def _is_fork_build() -> bool:
-    return DISTRIBUTION_REPO != UPSTREAM_REPO
 
 
 def _github_latest_version() -> str | None:
@@ -633,12 +639,11 @@ def _update_via_release() -> bool:
     # "auto-update from releases", not "replace my fork with upstream" -- and
     # `lc update` is where the choice is offered, interactively or with
     # --allow-upstream.
-    if _is_fork_build():
+    if is_fork_build():
         logger.info(
             f"Auto-update: skipping the {UPSTREAM_REPO} release installer -- this is a "
             f"{DISTRIBUTION_REPO} build, and installing upstream would replace it and the "
-            f"tools only it ships. Update the fork instead: "
-            f"cd <your {DISTRIBUTION_REPO} clone> && git pull && bash scripts/local.sh"
+            f"tools only it ships. Update the fork instead: {fork_update_command()}"
         )
         return False
 

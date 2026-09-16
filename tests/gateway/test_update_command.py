@@ -188,7 +188,7 @@ def _fork_release_install(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(update_mod, "_detect_method", lambda: ("release", None))
     monkeypatch.setattr(update_mod, "current_version", "1.0.0")
     monkeypatch.setattr(update_mod, "_github_latest_version", lambda: "1.4.0")
-    assert update_mod._is_fork_build(), "this checkout must identify as a fork build"
+    assert update_mod.is_fork_build(), "this checkout must identify as a fork build"
 
 
 @_fork_checkout_only
@@ -232,7 +232,7 @@ def test_release_update_refused_on_fork_build_without_confirmation(
     assert res.exit_code == 1, res.output
     assert calls == {}, "a refused update must neither run the installer nor record update state"
     assert f"Refused — still on the {update_mod.DISTRIBUTION_REPO} build." in res.output
-    hint = update_mod._fork_update_command()
+    hint = update_mod.fork_update_command()
     assert hint in res.output
     # Pasteable from anywhere: `git -C <clone> pull && bash scripts/local.sh`
     # would run the installer in whatever directory the operator is standing in,
@@ -296,7 +296,7 @@ def test_absent_distribution_module_reads_as_an_upstream_build(monkeypatch: pyte
     try:
         importlib.reload(update_mod)
         assert update_mod.DISTRIBUTION_REPO == update_mod.UPSTREAM_REPO == "lemoncrow-lab/lemoncrow"
-        assert update_mod._is_fork_build() is False
+        assert update_mod.is_fork_build() is False
 
         monkeypatch.setattr(update_mod, "_detect_method", lambda: ("release", None))
         monkeypatch.setattr(update_mod, "current_version", "1.0.0")
