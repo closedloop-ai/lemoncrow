@@ -6823,6 +6823,14 @@ def _collect_touched_paths(edits: list[dict[str, Any]], *, repo_root: str | Path
     return dict(sorted(paths.items()))
 
 
+# Scratch directories writes are allowed into besides the workspace and any
+# opted-in additional directory: staging a file before moving it in is ordinary
+# tool work, and refusing it would break callers that predate `root=`. One
+# literal covers macOS's /tmp -> /private/tmp symlink, because every root is
+# resolved before it is compared.
+_SCRATCH_EDIT_ROOTS: tuple[Path, ...] = (Path("/tmp"),)
+
+
 def _resolve_explicit_edit_root(raw_root: str, *, workspace_root: Path, extra_roots: list[Path]) -> Path | None:
     """Validate an explicit ``root=`` for edit resolution; None when out of bounds.
 
@@ -7748,9 +7756,10 @@ def tool_smart_edit(
     # Confine writes to the workspace root plus any additional directories from
     # Claude Code's additionalDirectories setting or LEMONCROW_ADDITIONAL_DIRS env.
     # Read tools accept any absolute path; writes need explicit opt-in.
-    # "/tmp" needs no twin "/private/tmp" entry: _allowed_edit_roots resolves
-    # every root before comparing, so one literal covers macOS's symlink.
-    _extra_roots = [*_claude_additional_dirs(repo_root), Path("/tmp")]
+    # _SCRATCH_EDIT_ROOTS carries the scratch allowance ("/tmp") and needs no
+    # twin "/private/tmp" entry: _allowed_edit_roots resolves every root before
+    # comparing, so one literal covers macOS's symlink.
+    _extra_roots = [*_claude_additional_dirs(repo_root), *_SCRATCH_EDIT_ROOTS]
     if _session_worktree is not None:
         _extra_roots.append(_session_worktree)
 

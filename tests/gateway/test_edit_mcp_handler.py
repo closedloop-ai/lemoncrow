@@ -1427,8 +1427,16 @@ def test_explicit_root_beats_the_inferred_worktree(workspace: Path, monkeypatch:
 def test_explicit_root_outside_the_workspace_is_refused(
     workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A root that is neither this workspace, a worktree of it, nor an allowed dir."""
+    """A root that is neither this workspace, a worktree of it, nor an allowed dir.
+
+    The scratch allowance is dropped for the duration: pytest's basetemp lives
+    under /tmp on Linux, which is a real allowed write root, so a directory
+    placed there is legitimately in bounds and the refusal under test would
+    never fire. Removing the allowance is what makes `outside` outside on every
+    platform -- the companion test below pins the allowance itself.
+    """
     wt = _repo_with_worktree(workspace)
+    monkeypatch.setattr(mcp_server, "_SCRATCH_EDIT_ROOTS", ())
     outside = tmp_path.parent / "outside-root"
     outside.mkdir(parents=True, exist_ok=True)
     (outside / "target.txt").write_text("OUTSIDE\n", encoding="utf-8")
@@ -1445,6 +1453,36 @@ def test_explicit_root_outside_the_workspace_is_refused(
     assert payload["rolled_back"] is True, payload
     assert str(outside) in payload["failed"][0]["error"], payload
     assert (outside / "target.txt").read_text(encoding="utf-8") == "OUTSIDE\n"
+
+
+def test_explicit_root_under_a_scratch_root_is_allowed(
+    workspace: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scratch root is a real write root, so naming one as `root` is in bounds.
+
+    Writes under the scratch allowance predate `root=` -- staging a file before
+    moving it in is ordinary tool work -- so validating the argument must not
+    quietly narrow what was already writable.
+    """
+    wt = _repo_with_worktree(workspace)
+    # Outside the workspace, or the workspace root would allow it on its own and
+    # the scratch allowance under test would carry nothing.
+    scratch = tmp_path.parent / "scratch-root"
+    scratch.mkdir(parents=True, exist_ok=True)
+    (scratch / "target.txt").write_text("SCRATCH\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_SCRATCH_EDIT_ROOTS", (scratch,))
+    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+
+    payload = _edit(
+        {
+            "post_edit_hooks": False,
+            "root": str(scratch),
+            "edits": [{"file_path": "target.txt", "old_string": "SCRATCH", "new_string": "EDITED"}],
+        }
+    )
+
+    assert "failed" not in payload, payload
+    assert (scratch / "target.txt").read_text(encoding="utf-8") == "EDITED\n"
 
 
 def test_worktree_redirect_is_disclosed_to_the_model(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
