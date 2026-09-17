@@ -444,54 +444,13 @@ that would read as "this code has no duplicates".
 
 ## F7. Index export / import
 
-### Delivery
-
-New `src/lemoncrow/infra/code_intel/portable.py`, CLI subcommands under the
-existing `lc code` group (`gateway/cli/commands/code.py`, live source):
-
-```
-lc code export [--out .lemoncrow/index.tar.zst] [--tier best|fast]
-lc code import [--from .lemoncrow/index.tar.zst]
-```
-
-- `VACUUM INTO` each of the five DBs into a temp dir (compacts, drops WAL)
-- tar + zstd; two tiers — `best` (zstd 9, drop derived indexes) on explicit
-  export, `fast` (zstd 3) for incremental refresh
-- manifest: engine `index_version`, `indexer_semantics_version`, LemonCrow
-  version, repo HEAD sha, row counts, sidecar `schema_version`
-- **import refuses on version mismatch** rather than producing a subtly wrong
-  graph. The engine owns those numbers; we cannot migrate its data.
-- import bootstraps into an empty workspace, then the engine's normal
-  incremental pass fills the local diff
-
-`zstandard` is a new dependency — put it behind an extra, not the base install.
-
-### Tests
-
-`tests/infra/code_intel/test_portable.py` — round-trip fidelity (row counts and
-a sampled query match), version-mismatch refusal, corrupt-archive handling.
-
-**Effort:** 5-8 days. **Risk:** low-medium. Deliberately does **not** commit the
-artifact to git by default.
-
-**Shipped** as `8235fdaf` — `infra/code_intel/portable.py`, plus `lc code
-export` / `lc code import`. Two deviations:
-
-> **`zstandard` is an accelerator, not a requirement.** It sits behind a new
-> `portable` extra as planned, but export falls back to stdlib lzma when it is
-> absent rather than failing. The manifest names the codec and import reads it,
-> so the feature works on a base install and gets smaller archives with the
-> extra.
->
-> **The `best` tier does not drop derived indexes.** The engine's DDL is closed;
-> an index dropped on export is one open code cannot recreate, so the import
-> would hand back a database the engine expects to be complete. The two tiers
-> differ by compression level only.
-
-One addition the plan did not call for: the archive is treated as untrusted
-input. Members must be regular files whose names are on a fixed allow-list, so a
-traversal path or a symlink is refused outright. A tar file is a format someone
-else can write, and "a teammate sent it" is not provenance.
+**Removed.** Shipped as `8235fdaf` — `infra/code_intel/portable.py` plus two
+`lc code` subcommands that packed a workspace's index into an archive and
+restored it — and removed again under PRD-739 FR15 (PLN-2027 PR 7): the fork
+added the surface, upstream never shipped it, and nothing consumed it. The
+code, including the archive's untrusted-input handling, is at `8235fdaf`; the
+delivery notes and the two deviations recorded against them are at
+`git show 8d77d599:docs/planning/open-code-intel-plan.md`.
 
 ---
 
@@ -811,7 +770,7 @@ superseded generation just multiplies the blast radius of the defect.
 | F11 | `8ea1eb15` | `infra/code_intel/freshness.py` |
 | F2 | `f866112d` | `code_changes` tool |
 | F5 | `e832fc70` | `code_query` tool |
-| F7 | `8235fdaf` | `lc code export` / `import` |
+| F7 | `8235fdaf` | index export / import (removed, PRD-739 FR15) |
 | F12 | `67d56649` | routing + completeness contract (below) |
 
 Deviations are recorded against each item above. The whole `tests/gateway/`
