@@ -48,6 +48,11 @@ BROKER_READ_ONLY: frozenset[str] = frozenset(
     }
 )
 
+#: ``graph``'s default kind, declared once. ``tool_graph`` and ``_op_graph``
+#: take their signature default from here, so an omitted ``kind`` means the same
+#: operation to the broker as it does to a direct call.
+GRAPH_DEFAULT_KIND: str = "blast_radius"
+
 # `graph` runs only these kinds, which read the index or git history.
 GRAPH_READ_ONLY_KINDS: frozenset[str] = frozenset(
     {
@@ -73,7 +78,7 @@ def broker_refusal(name: str, arguments: Mapping[str, Any]) -> str | None:
     if name == "graph":
         if "enable" in arguments:
             return f"graph `enable` is not reachable through the broker: it switches on indexing. {_ALTERNATIVES}"
-        kind = arguments.get("kind", "blast_radius")
+        kind = arguments.get("kind", GRAPH_DEFAULT_KIND)
         if not isinstance(kind, str) or kind not in GRAPH_READ_ONLY_KINDS:
             return (
                 f"graph kind={kind!r} is not reachable through the broker, which runs only the kinds "

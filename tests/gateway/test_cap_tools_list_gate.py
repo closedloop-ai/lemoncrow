@@ -337,6 +337,31 @@ def test_broker_refuses_graph_write_kinds(monkeypatch: pytest.MonkeyPatch, argum
     assert _broker({"action": "call", "name": "graph", "arguments": {"kind": "dead_code"}})["called"] == "graph"
 
 
+def test_broker_and_graph_resolve_the_same_default_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An omitted `kind` is the same operation to the broker as to a direct call.
+
+    The default was declared three times -- broker_refusal, _op_graph and
+    tool_graph -- so changing one left the broker vetting one kind while the
+    server ran another.
+    """
+    import inspect
+
+    from lemoncrow.gateway.adapters import mcp_server
+    from lemoncrow.gateway.adapters.mcp import broker_policy
+
+    handlers = (mcp_server.tool_graph, mcp_server._op_graph)
+    assert {inspect.signature(handler).parameters["kind"].default for handler in handlers} == {
+        broker_policy.GRAPH_DEFAULT_KIND
+    }
+    assert broker_policy.GRAPH_DEFAULT_KIND in broker_policy.GRAPH_READ_ONLY_KINDS
+
+    # Refuse every kind, so the refusal names the kind the broker resolved an omitted one to.
+    monkeypatch.setattr(broker_policy, "GRAPH_READ_ONLY_KINDS", frozenset())
+    refusal = broker_policy.broker_refusal("graph", {})
+    assert refusal is not None
+    assert f"graph kind={broker_policy.GRAPH_DEFAULT_KIND!r} " in refusal
+
+
 def test_broker_refusal_names_read_only_alternatives(monkeypatch: pytest.MonkeyPatch) -> None:
     """Over JSON-RPC, a refusal is an argument error that says where to go instead; the session carries on."""
     from lemoncrow.gateway.adapters import mcp_server

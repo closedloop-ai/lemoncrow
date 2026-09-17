@@ -81,6 +81,7 @@ from lemoncrow.gateway.adapters.mcp.bash import (
     tool_bash as tool_bash,
 )
 from lemoncrow.gateway.adapters.mcp.broker_policy import BROKER_READ_ONLY as _BROKER_READ_ONLY
+from lemoncrow.gateway.adapters.mcp.broker_policy import GRAPH_DEFAULT_KIND as _GRAPH_DEFAULT_KIND
 from lemoncrow.gateway.adapters.mcp.broker_policy import broker_refusal as _broker_refusal
 from lemoncrow.gateway.adapters.mcp.deferral import (  # noqa: F401  (re-exported for back-compat)
     _defer_bash_enabled,
@@ -9481,7 +9482,7 @@ def _synthesize_edges_for_paths(paths: list[str]) -> list[dict[str, Any]]:
 
 def _op_graph(
     *,
-    kind: str = "blast_radius",
+    kind: str = _GRAPH_DEFAULT_KIND,
     path: str | None = None,
     paths: list[str] | None = None,
     limit: int = 50,
@@ -10079,7 +10080,7 @@ def _parse_symbol(symbol: str) -> dict[str, Any]:
 
 @mcp_tool(name="graph")
 def tool_graph(
-    kind: str = "blast_radius",
+    kind: str = _GRAPH_DEFAULT_KIND,
     path: str | None = None,
     paths: list[str] | None = None,
     limit: int = 50,
