@@ -143,6 +143,17 @@ def test_stays_silent_for_graph_when_the_arguments_are_unreadable() -> None:
     assert proc.stdout == ""
 
 
+@pytest.mark.parametrize("kind", [[], {"a": 1}], ids=["list", "dict"])
+def test_stays_silent_for_a_graph_kind_that_is_not_a_string(kind: object) -> None:
+    """`kind` is raw model input: a list or dict is unhashable, so testing it against a
+    frozenset raised TypeError out of the hook -- a traceback and exit 1 where the
+    contract is exit 0, no output, host prompts.
+    """
+    proc = _run({"tool_name": "mcp__lc__graph", "tool_input": {"kind": kind}})
+    assert proc.returncode == 0, proc.stderr
+    assert proc.stdout == ""
+
+
 # --------------------------------------------------------------------------- #
 # PRD-739 FR4 -- the hook and the broker do not drift                          #
 # --------------------------------------------------------------------------- #

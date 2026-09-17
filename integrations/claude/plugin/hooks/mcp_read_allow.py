@@ -84,11 +84,15 @@ def _graph_reads_only(tool_input: Any) -> bool:
     """True when this ``graph`` call names a kind that only reads.
 
     Unreadable arguments count as not read-only: an omitted ``tool_input`` would
-    otherwise auto-allow whatever kind the call actually carried.
+    otherwise auto-allow whatever kind the call actually carried. ``kind`` is
+    raw model-supplied JSON, so a non-string one is judged rather than hashed --
+    the same shape the broker's own vetting uses -- because a ``list``/``dict``
+    would raise out of the membership test and out of the hook.
     """
     if not isinstance(tool_input, dict) or "enable" in tool_input:
         return False
-    return tool_input.get("kind", _GRAPH_DEFAULT_KIND) in _GRAPH_READ_ONLY_KINDS
+    kind = tool_input.get("kind", _GRAPH_DEFAULT_KIND)
+    return isinstance(kind, str) and kind in _GRAPH_READ_ONLY_KINDS
 
 
 def _read_only_tool(tool_name: str, tool_input: Any = None) -> str | None:
