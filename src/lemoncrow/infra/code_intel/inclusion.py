@@ -32,6 +32,7 @@ from lemoncrow.infra.code_intel.languages import LANGUAGES, language_for_path
 
 __all__ = [
     "EXCLUSION_RULES",
+    "FREE_TIER_MAX_FILES",
     "REASON_SOURCE_FILE_SCAN",
     "RULE_FREE_TIER_FILE_CAP",
     "RULE_GIT_IGNORE",
@@ -157,12 +158,23 @@ def scan_selects(rel: str, patterns: Sequence[str]) -> bool:
     )
 
 
+#: Free-tier repo-size cap for the context engine (``context_engine`` is a Pro
+#: feature at scale -- see licensing/features.py). Generous on purpose: this is
+#: well past a typical solo/small-team repo, so Free stays "genuinely useful";
+#: it's a real ceiling only for large monorepos, which is exactly what Pro's
+#: uncapped large-repo indexing is for. The engine's index run and the coverage
+#: verdict that predicts it both read it off this module at call time, so they
+#: always cap at the same number.
+FREE_TIER_MAX_FILES = 2_500
+
+
 def free_tier_selection(files: Sequence[Path], *, cap: int) -> list[Path]:
     """The first *cap* paths of the sorted scan, or all of *files* when under it.
 
     One definition of the Free-tier cap, so an index run and the coverage
-    verdict that has to predict it cannot drift apart. The caller owns the cap
-    value and the licensing check that decides whether it applies at all.
+    verdict that has to predict it cannot drift apart. Callers pass
+    :data:`FREE_TIER_MAX_FILES` and own the licensing check that decides whether
+    it applies at all.
     """
     if len(files) <= cap:
         return list(files)

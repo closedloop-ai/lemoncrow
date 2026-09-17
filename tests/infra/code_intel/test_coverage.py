@@ -162,12 +162,36 @@ def test_whole_repo_mode_covers_tracked_and_indexed_files(
 
 
 def test_report_states_which_exclusion_rules_it_applied(make_workspace: WorkspaceFactory) -> None:
-    """The rules are listed beside ``exclusion_source``, which keeps the value consumers captured."""
+    """Every rule the check applies is listed; none fired, so the summary names none."""
     root = make_workspace(files=[{"file_path": "src/a.py"}])
     report = check_coverage(paths=["src/a.py"], repo_root=root)
-    assert report.exclusion_source == "git-ignore + unrecognised-file-type"
+    assert report.exclusion_source == ""
     assert report.to_dict()["exclusion_rules"] == list(EXCLUSION_RULES)
     assert report.repo_root == str(root)
+
+
+def test_exclusion_source_names_only_the_rules_that_fired(
+    workspace_root: Path, make_workspace: WorkspaceFactory
+) -> None:
+    """The summary agrees with the per-path ``rule`` fields.
+
+    It was a fixed string, so a report whose only exclusion was a skipped
+    directory still named git-ignore, which no path used, and never named the
+    skipped directory, which did.
+    """
+    _write(workspace_root, "data/fixture.py", "def rows():\n    return []\n")
+    _write(workspace_root, "prompts/prompt.txt", "Review this diff.\n")
+    root = _index_one_file(workspace_root, make_workspace)
+    _git_init(root, "data/fixture.py", "prompts/prompt.txt")
+
+    report = check_coverage(paths=["prompts/prompt.txt", "src/a.py", "data/fixture.py"], repo_root=root)
+
+    assert sorted(entry.rule for entry in report.paths if entry.rule is not None) == [
+        "skipped-directory",
+        "unrecognised-file-type",
+    ]
+    assert report.exclusion_source == "skipped-directory + unrecognised-file-type"
+    assert report.to_dict()["exclusion_source"] == report.exclusion_source
 
 
 def test_rebuilding_index_raises(make_workspace: WorkspaceFactory, tear_index: Callable[[Path], None]) -> None:
@@ -219,7 +243,7 @@ def test_free_tier_cap_reports_excluded(workspace_root: Path, monkeypatch: pytes
     for name in ("c", "a", "b"):
         _write(workspace_root, f"src/{name}.py", f"def {name}_fn():\n    return 1\n")
     monkeypatch.setattr("lemoncrow.core.capabilities.licensing.has_feature", lambda _feature: False)
-    monkeypatch.setattr("lemoncrow.pro.capabilities.code_context.engine._FREE_TIER_MAX_FILES", 2)
+    monkeypatch.setattr("lemoncrow.infra.code_intel.inclusion.FREE_TIER_MAX_FILES", 2)
     CodeContextEngine(workspace_root).index_repo()
 
     report = check_coverage(paths=["src/a.py", "src/b.py", "src/c.py"], repo_root=workspace_root)
