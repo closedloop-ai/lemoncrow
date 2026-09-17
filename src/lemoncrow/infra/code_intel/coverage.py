@@ -230,7 +230,6 @@ def _exclusion(
 
 
 def _exclusion_source(entries: Sequence[PathCoverage]) -> str:
-    """The rules that excluded a returned path, in ladder order."""
     fired = {entry.rule for entry in entries if entry.rule is not None}
     return " + ".join(rule for rule in EXCLUSION_RULES if rule in fired)
 

@@ -631,7 +631,7 @@ def compute_usage_meter(
     ``monthlyLimitInUsd <= 0`` (or absent) means "no local limit": spend and
     savings are still reported, but ``warning``/``overLimit`` stay False.
 
-    ``fold`` is passed to :func:`aggregate_window_savings`.
+    ``fold=False`` leaves the savings aggregate alone (see :func:`aggregate_window_savings`).
     """
     root_path = Path(root)
     if subscription is None:

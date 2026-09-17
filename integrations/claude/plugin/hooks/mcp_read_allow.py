@@ -16,8 +16,8 @@ omitted and keeps prompting normally. ``tool`` is omitted too: it dispatches to
 any rarely-used lc tool by name, including write-capable ones, so allowing it
 would launder the whole surface through one decision. ``search`` (which caches
 every query in the workspace search cache) and ``context`` (which records the
-task on the session ledger) were listed here until PRD-739 FR4 classified them
-as writers.
+task on the session ledger) are writers under PRD-739 FR4, so they are omitted
+as well.
 
 What this list holds has to stay inside what the MCP ``tool`` broker will run,
 network tools aside -- the broker refuses those for reach, not for writes. That
