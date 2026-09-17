@@ -2562,10 +2562,12 @@ def _workspace_bridge_session_id() -> str:
             # Claude resolves via the window-anchored resolver; a workspace-shared
             # slot would cross-contaminate concurrent windows in one repo.
             return ""
-        from lemoncrow.core.foundation.paths import resolve_workspace_store_dir
+        from lemoncrow.core.foundation.paths import workspace_store_dir
 
         ws = os.environ.get("CLAUDE_WORKSPACE_ROOT") or os.getcwd()
-        path = resolve_workspace_store_dir(workspace_root=Path(ws)) / "session_state.json"
+        # Non-creating: this reader also runs on the read-only statusline route,
+        # which must leave no trace in the checkout.
+        path = workspace_store_dir(ws) / "session_state.json"
         if not path.is_file():
             return ""
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -10318,8 +10320,9 @@ def tool_statusline_segment(format: str = "segment", read_only: bool = False) ->
     - ``format="json"``: the raw savings report payload, JSON-encoded.
 
     ``read_only=true`` writes nothing: ``segment`` returns the sidecar as it
-    stands, and ``markdown``/``json`` read the savings aggregate without folding
-    new session ledgers into it, so their totals can trail the newest rows.
+    stands -- empty when no host session names one -- and ``markdown``/``json``
+    read the savings aggregate without folding new session ledgers into it, so
+    their totals can trail the newest rows.
 
     Hidden from tools/list (see HIDDEN_LLM_TOOLS) but callable by exact name,
     which is how the lemoncrow skill answers "what are my savings?" without a
@@ -10335,6 +10338,11 @@ def tool_statusline_segment(format: str = "segment", read_only: bool = False) ->
             return json.dumps(payload, indent=2, sort_keys=True, default=str)
         return render_savings_markdown(payload)
     try:
+        # Fail closed like _write_statusline_sidecar_now: with no resolvable
+        # session id the sidecar falls back to the workspace store dir, and
+        # resolving that creates <workspace>/.lemoncrow/ and its .gitignore.
+        if read_only and not _resolved_host_session_id():
+            return ""
         sidecar = _get_host_session_sidecar_path()
         seg_path = sidecar.parent / "statusline_segment"
         sid = sidecar.parent.name
