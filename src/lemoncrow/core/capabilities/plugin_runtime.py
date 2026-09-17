@@ -615,7 +615,9 @@ def _savings_cap_usd(subscription: dict[str, Any]) -> float | None:
     return None
 
 
-def compute_usage_meter(root: str | Path, *, subscription: dict[str, Any] | None = None) -> dict[str, Any]:
+def compute_usage_meter(
+    root: str | Path, *, subscription: dict[str, Any] | None = None, fold: bool = True
+) -> dict[str, Any]:
     """Price trailing-window usage against the plan's monthly limit.
 
     Realized spend and savings come from :func:`aggregate_window_savings` (the
@@ -628,6 +630,8 @@ def compute_usage_meter(root: str | Path, *, subscription: dict[str, Any] | None
 
     ``monthlyLimitInUsd <= 0`` (or absent) means "no local limit": spend and
     savings are still reported, but ``warning``/``overLimit`` stay False.
+
+    ``fold`` is passed to :func:`aggregate_window_savings`.
     """
     root_path = Path(root)
     if subscription is None:
@@ -651,7 +655,7 @@ def compute_usage_meter(root: str | Path, *, subscription: dict[str, Any] | None
     try:
         from lemoncrow.core.capabilities.savings_summary import aggregate_window_savings
 
-        window = aggregate_window_savings(root_path, days=BILLING_WINDOW_DAYS)
+        window = aggregate_window_savings(root_path, days=BILLING_WINDOW_DAYS, fold=fold)
         spend_usd = round(max(0.0, float(window.spend_usd)), 4)
         savings_usd = round(max(0.0, float(window.saved_usd)), 4)
     except Exception:
@@ -5094,6 +5098,7 @@ def build_savings_report(
     root: str | Path,
     *,
     session_id: str | None = None,
+    fold: bool = True,
 ) -> dict[str, Any]:
     """Compose the savings/cost report.
 
@@ -5101,6 +5106,10 @@ def build_savings_report(
       transcript JSONL (tool_result.content[].saved entries).
     - Without ``session_id``: all-session analytics aggregate from the
       routing/compaction event log.
+
+    ``fold=False`` leaves the savings aggregate alone: the windowed totals are
+    read from it as it stands, without folding session ledgers it has not seen
+    or persisting it, so they can trail rows written since the last fold.
     """
     root_path = Path(root)
     session = aggregate_session_stats(root_path, session_id=session_id)
@@ -5139,7 +5148,7 @@ def build_savings_report(
         # (sessions/*/savings.jsonl) so the CLI agrees with the statusline and
         # web Savings page. Routing credit stays sourced from the analytics log.
         analytics = load_live_savings_summary(root_path)
-        lifetime_w = aggregate_window_savings(root_path, days=36500)
+        lifetime_w = aggregate_window_savings(root_path, days=36500, fold=fold)
         tokens_saved = lifetime_w.tokens_saved
         calls_avoided = lifetime_w.calls_saved
         saved_usd = lifetime_w.saved_usd
@@ -5186,14 +5195,14 @@ def build_savings_report(
     lifetime.setdefault("tokens_saved", tokens_saved)
     lifetime.setdefault("saved_usd", saved_usd)
     subscription = resolve_subscription(root_path)
-    subscription = compute_usage_meter(root_path, subscription=subscription)
+    subscription = compute_usage_meter(root_path, subscription=subscription, fold=fold)
     ab_calibration = _summarize_ab_calibration(root_path)
 
     # --- Summary breakdown (1D, 7D, 30D) ---
     # Realized savings from the per-session ledger (sessions/*/savings.jsonl) —
     # the same source as the statusline and stop hook.
     def _window(d: int) -> dict[str, Any]:
-        w = aggregate_window_savings(root_path, days=d)
+        w = aggregate_window_savings(root_path, days=d, fold=fold)
         return {
             "calls": w.calls_saved,
             "usd": round(w.saved_usd, 2),

@@ -125,7 +125,9 @@ def _stub_handler(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
 def test_broker_calls_tools_that_are_hidden_under_the_core_profile(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     """A read-only tool hidden from tools/list must still be reachable through the broker.
 
-    The parametrization is every allow-listed tool the core profile hides.
+    The parametrization is every allow-listed tool the core profile hides, except
+    `statusline_segment`, which runs only with read_only=true (see
+    :func:`test_broker_refuses_the_savings_panel_unless_read_only`).
 
     The old guard refused a tool as "already exposed" whenever it sat in
     _CORE_MCP_TOOLS, even when HIDDEN_LLM_TOOLS meant nothing ever advertised
@@ -266,7 +268,6 @@ _BROKER_DENIED = frozenset(
         "review_rationale",
         "search",
         "sql",
-        "statusline_segment",
         "tool",
         "trace",
         "verify",
@@ -360,6 +361,86 @@ def test_broker_and_graph_resolve_the_same_default_kind(monkeypatch: pytest.Monk
     refusal = broker_policy.broker_refusal("graph", {})
     assert refusal is not None
     assert f"graph kind={broker_policy.GRAPH_DEFAULT_KIND!r} " in refusal
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"format": "markdown"},
+        {"format": "json", "read_only": False},
+        # The handler's validator coerces "false" to False, so a truthiness check
+        # here would let a folding call through.
+        {"format": "markdown", "read_only": "false"},
+    ],
+    ids=["segment", "markdown", "read_only-false", "read_only-string"],
+)
+def test_broker_refuses_the_savings_panel_unless_read_only(monkeypatch: pytest.MonkeyPatch, arguments: dict) -> None:
+    """Without read_only=true the panel rewrites the sidecar or folds ledgers, so the broker refuses it."""
+    from lemoncrow.gateway.adapters import mcp_server
+
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    _stub_handler(monkeypatch, "statusline_segment")
+    with pytest.raises(mcp_server._ToolArgumentError, match="not reachable through the broker without read_only=true"):
+        _broker({"action": "call", "name": "statusline_segment", "arguments": arguments})
+
+    ran = _broker({"action": "call", "name": "statusline_segment", "arguments": {"read_only": True}})
+    assert ran["called"] == "statusline_segment"
+
+
+def _canary(root: Path) -> dict[str, tuple[bytes, int]]:
+    return {
+        path.relative_to(root).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns)
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _seed_savings_ledger(root: Path) -> None:
+    """One session ledger nothing has folded yet, so any fold writes the savings aggregate."""
+    import json
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = root / "sessions" / now.strftime("%Y") / now.strftime("%m") / now.strftime("%d") / "claude" / "canary"
+    session.mkdir(parents=True)
+    row = {"tool": "read", "tokens": 1234, "calls": 1, "ts": now.isoformat(), "cost_saved_usd": 0.01}
+    (session / "savings.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize("fmt", ["markdown", "json", "segment"])
+def test_the_savings_panel_is_reachable_through_the_broker_without_a_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fmt: str
+) -> None:
+    """A host that can only call advertised tools still reaches the panel, and nothing on disk moves.
+
+    The whole LemonCrow root is the canary, seeded with an unfolded ledger and a
+    subscription state, so a fold or a refresh has something to write.
+    """
+    import threading
+
+    from lemoncrow.gateway.adapters import mcp_server
+
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    monkeypatch.setenv("LEMONCROW_WORKSPACE_ROOT", str(tmp_path / "workspace"))
+    _seed_legacy_over_cap(tmp_path)
+    _seed_savings_ledger(tmp_path)
+    before = _canary(tmp_path)
+
+    panel = mcp_server._TOOL_BROKER_SPEC["handler"](
+        {"action": "call", "name": "statusline_segment", "arguments": {"format": fmt, "read_only": True}}
+    )
+    # A background fold would land after the call returns.
+    for thread in threading.enumerate():
+        if thread.name == "lemoncrow-savings-aggregate":
+            thread.join(timeout=10)
+
+    assert _canary(tmp_path) == before
+    if fmt != "segment":
+        assert panel
+        # The canary does see the write this route avoids: the call without read_only folds.
+        mcp_server.TOOLS["statusline_segment"]["handler"]({"format": fmt})
+        assert (tmp_path / "savings_aggregate.json").is_file()
 
 
 def test_broker_refusal_names_read_only_alternatives(monkeypatch: pytest.MonkeyPatch) -> None:

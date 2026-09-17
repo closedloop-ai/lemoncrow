@@ -10,10 +10,11 @@ Refused because the code shows a write, execute or network path:
 
 * ``scan`` runs the ast-grep binary in a subprocess.
 * ``context`` records the task on the session ledger.
-* ``statusline_segment`` rewrites the session's statusline sidecar in its
-  default ``segment`` format; ``markdown`` and ``json`` fold unfolded session
-  ledgers into the persisted savings aggregate. The lemoncrow skill calls it
-  directly by name instead.
+* ``statusline_segment`` without ``read_only=true``: it rewrites the session's
+  statusline sidecar in its default ``segment`` format, and ``markdown`` and
+  ``json`` fold unfolded session ledgers into the persisted savings aggregate.
+  With ``read_only=true`` it writes nothing, which is the call a host that can
+  only reach advertised tools makes for the savings panel.
 * ``search`` stores each query's results in the workspace search cache
   (``smart_state.json``).
 * ``graph kind=index_docs`` writes the design-doc store; ``recall_docs`` embeds
@@ -45,6 +46,7 @@ BROKER_READ_ONLY: frozenset[str] = frozenset(
         "orient",
         "read",
         "relations",
+        "statusline_segment",
     }
 )
 
@@ -75,6 +77,12 @@ def broker_refusal(name: str, arguments: Mapping[str, Any]) -> str | None:
     """Why the broker must not run *name* with *arguments*; ``None`` when it may."""
     if name not in BROKER_READ_ONLY:
         return f"{name!r} is not reachable through the broker, which runs read-only tools only. {_ALTERNATIVES}"
+    if name == "statusline_segment" and arguments.get("read_only") is not True:
+        return (
+            "statusline_segment is not reachable through the broker without read_only=true: otherwise it "
+            "rewrites the statusline sidecar or folds session ledgers into the savings aggregate. "
+            'Call it with {"read_only": true}.'
+        )
     if name == "graph":
         if "enable" in arguments:
             return f"graph `enable` is not reachable through the broker: it switches on indexing. {_ALTERNATIVES}"

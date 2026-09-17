@@ -10307,7 +10307,7 @@ def tool_blame(
 
 
 @mcp_tool(name="statusline_segment")
-def tool_statusline_segment(format: str = "segment") -> str:
+def tool_statusline_segment(format: str = "segment", read_only: bool = False) -> str:
     """Savings surface for the active session.
 
     - ``format="segment"`` (default): the pre-computed rotating statusline
@@ -10317,17 +10317,20 @@ def tool_statusline_segment(format: str = "segment") -> str:
       that render chat markdown and have no shell to run the CLI.
     - ``format="json"``: the raw savings report payload, JSON-encoded.
 
+    ``read_only=true`` writes nothing: ``segment`` returns the sidecar as it
+    stands, and ``markdown``/``json`` read the savings aggregate without folding
+    new session ledgers into it, so their totals can trail the newest rows.
+
     Hidden from tools/list (see HIDDEN_LLM_TOOLS) but callable by exact name,
     which is how the lemoncrow skill answers "what are my savings?" without a
-    shell. The `tool` broker refuses it: every format writes (the sidecar, or the
-    savings aggregate).
+    shell. The `tool` broker runs it only with ``read_only=true``.
     """
     fmt = (format or "segment").strip().lower()
     if fmt in {"markdown", "md", "json"}:
         from lemoncrow.core.capabilities.plugin_runtime import build_savings_report
         from lemoncrow.core.capabilities.savings_summary import render_savings_markdown
 
-        payload = build_savings_report(_lemoncrow_root())
+        payload = build_savings_report(_lemoncrow_root(), fold=not read_only)
         if fmt == "json":
             return json.dumps(payload, indent=2, sort_keys=True, default=str)
         return render_savings_markdown(payload)
@@ -10337,7 +10340,7 @@ def tool_statusline_segment(format: str = "segment") -> str:
         sid = sidecar.parent.name
         from lemoncrow.core.capabilities.savings_summary import savings_segment
 
-        seg = savings_segment(session_id=sid)
+        seg = "" if read_only else savings_segment(session_id=sid)
         if seg:
             seg_path.write_text(seg, encoding="utf-8")
             return seg

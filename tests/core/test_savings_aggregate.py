@@ -74,6 +74,23 @@ def _reset_process_state(root: Path) -> None:
         del ss._historical_savings_cache[key]
 
 
+def test_an_unfolded_read_writes_nothing_and_caches_nothing(tmp_path: Path) -> None:
+    """``fold=False`` answers from the aggregate as it stands and leaves the window cache alone.
+
+    Caching that answer would serve the next blocking surface a total that
+    predates the ledger rows it exists to fold, for a whole TTL.
+    """
+    root = tmp_path / ".lemoncrow"
+    _append(root, "unfolded-s1", [_row(NOW - 3600, 700, 0.7)])
+    _reset_process_state(root)
+
+    unfolded = ss.aggregate_window_savings(root, days=30, fold=False)
+
+    assert (unfolded.tokens_saved, unfolded.saved_usd) == (0, 0.0)
+    assert not (root / "savings_aggregate.json").exists()
+    assert ss.aggregate_window_savings(root, days=30).tokens_saved == 700
+
+
 def test_incremental_equals_full_recompute_multi_day(tmp_path: Path) -> None:
     root = tmp_path / ".lemoncrow"
     # s1: rows on both sides of the 30d boundary (40d ago ages out, 20d ago in).
