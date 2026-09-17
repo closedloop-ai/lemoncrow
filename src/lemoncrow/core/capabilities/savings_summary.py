@@ -2551,7 +2551,7 @@ def _bump_historical_savings_cache(row: dict[str, Any]) -> None:
 
 
 def _read_historical_savings(
-    days: int, root: Path
+    days: int, root: Path, *, fold: bool = True
 ) -> tuple[float, int, int, int, float, float, float, float, int, int]:
     """Windowed savings/spend for ONE trailing window — blocking surface.
 
@@ -2559,12 +2559,13 @@ def _read_historical_savings(
     reports): reconciles any session ledgers the persisted aggregate has not
     folded yet before answering, so explicit surfaces always reflect the
     on-disk ledger. The statusline path uses the non-blocking
-    :func:`_read_historical_savings_many` directly.
+    :func:`_read_historical_savings_many` directly. ``fold=False`` skips that
+    reconcile and writes nothing.
 
     Returns (savings_usd, tokens_saved, calls_saved, turns_saved, spend_usd,
     carry_usd, routing_usd, read_saved_usd, read_saved_tokens, carry_tokens).
     """
-    return _read_historical_savings_many((int(days),), root, block=True)[int(days)]
+    return _read_historical_savings_many((int(days),), root, block=True, fold=fold)[int(days)]
 
 
 # ---------------------------------------------------------------------------
@@ -2963,6 +2964,19 @@ def _get_aggregate_state(root: Path) -> dict[str, Any]:
     return agg
 
 
+def _aggregate_as_it_stands(root: Path) -> dict[str, Any]:
+    """This process's aggregate for *root*, else the persisted one, else empty.
+
+    The read-only counterpart of :func:`_get_aggregate_state`, whose bootstrap
+    folds and persists: this never does either.
+    """
+    with _aggregate_lock:
+        cached = _aggregate_state.get(str(root))
+    if cached is not None:
+        return cached
+    return _load_persisted_aggregate(root) or _empty_savings_aggregate()
+
+
 def _refresh_aggregate_state(root: Path) -> None:
     """Reconcile, swap the in-memory aggregate, and rewrite cached window totals."""
     root_str = str(root)
@@ -3000,7 +3014,7 @@ def _maybe_refresh_aggregate(root: Path, *, block: bool) -> None:
 
 
 def _read_historical_savings_many(
-    days_list: tuple[int, ...], root: Path, *, block: bool = False
+    days_list: tuple[int, ...], root: Path, *, block: bool = False, fold: bool = True
 ) -> dict[int, tuple[float, int, int, int, float, float, float, float, int, int]]:
     """Windowed savings for SEVERAL trailing windows from the day-bucketed
     aggregate — never a sessions/** scan on the caller's thread (except a
@@ -3012,6 +3026,11 @@ def _read_historical_savings_many(
     current totals (live rows already folded in O(1) by
     :func:`_bump_historical_savings_cache`) and refresh in a background thread
     that rewrites the cache for the next read.
+    ``fold=False`` (read-only surfaces): writes nothing -- no reconcile, no
+    bootstrap, no background refresh. It answers from the aggregate as it
+    stands, which trails any ledger rows nothing has folded yet, and it caches
+    nothing, so that trailing answer is never what a blocking surface is served
+    for the next TTL.
     """
     now = time.time()
     root_str = str(root)
@@ -3024,6 +3043,11 @@ def _read_historical_savings_many(
         else:
             missing.append(days)
     if not missing:
+        return results
+    if not fold:
+        agg = _aggregate_as_it_stands(root)
+        for days in missing:
+            results[days] = _window_from_aggregate(agg, days, now)
         return results
     _get_aggregate_state(root)
     _maybe_refresh_aggregate(root, block=block)
@@ -3093,7 +3117,7 @@ class WindowSavings:
         return self.saved_usd + self.carry_usd
 
 
-def aggregate_window_savings(root: str | Path, *, days: int) -> WindowSavings:
+def aggregate_window_savings(root: str | Path, *, days: int, fold: bool = True) -> WindowSavings:
     """Realized savings over the last *days* from the canonical per-session ledger.
 
     Single source of truth for every windowed savings surface (CLI breakdown,
@@ -3103,9 +3127,12 @@ def aggregate_window_savings(root: str | Path, *, days: int) -> WindowSavings:
     (composition time), not inside the per-row day buckets, mirroring how
     :func:`compute_savings_summary` folds ``routing_saved_usd`` into its
     ``saved_usd`` — both still expose the routing figure separately too.
+
+    ``fold=False`` writes nothing, and trails ledger rows no fold has seen yet
+    (see :func:`_read_historical_savings_many`).
     """
     usd, tok, calls, turns, spend, carry, routing, read_usd, read_tok, carry_tok = _read_historical_savings(
-        int(days), Path(root)
+        int(days), Path(root), fold=fold
     )
     return WindowSavings(
         saved_usd=round(usd + routing, 6),

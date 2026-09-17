@@ -81,6 +81,7 @@ from lemoncrow.gateway.adapters.mcp.bash import (
     tool_bash as tool_bash,
 )
 from lemoncrow.gateway.adapters.mcp.broker_policy import BROKER_READ_ONLY as _BROKER_READ_ONLY
+from lemoncrow.gateway.adapters.mcp.broker_policy import GRAPH_DEFAULT_KIND as _GRAPH_DEFAULT_KIND
 from lemoncrow.gateway.adapters.mcp.broker_policy import broker_refusal as _broker_refusal
 from lemoncrow.gateway.adapters.mcp.deferral import (  # noqa: F401  (re-exported for back-compat)
     _defer_bash_enabled,
@@ -2561,10 +2562,12 @@ def _workspace_bridge_session_id() -> str:
             # Claude resolves via the window-anchored resolver; a workspace-shared
             # slot would cross-contaminate concurrent windows in one repo.
             return ""
-        from lemoncrow.core.foundation.paths import resolve_workspace_store_dir
+        from lemoncrow.core.foundation.paths import workspace_store_dir
 
         ws = os.environ.get("CLAUDE_WORKSPACE_ROOT") or os.getcwd()
-        path = resolve_workspace_store_dir(workspace_root=Path(ws)) / "session_state.json"
+        # Non-creating: this reader also runs on the read-only statusline route,
+        # which must leave no trace in the checkout.
+        path = workspace_store_dir(ws) / "session_state.json"
         if not path.is_file():
             return ""
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -9481,7 +9484,7 @@ def _synthesize_edges_for_paths(paths: list[str]) -> list[dict[str, Any]]:
 
 def _op_graph(
     *,
-    kind: str = "blast_radius",
+    kind: str = _GRAPH_DEFAULT_KIND,
     path: str | None = None,
     paths: list[str] | None = None,
     limit: int = 50,
@@ -10079,7 +10082,7 @@ def _parse_symbol(symbol: str) -> dict[str, Any]:
 
 @mcp_tool(name="graph")
 def tool_graph(
-    kind: str = "blast_radius",
+    kind: str = _GRAPH_DEFAULT_KIND,
     path: str | None = None,
     paths: list[str] | None = None,
     limit: int = 50,
@@ -10306,7 +10309,7 @@ def tool_blame(
 
 
 @mcp_tool(name="statusline_segment")
-def tool_statusline_segment(format: str = "segment") -> str:
+def tool_statusline_segment(format: str = "segment", read_only: bool = False) -> str:
     """Savings surface for the active session.
 
     - ``format="segment"`` (default): the pre-computed rotating statusline
@@ -10316,27 +10319,36 @@ def tool_statusline_segment(format: str = "segment") -> str:
       that render chat markdown and have no shell to run the CLI.
     - ``format="json"``: the raw savings report payload, JSON-encoded.
 
+    ``read_only=true`` writes nothing: ``segment`` returns the sidecar as it
+    stands -- empty when no host session names one -- and ``markdown``/``json``
+    read the savings aggregate without folding new session ledgers into it, so
+    their totals can trail the newest rows.
+
     Hidden from tools/list (see HIDDEN_LLM_TOOLS) but callable by exact name,
     which is how the lemoncrow skill answers "what are my savings?" without a
-    shell. The `tool` broker refuses it: every format writes (the sidecar, or the
-    savings aggregate).
+    shell. The `tool` broker runs it only with ``read_only=true``.
     """
     fmt = (format or "segment").strip().lower()
     if fmt in {"markdown", "md", "json"}:
         from lemoncrow.core.capabilities.plugin_runtime import build_savings_report
         from lemoncrow.core.capabilities.savings_summary import render_savings_markdown
 
-        payload = build_savings_report(_lemoncrow_root())
+        payload = build_savings_report(_lemoncrow_root(), fold=not read_only)
         if fmt == "json":
             return json.dumps(payload, indent=2, sort_keys=True, default=str)
         return render_savings_markdown(payload)
     try:
+        # Fail closed like _write_statusline_sidecar_now: with no resolvable
+        # session id the sidecar falls back to the workspace store dir, and
+        # resolving that creates <workspace>/.lemoncrow/ and its .gitignore.
+        if read_only and not _resolved_host_session_id():
+            return ""
         sidecar = _get_host_session_sidecar_path()
         seg_path = sidecar.parent / "statusline_segment"
         sid = sidecar.parent.name
         from lemoncrow.core.capabilities.savings_summary import savings_segment
 
-        seg = savings_segment(session_id=sid)
+        seg = "" if read_only else savings_segment(session_id=sid)
         if seg:
             seg_path.write_text(seg, encoding="utf-8")
             return seg

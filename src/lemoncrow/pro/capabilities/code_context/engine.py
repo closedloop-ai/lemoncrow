@@ -173,12 +173,6 @@ def _query_is_natural_language(query: str) -> bool:
 
 
 _MAX_FILE_BYTES = 1_000_000
-# Free-tier repo-size cap for the context engine (context_engine is a Pro
-# feature at scale -- see licensing/features.py). Generous on purpose: this is
-# well past a typical solo/small-team repo, so Free stays "genuinely useful";
-# it's a real ceiling only for large monorepos, which is exactly what Pro's
-# uncapped large-repo indexing is for.
-_FREE_TIER_MAX_FILES = 2_500
 logger = logging.getLogger(__name__)
 
 
@@ -4219,19 +4213,19 @@ class CodeContextEngine:
             if not self._excluded(path, exclude_globs or [])
         ]
         from lemoncrow.core.capabilities import licensing
-        from lemoncrow.infra.code_intel.inclusion import free_tier_selection
+        from lemoncrow.infra.code_intel import inclusion
 
         capped = False
         if not licensing.has_feature("context_engine"):
-            kept = free_tier_selection(all_files, cap=_FREE_TIER_MAX_FILES)
+            kept = inclusion.free_tier_selection(all_files, cap=inclusion.FREE_TIER_MAX_FILES)
             capped = len(kept) != len(all_files)
             all_files = kept
         if capped:
             logger.warning(
                 "context_engine: repo exceeds the Free-tier cap of %d files; indexing the first %d only "
                 "(LemonCrow Pro removes this cap)",
-                _FREE_TIER_MAX_FILES,
-                _FREE_TIER_MAX_FILES,
+                inclusion.FREE_TIER_MAX_FILES,
+                inclusion.FREE_TIER_MAX_FILES,
             )
         total = len(all_files)
         if progress_callback is not None:

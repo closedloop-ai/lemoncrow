@@ -125,7 +125,9 @@ def _stub_handler(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
 def test_broker_calls_tools_that_are_hidden_under_the_core_profile(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     """A read-only tool hidden from tools/list must still be reachable through the broker.
 
-    The parametrization is every allow-listed tool the core profile hides.
+    The parametrization is every allow-listed tool the core profile hides, except
+    `statusline_segment`, which runs only with read_only=true (see
+    :func:`test_broker_refuses_the_savings_panel_unless_read_only`).
 
     The old guard refused a tool as "already exposed" whenever it sat in
     _CORE_MCP_TOOLS, even when HIDDEN_LLM_TOOLS meant nothing ever advertised
@@ -266,7 +268,6 @@ _BROKER_DENIED = frozenset(
         "review_rationale",
         "search",
         "sql",
-        "statusline_segment",
         "tool",
         "trace",
         "verify",
@@ -335,6 +336,186 @@ def test_broker_refuses_graph_write_kinds(monkeypatch: pytest.MonkeyPatch, argum
 
     # Per kind, not per tool: a read-only kind still runs.
     assert _broker({"action": "call", "name": "graph", "arguments": {"kind": "dead_code"}})["called"] == "graph"
+
+
+def test_broker_and_graph_resolve_the_same_default_kind(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An omitted `kind` is the same operation to the broker as to a direct call.
+
+    The default was declared three times -- broker_refusal, _op_graph and
+    tool_graph -- so changing one left the broker vetting one kind while the
+    server ran another.
+    """
+    import inspect
+
+    from lemoncrow.gateway.adapters import mcp_server
+    from lemoncrow.gateway.adapters.mcp import broker_policy
+
+    handlers = (mcp_server.tool_graph, mcp_server._op_graph)
+    assert {inspect.signature(handler).parameters["kind"].default for handler in handlers} == {
+        broker_policy.GRAPH_DEFAULT_KIND
+    }
+    assert broker_policy.GRAPH_DEFAULT_KIND in broker_policy.GRAPH_READ_ONLY_KINDS
+
+    # Refuse every kind, so the refusal names the kind the broker resolved an omitted one to.
+    monkeypatch.setattr(broker_policy, "GRAPH_READ_ONLY_KINDS", frozenset())
+    refusal = broker_policy.broker_refusal("graph", {})
+    assert refusal is not None
+    assert f"graph kind={broker_policy.GRAPH_DEFAULT_KIND!r} " in refusal
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {},
+        {"format": "markdown"},
+        {"format": "json", "read_only": False},
+        # The handler's validator coerces "false" to False, so a truthiness check
+        # here would let a folding call through.
+        {"format": "markdown", "read_only": "false"},
+    ],
+    ids=["segment", "markdown", "read_only-false", "read_only-string"],
+)
+def test_broker_refuses_the_savings_panel_unless_read_only(monkeypatch: pytest.MonkeyPatch, arguments: dict) -> None:
+    """Without read_only=true the panel rewrites the sidecar or folds ledgers, so the broker refuses it."""
+    from lemoncrow.gateway.adapters import mcp_server
+
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    _stub_handler(monkeypatch, "statusline_segment")
+    with pytest.raises(mcp_server._ToolArgumentError, match="not reachable through the broker without read_only=true"):
+        _broker({"action": "call", "name": "statusline_segment", "arguments": arguments})
+
+    ran = _broker({"action": "call", "name": "statusline_segment", "arguments": {"read_only": True}})
+    assert ran["called"] == "statusline_segment"
+
+
+def _canary(*roots: Path) -> dict[str, tuple[bytes, int]]:
+    """Every file under each root, by content and mtime."""
+    return {
+        f"{root.name}/{path.relative_to(root).as_posix()}": (path.read_bytes(), path.stat().st_mtime_ns)
+        for root in roots
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _seed_savings_ledger(root: Path, session_id: str) -> None:
+    """One session ledger nothing has folded yet, so any fold writes the savings aggregate."""
+    import json
+    from datetime import UTC, datetime
+
+    now = datetime.now(UTC).replace(tzinfo=None)
+    session = root / "sessions" / now.strftime("%Y") / now.strftime("%m") / now.strftime("%d") / "claude" / session_id
+    session.mkdir(parents=True)
+    row = {"tool": "read", "tokens": 1234, "calls": 1, "ts": now.isoformat(), "cost_saved_usd": 0.01}
+    (session / "savings.jsonl").write_text(json.dumps(row) + "\n", encoding="utf-8")
+
+
+def _clear_host_session_ids(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make the resolved host session id come from this test's env alone.
+
+    Unsetting every host session-id env var is what CI, and any host that names
+    no session, looks like. The window resolver memoizes on the window file's
+    mtime, which is 0.0 for every test (there is no window file), so without
+    dropping that cache the first test in the process to resolve answers for
+    all of them.
+    """
+    from lemoncrow.gateway.adapters import mcp_server
+    from lemoncrow.gateway.adapters.mcp import ledger
+
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+    for env_var, _host in mcp_server._HOST_SESSION_ENVS:
+        monkeypatch.delenv(env_var, raising=False)
+    monkeypatch.setattr(ledger, "_WINDOW_SID_CACHE", None)
+
+
+_CANARY_SESSION = "canary"
+
+
+@pytest.mark.parametrize("fmt", ["markdown", "json", "segment"])
+@pytest.mark.parametrize("session_id", [_CANARY_SESSION, ""], ids=["host-session", "no-host-session"])
+def test_the_savings_panel_is_reachable_through_the_broker_without_a_write(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fmt: str, session_id: str
+) -> None:
+    """A host that can only call advertised tools still reaches the panel, and nothing on disk moves.
+
+    Both roots are canaries. The LemonCrow root is seeded with an unfolded
+    ledger and a subscription state so a fold or a refresh has something to
+    write; the workspace root is watched separately, and sits outside the
+    LemonCrow root, because with no session id the segment route falls back to
+    the workspace store dir -- and resolving that creates
+    ``<workspace>/.lemoncrow/`` and its ``.gitignore`` in the checkout.
+    """
+    import threading
+
+    from lemoncrow.gateway.adapters import mcp_server
+
+    root = tmp_path / "root"
+    workspace = tmp_path / "workspace"
+    root.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("LEMONCROW_ROOT", str(root))
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    monkeypatch.setenv("LEMONCROW_WORKSPACE_ROOT", str(workspace))
+    _clear_host_session_ids(monkeypatch)
+    if session_id:
+        monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", session_id)
+    _seed_legacy_over_cap(root)
+    _seed_savings_ledger(root, session_id or _CANARY_SESSION)
+    # Without this the no-session case is vacuous on a developer machine, where
+    # the ambient CLAUDE_CODE_SESSION_ID resolves and the fallback is never taken.
+    assert mcp_server._resolved_host_session_id() == session_id
+    before = _canary(root, workspace)
+
+    panel = mcp_server._TOOL_BROKER_SPEC["handler"](
+        {"action": "call", "name": "statusline_segment", "arguments": {"format": fmt, "read_only": True}}
+    )
+    # A background fold would land after the call returns.
+    for thread in threading.enumerate():
+        if thread.name == "lemoncrow-savings-aggregate":
+            thread.join(timeout=10)
+
+    assert _canary(root, workspace) == before
+    assert not (workspace / ".lemoncrow").exists()
+    # The canary does see the writes this route avoids: without read_only the
+    # panel folds the ledger, and the segment refreshes its sidecar.
+    if fmt != "segment":
+        assert panel
+        mcp_server.TOOLS["statusline_segment"]["handler"]({"format": fmt})
+        assert (root / "savings_aggregate.json").is_file()
+    elif session_id:
+        mcp_server.TOOLS["statusline_segment"]["handler"]({})
+        assert _canary(root, workspace) != before
+
+
+def test_the_read_only_panel_leaves_no_trace_for_a_host_resolved_through_the_workspace_bridge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex/OpenCode name their session in a file inside the workspace store dir, and reading it is all this may do.
+
+    That read went through resolve_workspace_store_dir, whose self-ignore
+    courtesy creates ``<workspace>/.lemoncrow/`` and its ``.gitignore``.
+    """
+    from lemoncrow.gateway.adapters import mcp_server
+
+    root = tmp_path / "root"
+    workspace = tmp_path / "workspace"
+    root.mkdir()
+    workspace.mkdir()
+    monkeypatch.setenv("LEMONCROW_ROOT", str(root))
+    monkeypatch.setenv("LEMONCROW_MCP_TOOL_PROFILE", "core")
+    monkeypatch.setenv("LEMONCROW_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("CLAUDE_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("LEMONCROW_AGENT", "codex")
+    _clear_host_session_ids(monkeypatch)
+    assert mcp_server._detect_agent() == "codex"
+    before = _canary(root, workspace)
+
+    mcp_server._TOOL_BROKER_SPEC["handler"](
+        {"action": "call", "name": "statusline_segment", "arguments": {"read_only": True}}
+    )
+
+    assert _canary(root, workspace) == before
+    assert not (workspace / ".lemoncrow").exists()
 
 
 def test_broker_refusal_names_read_only_alternatives(monkeypatch: pytest.MonkeyPatch) -> None:

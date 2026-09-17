@@ -3,9 +3,9 @@
 ``infra/code_intel/inclusion.py`` owns the indexer's file-selection rules and
 ``pro`` calls down into them -- ``repo_map/graph.py`` for the whole-repo scan,
 ``code_context/engine.py`` for the incremental one. An import back up into
-``pro`` at module scope would turn that into a real cycle; the reaches that
-remain (``coverage.py`` reading the engine's scan and its Free-tier cap) are
-deferred to call time on purpose, and this guard keeps them that way.
+``pro`` at module scope would turn that into a real cycle; the reach that
+remains (``coverage.py`` running the engine's own scan) is deferred to call
+time on purpose, and this guard keeps it that way.
 """
 
 from __future__ import annotations
@@ -62,6 +62,28 @@ def test_code_intel_never_imports_pro_at_module_scope() -> None:
         "lemoncrow.infra.code_intel imports lemoncrow.pro at import time, which makes the "
         f"infra/pro dependency a real cycle -- defer the import to call time:\n{offenders}"
     )
+
+
+def test_file_selection_imports_no_private_pro_symbol() -> None:
+    """The coverage verdict's call-time reach into ``pro`` names only public symbols.
+
+    ``coverage.py`` used to import ``_FREE_TIER_MAX_FILES`` from the engine, so a
+    rename inside ``pro`` broke ``infra`` with nothing in ``pro`` to say why. The
+    cap now lives in ``inclusion.py`` as ``FREE_TIER_MAX_FILES``.
+    """
+    offenders: dict[str, list[str]] = {}
+    for path in (CODE_INTEL / "coverage.py", INCLUSION):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        names = [
+            f"{node.module}.{alias.name}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and _imports_pro(node)
+            for alias in node.names
+            if alias.name.startswith("_")
+        ]
+        if names:
+            offenders[path.relative_to(REPO_ROOT).as_posix()] = names
+    assert not offenders, f"lemoncrow.infra.code_intel imports private lemoncrow.pro symbols: {offenders}"
 
 
 def test_inclusion_never_imports_pro_at_any_scope() -> None:

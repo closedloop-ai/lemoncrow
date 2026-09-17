@@ -44,6 +44,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from lemoncrow.infra.code_intel import inclusion
 from lemoncrow.infra.code_intel.completeness import OBJECTIVE_EXHAUSTIVE
 from lemoncrow.infra.code_intel.freshness import require_ready
 from lemoncrow.infra.code_intel.inclusion import (
@@ -70,11 +71,6 @@ __all__ = [
 ]
 
 STATES: tuple[str, ...] = ("indexed", "stale", "missing", "excluded", "unparsed")
-
-# Kept verbatim for consumers that captured it (PLN-1677 N0). It predates the
-# indexer's rules being readable here; `exclusion_rules` lists the rules this
-# check applies now, and each excluded verdict names its own.
-_EXCLUSION_SOURCE = "git-ignore + unrecognised-file-type"
 
 # `exclude_globs` given to an index run are not persisted, so a path the scan
 # selects but the index does not hold may be excluded that way or not yet indexed.
@@ -114,6 +110,10 @@ class CoverageReport:
 
     repo_root: str
     engine_index_version: int
+    #: The rules behind this report's ``excluded`` verdicts, in
+    #: :data:`EXCLUSION_RULES` order and joined with `` + ``; empty when no path
+    #: was excluded. A summary of the per-path ``rule`` fields, never a claim
+    #: about rules no returned path used.
     exclusion_source: str
     totals: dict[str, int]
     paths: tuple[PathCoverage, ...]
@@ -202,9 +202,7 @@ def _index_selection(root: Path) -> _IndexSelection:
     files = iter_source_files(root)
     kept = files
     if not licensing.has_feature("context_engine"):
-        from lemoncrow.pro.capabilities.code_context.engine import _FREE_TIER_MAX_FILES
-
-        kept = free_tier_selection(files, cap=_FREE_TIER_MAX_FILES)
+        kept = free_tier_selection(files, cap=inclusion.FREE_TIER_MAX_FILES)
     return _IndexSelection(
         selected=_relative_set(root, files),
         kept=_relative_set(root, kept),
@@ -229,6 +227,11 @@ def _exclusion(
         RULE_SOURCE_FILE_SCAN,
         REASON_SOURCE_FILE_SCAN,
     )
+
+
+def _exclusion_source(entries: Sequence[PathCoverage]) -> str:
+    fired = {entry.rule for entry in entries if entry.rule is not None}
+    return " + ".join(rule for rule in EXCLUSION_RULES if rule in fired)
 
 
 def _disk_matches(root: Path, rel: str, row: FileRow) -> bool:
@@ -331,7 +334,7 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
     return CoverageReport(
         repo_root=str(root),
         engine_index_version=snapshot.index_version,
-        exclusion_source=_EXCLUSION_SOURCE,
+        exclusion_source=_exclusion_source(entries),
         totals=totals,
         paths=tuple(entries),
     )

@@ -14,7 +14,17 @@ that can mutate a file, a store, or a shell (``edit``, ``bash``, ``sql``,
 ``codemod``, ``memory``, ``compact``, ``verify``, ``agent``, ``workflow``) is
 omitted and keeps prompting normally. ``tool`` is omitted too: it dispatches to
 any rarely-used lc tool by name, including write-capable ones, so allowing it
-would launder the whole surface through one decision.
+would launder the whole surface through one decision. ``search`` (which caches
+every query in the workspace search cache) and ``context`` (which records the
+task on the session ledger) are writers under PRD-739 FR4, so they are omitted
+as well.
+
+What this list holds has to stay inside what the MCP ``tool`` broker will run,
+network tools aside -- the broker refuses those for reach, not for writes. That
+agreement is pinned by ``tests/integrations/test_mcp_read_allow_hook.py``, not
+by a shared import: Claude Code runs this file as a subprocess in plugin
+installs where ``lemoncrow`` is not importable, so it stays standard-library
+only.
 
 Stays silent (no decision at all) for every other tool, so it never overrides a
 user's own deny rule for something outside this list.
@@ -39,24 +49,63 @@ _READ_ONLY_TOOLS = frozenset(
     {
         "blame",
         "code_search",
-        "context",
         "graph",
         "grep",
         "orient",
         "read",
         "relations",
-        "search",
         "web_fetch",
     }
 )
 
+# ``graph`` is one name over many operations, so the tool alone does not say
+# whether a call reads: ``index_docs`` writes the design-doc store, ``pr_risk``
+# folds each changed file into the machine-wide semantic file index,
+# ``recall_docs`` embeds its query through the configured embedder, and
+# ``enable`` switches doc indexing on. Only the kinds that read the code index
+# or git history are auto-allowed; the rest keep prompting.
+_GRAPH_READ_ONLY_KINDS = frozenset(
+    {
+        "blast_radius",
+        "centrality",
+        "commit_provenance",
+        "coupling",
+        "cycles",
+        "dead_code",
+        "design_gaps",
+        "topology",
+        "verify_design",
+    }
+)
+_GRAPH_DEFAULT_KIND = "blast_radius"
 
-def _read_only_tool(tool_name: str) -> str | None:
-    """Return the bare lc tool name when ``tool_name`` is an allowed read tool."""
+
+def _graph_reads_only(tool_input: Any) -> bool:
+    """True when this ``graph`` call names a kind that only reads.
+
+    Unreadable arguments count as not read-only: an omitted ``tool_input`` would
+    otherwise auto-allow whatever kind the call actually carried. ``kind`` is
+    raw model-supplied JSON, so a non-string one is judged rather than hashed --
+    the same shape the broker's own vetting uses -- because a ``list``/``dict``
+    would raise out of the membership test and out of the hook.
+    """
+    if not isinstance(tool_input, dict) or "enable" in tool_input:
+        return False
+    kind = tool_input.get("kind", _GRAPH_DEFAULT_KIND)
+    return isinstance(kind, str) and kind in _GRAPH_READ_ONLY_KINDS
+
+
+def _read_only_tool(tool_name: str, tool_input: Any = None) -> str | None:
+    """Return the bare lc tool name when this call is an allowed read call."""
     parts = tool_name.split("__")
     if len(parts) != 3 or parts[0] != "mcp" or parts[1] not in _SERVERS:
         return None
-    return parts[2] if parts[2] in _READ_ONLY_TOOLS else None
+    tool = parts[2]
+    if tool not in _READ_ONLY_TOOLS:
+        return None
+    if tool == "graph" and not _graph_reads_only(tool_input):
+        return None
+    return tool
 
 
 def _allow(reason: str) -> None:
@@ -82,7 +131,7 @@ def main() -> int:
         return 0
     if not isinstance(payload, dict):
         return 0
-    tool = _read_only_tool(str(payload.get("tool_name") or ""))
+    tool = _read_only_tool(str(payload.get("tool_name") or ""), payload.get("tool_input"))
     if tool is None:
         return 0
     _allow(f"lc {tool} is read-only (no writes, no shell); auto-allowed in every mode including Plan Mode.")

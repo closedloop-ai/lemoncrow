@@ -76,7 +76,7 @@ class IndexStats(BaseModel):
     imports_indexed: int
     index_version: int = 0
     # True when the Free-tier repo-size cap truncated indexing (see
-    # code_context/engine.py's _FREE_TIER_MAX_FILES). Always False on Pro.
+    # infra/code_intel/inclusion.py's FREE_TIER_MAX_FILES). Always False on Pro.
     capped: bool = False
 
 

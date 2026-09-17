@@ -572,9 +572,20 @@ def resolve_workspace_store_dir(root: Path | str | None = None, workspace_root: 
     "LemonCrow wrote here" and "git does not see it" are kept inseparable.
     """
     ws = Path(workspace_root).expanduser().resolve() if workspace_root is not None else resolve_workspace_root(root)
-    store_root = ws / DEFAULT_STORE_DIRNAME
-    _ensure_store_self_ignored(store_root)
-    return store_root / "workspace"
+    _ensure_store_self_ignored(ws / DEFAULT_STORE_DIRNAME)
+    return workspace_store_dir(ws)
+
+
+def workspace_store_dir(workspace_root: Path | str) -> Path:
+    """``<workspace_root>/.lemoncrow/workspace/``, creating nothing.
+
+    The same layout as :func:`resolve_workspace_store_dir` without its
+    self-ignore side effect, for readers that must leave no trace in the
+    checkout -- a tool the MCP broker runs read-only, say. Every writer of
+    project-local runtime data keeps using ``resolve_workspace_store_dir``, so
+    the courtesy stays attached to the moment something is written.
+    """
+    return Path(workspace_root).expanduser().resolve() / DEFAULT_STORE_DIRNAME / "workspace"
 
 
 def resolve_store_root_for_workspace(workspace_root: Path | str | None = None) -> Path:
@@ -629,4 +640,5 @@ __all__ = [
     "safe_segment",
     "session_dir",
     "workspace_key",
+    "workspace_store_dir",
 ]
