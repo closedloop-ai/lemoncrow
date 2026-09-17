@@ -1434,6 +1434,32 @@ def test_a_worktree_of_another_repo_does_not_redirect(
     assert mcp_server._session_worktree_root(workspace) is None
 
 
+def test_absolute_main_checkout_path_survives_a_worktree_inference(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An inferred worktree must not refuse absolute paths in the main checkout.
+
+    The handler confines writes to [repo_root, edit_root, *extras] but used to
+    hand rich_edit only the extras, so its own second check -- against
+    [edit_root, *allowed_roots] -- never saw the main checkout and rejected
+    every absolute path under it as a workspace escape.
+    """
+    wt = _repo_with_worktree(workspace)
+    target = workspace / "main_only.txt"
+    target.write_text("MAIN\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+
+    payload = _edit(
+        {
+            "post_edit_hooks": False,
+            "edits": [{"file_path": str(target), "old_string": "MAIN", "new_string": "EDITED"}],
+        }
+    )
+
+    assert "failed" not in payload, payload
+    assert target.read_text(encoding="utf-8") == "EDITED\n"
+
+
 def test_bash_cwd_is_what_teaches_edit_where_the_session_is(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only a bash call's cwd is recorded -- it is the sole session-cwd signal."""
     monkeypatch.setattr(mcp_server, "_last_session_cwd", None)
