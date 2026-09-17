@@ -1563,6 +1563,36 @@ def test_absolute_main_checkout_path_survives_a_worktree_inference(
     assert target.read_text(encoding="utf-8") == "EDITED\n"
 
 
+def test_absolute_edit_under_a_symlinked_workspace_root_is_not_an_escape(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A workspace reached through a symlink still contains its own files.
+
+    Touched paths come back resolved, while the workspace root arrives however
+    the env handed it over -- and ``is_relative_to`` is lexical, so an
+    unresolved root lexically contains none of its own files. On macOS every
+    workspace under /tmp or /var reaches the handler this way.
+    """
+    real = workspace / "real"
+    real.mkdir()
+    link = workspace / "link"
+    link.symlink_to(real, target_is_directory=True)
+    monkeypatch.setenv("CLAUDE_WORKSPACE_ROOT", str(link))
+    wt = _repo_with_worktree(real)
+    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    (link / "main_only.txt").write_text("MAIN\n", encoding="utf-8")
+
+    payload = _edit(
+        {
+            "post_edit_hooks": False,
+            "edits": [{"file_path": str(link / "main_only.txt"), "old_string": "MAIN", "new_string": "EDITED"}],
+        }
+    )
+
+    assert "failed" not in payload, payload
+    assert (real / "main_only.txt").read_text(encoding="utf-8") == "EDITED\n"
+
+
 def test_bash_cwd_is_what_teaches_edit_where_the_session_is(monkeypatch: pytest.MonkeyPatch) -> None:
     """Only a bash call's cwd is recorded -- it is the sole session-cwd signal."""
     monkeypatch.setattr(mcp_server, "_last_session_cwd", None)

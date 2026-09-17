@@ -6929,7 +6929,9 @@ def _resolve_explicit_edit_root(raw_root: str, *, workspace_root: Path, extra_ro
         return candidate
     if _linked_worktree_root(workspace_root, candidate) is not None:
         return candidate
-    if any(candidate == r or candidate.is_relative_to(r) for r in extra_roots):
+    # Resolved on both sides: an additional directory reached through a symlink
+    # (or the /tmp literal on macOS) contains nothing lexically.
+    if any(candidate == r or candidate.is_relative_to(r) for r in (extra.resolve() for extra in extra_roots)):
         return candidate
     return None
 
@@ -7851,10 +7853,9 @@ def tool_smart_edit(
     # Confine writes to the workspace root plus any additional directories from
     # Claude Code's additionalDirectories setting or LEMONCROW_ADDITIONAL_DIRS env.
     # Read tools accept any absolute path; writes need explicit opt-in.
-    # Path("/tmp").resolve() as well as "/tmp": on macOS /tmp is a symlink to
-    # /private/tmp, and the candidates below are resolved, so the bare literal
-    # never matched and the /tmp allowance was dead on that platform.
-    _extra_roots = [*_claude_additional_dirs(repo_root), Path("/tmp"), Path("/tmp").resolve()]
+    # "/tmp" needs no twin "/private/tmp" entry: _allowed_edit_roots resolves
+    # every root before comparing, so one literal covers macOS's symlink.
+    _extra_roots = [*_claude_additional_dirs(repo_root), Path("/tmp")]
     if _session_worktree is not None:
         _extra_roots.append(_session_worktree)
 
@@ -7880,7 +7881,18 @@ def tool_smart_edit(
             }
         _extra_roots.append(_explicit_root)
     _edit_root = _explicit_root or _session_worktree or repo_root
-    _allowed_edit_roots = [repo_root, _edit_root, *_extra_roots]
+    # Resolved against resolved. Touched paths arrive through
+    # _resolve_snapshot_path's .resolve(), while _workspace_root() hands back
+    # whatever the env or CLI gave it -- a macOS /tmp or /var path, a home
+    # reached through a symlink -- and is_relative_to is purely lexical, so an
+    # unresolved root lexically contains none of its own files. Compare the
+    # resolved forms; the escape error still prints the caller's own path.
+    _allowed_edit_roots = [_candidate.resolve() for _candidate in (repo_root, _edit_root, *_extra_roots)]
+    # Every later membership test below takes a RESOLVED path, so it needs the
+    # resolved root for the same reason -- under a symlinked workspace an
+    # unresolved one silently drops all hook diagnostics and every path the
+    # contract review would have read.
+    _repo_root_resolved = repo_root.resolve()
 
     # A relative path naming an existing file in BOTH the inferred worktree and
     # the workspace root has no right answer: the worktree came from another
@@ -8277,7 +8289,7 @@ def tool_smart_edit(
         result["diagnostics"] = [
             d
             for d in result["diagnostics"]
-            if d.get("severity") in ("error", "warning") and _diag_in_repo_root(d, repo_root)
+            if d.get("severity") in ("error", "warning") and _diag_in_repo_root(d, _repo_root_resolved)
         ]
         if not result["diagnostics"]:
             result.pop("diagnostics")
@@ -8294,7 +8306,7 @@ def tool_smart_edit(
                 msg = d.get("message", "")
                 return f"{loc} {code}: {msg}" if code else f"{loc}: {msg}"
 
-            _diag_lines = [_fmt_diag(d, repo_root) for d in result.pop("diagnostics")]
+            _diag_lines = [_fmt_diag(d, _repo_root_resolved) for d in result.pop("diagnostics")]
             # Cap: a touched file with many pre-existing findings must not dump
             # an unbounded lint report into the edit result.
             if len(_diag_lines) > _EDIT_DIAG_CAP:
@@ -8340,7 +8352,9 @@ def tool_smart_edit(
             result,
             edits,
             repo_root=repo_root,
-            touched_paths=[str(p.relative_to(repo_root)) for p in paths.values() if p.is_relative_to(repo_root)],
+            touched_paths=[
+                str(p.relative_to(_repo_root_resolved)) for p in paths.values() if p.is_relative_to(_repo_root_resolved)
+            ],
         )
         _phase_contract_ms = int((time.monotonic() - _contract_start) * 1000)
         # Incremental: refresh the shared index for the touched files now, so a
