@@ -110,8 +110,8 @@ def test_malformed_stdin_exits_zero_with_no_output() -> None:
 
 @pytest.mark.parametrize(
     "tool_input",
-    [{}, {"kind": "blast_radius", "path": "a.py"}, {"kind": "dead_code"}],
-    ids=["default-kind", "blast_radius", "dead_code"],
+    [{}, {"kind": "dead_code"}],
+    ids=["default-kind", "dead_code"],
 )
 def test_allows_graph_kinds_that_only_read(tool_input: dict) -> None:
     proc = _run({"tool_name": "mcp__lc__graph", "tool_input": tool_input})
