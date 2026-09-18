@@ -267,6 +267,13 @@ class VersionedEngineCache:
 
     Rebuilds happen under a lock with a double check, so N concurrent callers
     arriving at a version bump together produce one rebuild, not N.
+
+    Dropping an entry does not end whatever the value started. *on_evict* is
+    called with every value the cache lets go of -- superseded, discarded or
+    cleared -- so its owner can stop it. The code engine is why this exists: its
+    background autosync thread references the engine, so an evicted engine never
+    died. Every index bump left one more loop polling the tree and spawning its
+    own reindex, and those reindexes bumped the version again.
     """
 
     def __init__(
@@ -274,9 +281,11 @@ class VersionedEngineCache:
         name: str,
         recheck_seconds: float = DEFAULT_RECHECK_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        on_evict: Callable[[Any], None] | None = None,
     ) -> None:
         self.name = name
         self.recheck_seconds = float(recheck_seconds)
+        self.on_evict = on_evict
         self.evictions = 0
         self._clock = clock
         self._lock = threading.Lock()
@@ -332,7 +341,19 @@ class VersionedEngineCache:
                 self.evictions += 1
             value = build()
             self._entries[key] = _Entry(value=value, index_version=state.index_version)
-            return value, FRESHNESS_FRESH if superseded is None else FRESHNESS_REBUILT
+        # Outside the lock: retiring may join threads, and every other caller of
+        # this cache would wait on it.
+        if entry is not None:
+            self._retire(entry.value)
+        return value, FRESHNESS_FRESH if superseded is None else FRESHNESS_REBUILT
+
+    def _retire(self, value: Any) -> None:
+        if self.on_evict is None:
+            return
+        try:
+            self.on_evict(value)
+        except Exception:
+            logger.warning("%s: retiring an evicted entry failed", self.name, exc_info=True)
 
     def peek(self, key: str) -> Any | None:
         """The cached value for *key* without probing or building."""
@@ -346,13 +367,18 @@ class VersionedEngineCache:
 
     def discard(self, key: str) -> None:
         with self._lock:
-            self._entries.pop(key, None)
+            entry = self._entries.pop(key, None)
+        if entry is not None:
+            self._retire(entry.value)
 
     def clear(self) -> None:
         with self._lock:
+            dropped = [entry.value for entry in self._entries.values()]
             self._entries.clear()
             self._probes.clear()
             self.evictions = 0
+        for value in dropped:
+            self._retire(value)
 
     def __len__(self) -> int:
         return len(self._entries)
