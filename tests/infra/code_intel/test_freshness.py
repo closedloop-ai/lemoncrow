@@ -9,9 +9,10 @@ index is the failure, not the fallback.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,7 @@ from lemoncrow.infra.code_intel.freshness import (
     IndexRebuilding,
     VersionedEngineCache,
     index_state,
+    take_refreshing,
 )
 from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, workspace_dir
 
@@ -125,25 +127,68 @@ def test_missing_table_reads_as_rebuilding(make_workspace: WorkspaceFactory) -> 
     assert "imports" in state.detail
 
 
-def test_held_index_lock_reads_as_rebuilding(make_workspace: WorkspaceFactory) -> None:
+@contextlib.contextmanager
+def _index_lock_held(root: Path) -> Iterator[None]:
     fcntl = pytest.importorskip("fcntl")
-    root = make_workspace(files=_FILES, symbols=_SYMBOLS, index_version=3)
     lock_path = Path(str(_code_db(root)) + INDEX_LOCK_SUFFIX)
     lock_path.touch()
-
-    assert index_state(root).status == STATUS_READY  # lock exists but is free
-
     handle = lock_path.open("r+")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        state = index_state(root)
+        yield
     finally:
         fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
 
-    assert state.status == STATUS_REBUILDING
+
+def test_held_index_lock_on_a_populated_index_is_ready_and_refreshing(make_workspace: WorkspaceFactory) -> None:
+    """A reindex holds the lock but commits in one transaction; readers keep the last index."""
+    root = make_workspace(files=_FILES, symbols=_SYMBOLS, index_version=3)
+    take_refreshing()
+
+    free = index_state(root)
+    assert free.status == STATUS_READY and not free.refreshing
+    assert take_refreshing() is False
+
+    with _index_lock_held(root):
+        state = index_state(root)
+
+    assert state.status == STATUS_READY
+    assert state.refreshing
     assert state.lock == LOCK_HELD
     assert state.index_version == 3
+    assert take_refreshing() is True
+    assert take_refreshing() is False, "the mark must clear once taken"
+
+
+def test_held_index_lock_on_an_empty_index_is_a_first_build(make_workspace: WorkspaceFactory) -> None:
+    """Nothing is committed yet, so there is nothing to answer from: that still fails loud."""
+    root = make_workspace(index_version=0)
+
+    assert index_state(root).status == STATUS_ABSENT
+    with _index_lock_held(root):
+        state = index_state(root)
+
+    assert state.status == STATUS_REBUILDING
+    assert state.detail == "first index build in progress"
+
+
+def test_the_engine_cache_serves_a_refreshing_index_and_marks_every_probe(make_workspace: WorkspaceFactory) -> None:
+    root = make_workspace(files=_FILES, symbols=_SYMBOLS, index_version=3)
+    clock = _Clock()
+    cache = VersionedEngineCache("test", recheck_seconds=5.0, clock=clock)
+    first, _ = cache.get("k", root, object)
+    take_refreshing()
+
+    with _index_lock_held(root):
+        clock.now = 10.0
+        during, _ = cache.get("k", root, object)
+        assert take_refreshing() is True
+        clock.now = 11.0  # inside the throttle window: the cached probe is reused
+        cache.get("k", root, object)
+        assert take_refreshing() is True, "a throttled probe of a refreshing index went unmarked"
+
+    assert during is first
 
 
 # --------------------------------------------------------------------------- #

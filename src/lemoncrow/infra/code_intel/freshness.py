@@ -27,6 +27,15 @@ delivered with the same confidence as a right one. A reviewer reads "no
 matches" as "this symbol has no callers" and files a finding on it. Callers get
 an exception they can catch instead.
 
+A reindex in progress is not, by itself, that case. Every reindex writes in one
+transaction and the databases run in WAL mode, so a reader sees the last
+committed index, whole, until the writer commits. Treating a held write lock as
+"mid-write" made every code tool fail for the length of every reindex -- two
+thirds of code_search calls on a large repo. Such a state is now ``ready`` and
+``refreshing``: readable, possibly behind the files being reindexed, and
+announced as such by :func:`take_refreshing`. The lock still fails loud where
+there is nothing committed to read: a first build that has written no files.
+
 Nothing here writes to the engine's databases; see
 :mod:`lemoncrow.infra.code_intel.store` for that boundary.
 """
@@ -49,6 +58,7 @@ __all__ = [
     "DEFAULT_RECHECK_SECONDS",
     "FRESHNESS_FRESH",
     "FRESHNESS_REBUILT",
+    "FRESHNESS_REFRESHING",
     "INDEX_LOCK_SUFFIX",
     "LOCK_FREE",
     "LOCK_HELD",
@@ -62,6 +72,7 @@ __all__ = [
     "index_state",
     "require_ready",
     "reset_readiness_probes",
+    "take_refreshing",
 ]
 
 logger = logging.getLogger(__name__)
@@ -80,6 +91,8 @@ STATUS_ABSENT = "absent"
 
 FRESHNESS_FRESH = "fresh"
 FRESHNESS_REBUILT = "rebuilt"
+#: Answered from the last committed index while a reindex holds the write lock.
+FRESHNESS_REFRESHING = "refreshing"
 
 LOCK_FREE = "free"
 LOCK_HELD = "held"
@@ -117,10 +130,13 @@ class IndexState:
     ``status`` is the field that gates behaviour:
 
     ``ready``
-        The index can be read.
+        The index can be read -- also while a reindex holds the write lock, in
+        which case :attr:`refreshing` is true and answers come from the last
+        committed index.
     ``rebuilding``
-        Mid-write. A query against it would return a torn or empty view, so
-        callers must raise rather than return what they find.
+        Torn, or a first build with nothing committed yet. A query against it
+        would return a torn or empty view, so callers must raise rather than
+        return what they find.
     ``absent``
         Never indexed, or indexed to nothing. An answer, not a failure -- the
         engine creates the databases on first use.
@@ -134,6 +150,31 @@ class IndexState:
     @property
     def rebuilding(self) -> bool:
         return self.status == STATUS_REBUILDING
+
+    @property
+    def refreshing(self) -> bool:
+        """Readable while a reindex holds the lock; may lag the files it is reindexing."""
+        return self.status == STATUS_READY and self.lock == LOCK_HELD
+
+
+_refreshing_seen = threading.local()
+
+
+def _noted(state: IndexState) -> IndexState:
+    if state.refreshing:
+        _refreshing_seen.value = True
+    return state
+
+
+def take_refreshing() -> bool:
+    """Whether a probe on this thread answered during a reindex since the last take.
+
+    Clears the mark. The MCP dispatcher takes it once before a tool call and once
+    after, so a response is flagged exactly when that call read a refreshing index.
+    """
+    seen = bool(getattr(_refreshing_seen, "value", False))
+    _refreshing_seen.value = False
+    return seen
 
 
 def index_lock_path(repo_root: Path | str = ".") -> Path:
@@ -193,8 +234,11 @@ def index_state(repo_root: Path | str = ".") -> IndexState:
     1. the database file is missing -> ``absent``
     2. a required table is missing -> ``rebuilding`` (caught mid-DDL)
     3. symbols without files -> ``rebuilding`` (a torn index)
-    4. the index-write lock is held -> ``rebuilding``
-    5. no rows at all -> ``absent``; otherwise ``ready``
+    4. no files -> ``rebuilding`` while the index-write lock is held (a first
+       build has committed nothing to answer from), otherwise ``absent``
+    5. otherwise ``ready`` -- ``refreshing`` too if the lock is held, since a
+       reindex commits in one transaction and a WAL reader sees the last
+       committed index until it does
 
     Check 3 is deliberately one-directional. Symbols with no files cannot be a
     resting state -- every symbol row references a file row. Files with no
@@ -231,11 +275,11 @@ def index_state(repo_root: Path | str = ".") -> IndexState:
                 f"index partially populated ({files} files, {symbols} symbols)",
                 lock,
             )
-        if lock == LOCK_HELD:
-            return IndexState(version, STATUS_REBUILDING, "index-write lock is held", lock)
         if files == 0:
+            if lock == LOCK_HELD:
+                return IndexState(version, STATUS_REBUILDING, "first index build in progress", lock)
             return IndexState(version, STATUS_ABSENT, "index is empty", lock)
-        return IndexState(version, STATUS_READY, "", lock)
+        return _noted(IndexState(version, STATUS_READY, "", lock))
     except sqlite3.Error as exc:
         # A torn database mid-rebuild reads as corruption. That is a rebuild in
         # progress, not a permanent failure, and it must not surface as empty.
@@ -291,7 +335,7 @@ class VersionedEngineCache:
         now = self._clock()
         probe = self._probes.get(key)
         if probe is not None and (now - probe.checked_at) < self.recheck_seconds:
-            return probe.state
+            return _noted(probe.state)
         state = index_state(repo_root)
         self._probes[key] = _Probe(state=state, checked_at=now)
         return state
@@ -372,9 +416,9 @@ def require_ready(repo_root: Path | str = ".") -> IndexState:
 
     ``code_changes``, ``code_query``, ``code_coverage_check`` and the file-graph
     analytics open the engine's databases directly, so the engine cache's
-    rebuild check never ran for them: mid-reindex they read a torn index and
-    returned what was left, an empty answer delivered as a complete one. This
-    is that check, applied where they start.
+    rebuild check never ran for them: they could read a torn index and return
+    what was left, an empty answer delivered as a complete one. This is that
+    check, applied where they start.
 
     ``rebuilding`` raises :class:`IndexRebuilding`. ``absent`` raises
     :class:`~lemoncrow.infra.code_intel.store.CodeIntelUnavailable`: the probe

@@ -858,7 +858,7 @@ def test_build_refuses_a_torn_index(clone_repo: Path, monkeypatch: pytest.Monkey
     monkeypatch.setattr(
         clones_mod,
         "index_state",
-        lambda root: IndexState(9, STATUS_REBUILDING, "index-write lock is held", "held"),
+        lambda root: IndexState(9, STATUS_REBUILDING, "first index build in progress", "held"),
     )
     with pytest.raises(IndexRebuilding):
         build_clones(clone_repo)
