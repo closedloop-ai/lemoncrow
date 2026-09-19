@@ -174,9 +174,11 @@ from lemoncrow.infra.code_intel.completeness import (
 )
 from lemoncrow.infra.code_intel.freshness import (  # noqa: F401  (IndexRebuilding re-exported for handlers/tests)
     FRESHNESS_REBUILT,
+    FRESHNESS_REFRESHING,
     IndexRebuilding,
     VersionedEngineCache,
     reset_readiness_probes,
+    take_refreshing,
 )
 from lemoncrow.infra.runtime.run_ledger import (
     RunLedger,
@@ -12470,6 +12472,14 @@ def _model_recommendation_state(led: RunLedger, args: dict[str, Any]) -> dict[st
     return session_state
 
 
+# Appended to any response that read the code index while a reindex held the
+# write lock: the answer is the last committed index, whole but possibly behind.
+_INDEX_REFRESHING_NOTE = (
+    "note: the code index is refreshing; results come from the last completed index "
+    "and may not reflect the newest edits"
+)
+
+
 def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
     rid = request.get("id")
     method = request.get("method")
@@ -12660,6 +12670,10 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
                 },
             )
 
+        # Set once the handler returns: whether this call read the code index while
+        # a reindex held its write lock. Read by _finalize_response.
+        index_refreshing = False
+
         def _finalize_response(result: dict[str, Any] | Any) -> dict[str, Any]:
             # Post-handler finalization pipeline. Runs synchronously on the worker
             # for the non-deferred path, and on bash_exec's watcher thread for a
@@ -12742,6 +12756,8 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
                     with contextlib.suppress(Exception):
                         _write_statusline_sidecar()
 
+                if index_refreshing and isinstance(result, dict):
+                    result.setdefault("index_state", FRESHNESS_REFRESHING)
                 response_text: str
                 if rendered_text:
                     response_text = rendered_text
@@ -12755,6 +12771,8 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
                 # string, or JSON). Soft signal -- never replaces the result.
                 if _loop_note and _loop_note not in response_text:
                     response_text = f"{response_text}\n{_loop_note}"
+                if index_refreshing and _INDEX_REFRESHING_NOTE not in response_text:
+                    response_text = f"{response_text}\n{_INDEX_REFRESHING_NOTE}"
 
                 # Only pay the full-payload UTF-8 encode when a telemetry sink will
                 # consume the byte count; otherwise approximate with the O(1) char len.
@@ -13003,6 +13021,7 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
                 _tool_call_tokens_saved.value = 0  # reset before handler so stale values can't bleed through
                 _tool_call_counterfactual.value = None  # reset before handler
                 _tool_call_rendered_text.value = None  # reset before handler
+                take_refreshing()  # drop a mark left by work that never reached a response
                 wrapper_model = (
                     str(route_payload.get("model") or "")
                     if _route_enforcement_enabled() and route_payload.get("configured") is not False
@@ -13014,6 +13033,7 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
                     _handler_start = time.perf_counter()
                     with active_model_override(wrapper_model or None):
                         result = handler(args)
+                    index_refreshing = take_refreshing()
                     _call_duration_ms = round((time.perf_counter() - _handler_start) * 1000)
                 finally:
                     # Runs in finally; a raise here would mask the handler's real
