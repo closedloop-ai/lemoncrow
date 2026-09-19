@@ -2602,6 +2602,15 @@ def _resolve_index_max_workers() -> int:
     return _memory_capped_index_workers(os.cpu_count() or 1)
 
 
+# The autosync loop wakes once per tick to check git HEAD, which costs one
+# `git rev-parse`. The full-tree check stat-walks every source file, so it runs
+# once per poll interval, never more often than the floor.
+_AUTOSYNC_TICK_MS = 60_000
+_AUTOSYNC_MIN_POLL_MS = 60_000
+_AUTOSYNC_DEFAULT_POLL_MS = 300_000
+_AUTOSYNC_GIT_HEAD_TIMEOUT_S = 3.0
+
+
 def _resolve_autosync_index_max_workers() -> int:
     """Worker count for background autosync indexing.
 
@@ -3728,6 +3737,9 @@ class CodeContextEngine:
         self._autosync_pending_events = 0
         self._autosync_reindex_count = 0
         self._autosync_history: list[dict[str, Any]] = []
+        self._autosync_head: str | None = None
+        # Monotonic ms, unlike the wall-clock _autosync_last_sync_ms.
+        self._autosync_last_full_check_ms: int | None = None
         # Counts completed tool calls; used to pace the periodic heap trim.
         self._tool_call_count: int = 0
         self._last_heap_trim_ts: float = 0.0
@@ -14724,32 +14736,36 @@ class CodeContextEngine:
             logging.exception("code index subprocess error for %s", self.repo_root)
             return False
 
-    def _maybe_autosync_reindex(self, *, _from_watcher: bool = False) -> None:
+    def _maybe_autosync_reindex(self, *, known_change: str | None = None) -> bool:
         if not self._autosync_lock.acquire(blocking=False):
-            return
+            return False
         try:
-            self._maybe_autosync_reindex_locked(_from_watcher=_from_watcher)
+            return self._maybe_autosync_reindex_locked(known_change=known_change)
         finally:
             self._autosync_lock.release()
 
-    def _maybe_autosync_reindex_locked(self, *, _from_watcher: bool = False) -> None:
-        # When called from the file watcher we already know a change happened,
-        # so skip the expensive _source_tree_signature() stat walk entirely.
-        if _from_watcher:
+    def _maybe_autosync_reindex_locked(self, *, known_change: str | None = None) -> bool:
+        """Reindex if the tree changed; True iff a reindex ran and succeeded.
+
+        ``known_change`` names a change the caller already detected (the file
+        watcher, or a HEAD move). It forces the reindex, bypassing the tree
+        check and the debounce window, and is recorded as the reindex's reason.
+        """
+        if known_change is not None:
             self._autosync_state = "syncing"
             if not self._run_index_subprocess():
                 # Reindex failed; leave the signature/pending state stale so the
                 # next poll retries instead of recording a failed sync as done.
                 self._autosync_state = "idle"
-                self._record_autosync_event(event="reindex", reason="watcher_triggered", reindexed=False)
-                return
+                self._record_autosync_event(event="reindex", reason=known_change, reindexed=False)
+                return False
             self._autosync_signature = self._source_tree_signature()
             self._autosync_last_sync_ms = int(time.time() * 1000)
             self._autosync_pending_events = 0
             self._autosync_state = "idle"
             self._autosync_reindex_count += 1
-            self._record_autosync_event(event="reindex", reason="watcher_triggered", reindexed=True)
-            return
+            self._record_autosync_event(event="reindex", reason=known_change, reindexed=True)
+            return True
 
         current_signature = self._source_tree_signature()
         if self._autosync_signature is None:
@@ -14757,31 +14773,33 @@ class CodeContextEngine:
             self._autosync_last_sync_ms = int(time.time() * 1000)
             self._autosync_state = "idle"
             self._record_autosync_event(event="bootstrap", reason="seed_signature", reindexed=False)
-            return
+            return False
         if current_signature == self._autosync_signature:
             self._autosync_state = "idle"
             self._autosync_pending_events = 0
-            return
+            self._record_autosync_event(event="full_check", reason="unchanged", reindexed=False)
+            return False
         now_ms = int(time.time() * 1000)
         self._autosync_last_event_at = datetime.now(UTC).isoformat()
         self._autosync_pending_events = max(1, self._autosync_pending_events + 1)
         if now_ms - self._autosync_last_sync_ms < self._autosync_debounce_ms:
             self._autosync_state = "debouncing"
             self._record_autosync_event(event="change_detected", reason="within_debounce_window", reindexed=False)
-            return
+            return False
         self._autosync_state = "syncing"
         if not self._run_index_subprocess():
             # Reindex failed; leave the signature/pending state stale so the next
             # poll retries instead of recording a failed sync as complete.
             self._autosync_state = "idle"
             self._record_autosync_event(event="reindex", reason="source_signature_changed", reindexed=False)
-            return
+            return False
         self._autosync_signature = self._source_tree_signature()
         self._autosync_last_sync_ms = int(time.time() * 1000)
         self._autosync_pending_events = 0
         self._autosync_state = "idle"
         self._autosync_reindex_count += 1
         self._record_autosync_event(event="reindex", reason="source_signature_changed", reindexed=True)
+        return True
 
     def _maybe_refresh_zoekt_index(self) -> None:
         """Keep the git-repo Zoekt shard fresh at commit granularity.
@@ -14800,10 +14818,10 @@ class CodeContextEngine:
 
     def _parse_autosync_poll_ms(self, raw_value: str | None) -> int:
         if raw_value is None:
-            return 10000
+            return _AUTOSYNC_DEFAULT_POLL_MS
         with contextlib.suppress(ValueError):
             return max(1000, int(raw_value))
-        return 10000
+        return _AUTOSYNC_DEFAULT_POLL_MS
 
     def _start_autosync_worker(self) -> None:
         if self._autosync_thread is not None:
@@ -14952,7 +14970,7 @@ class CodeContextEngine:
         self._watcher_last_event_ms = now_ms
         self._autosync_last_event_at = datetime.now(UTC).isoformat()
         self._autosync_pending_events = max(1, self._autosync_pending_events + 1)
-        self._maybe_autosync_reindex(_from_watcher=True)
+        self._maybe_autosync_reindex(known_change="watcher_triggered")
 
     def _parse_watcher_enabled(self, raw_value: str | None) -> bool:
         if raw_value is None:
@@ -14980,28 +14998,66 @@ class CodeContextEngine:
                 self._run_index_subprocess()
             except Exception:
                 logging.exception("autosync: initial index build failed")
-        # When the file watcher is active, polling is a safety net only -- the
-        # watcher handles real-time change detection. When it's absent (no
-        # `watchdog` installed, EMFILE/inotify limit, etc.) polling is the
-        # *only* detection path, but each poll still does a full source-tree
-        # stat walk + two `git ls-files` subprocesses, so it must never run
-        # hotter than the same 60s floor used for the watcher's safety net.
-        poll_ms = max(self._autosync_poll_ms, 60000)
-        while not self._autosync_stop.wait(poll_ms / 1000.0):
+        while not self._autosync_stop.wait(_AUTOSYNC_TICK_MS / 1000.0):
             try:
-                if not self.index_ready():
-                    # Still empty (e.g. the initial build lost an index-lock race
-                    # with a concurrent prewarm). Keep retrying until it exists.
-                    self._run_index_subprocess()
-                else:
-                    # Polling-based check is the safety net; skip when watcher is
-                    # active (the watcher already triggers reindex on change).
-                    if self._file_watcher is None or not self._file_watcher.is_alive():
-                        self._maybe_autosync_reindex()
-                self._maybe_refresh_zoekt_index()
+                self._autosync_tick(int(time.monotonic() * 1000))
             except Exception as exc:
                 logging.exception("Recovered from broad exception handler")
                 self._record_autosync_event(event="worker_error", reason=str(exc), reindexed=False)
+
+    def _autosync_tick(self, now_ms: int) -> None:
+        """One pass of the autosync loop; ``now_ms`` is a monotonic clock in ms.
+
+        A moved git HEAD (pull, checkout, merge, rebase) reindexes on the tick
+        that sees it. Other working-tree changes wait for the full-tree check,
+        which runs once per poll interval. Both are skipped while the file
+        watcher is alive: it already reindexes the files any change touches, a
+        checkout included, so checking HEAD too would reindex a checkout twice.
+        """
+        if not self.index_ready():
+            # Still empty (e.g. the initial build lost an index-lock race
+            # with a concurrent prewarm). Keep retrying until it exists.
+            self._run_index_subprocess()
+        elif self._file_watcher is None or not self._file_watcher.is_alive():
+            # Non-blocking like every autosync entry point: an edit's reindex
+            # may hold the lock, and the next tick checks again.
+            if self._autosync_lock.acquire(blocking=False):
+                try:
+                    self._autosync_poll_locked(now_ms)
+                finally:
+                    self._autosync_lock.release()
+        self._maybe_refresh_zoekt_index()
+
+    def _autosync_poll_locked(self, now_ms: int) -> None:
+        head = self._autosync_git_head()
+        if head is not None and self._autosync_head is not None and head != self._autosync_head:
+            # On failure keep the old HEAD, so the next tick retries.
+            if self._maybe_autosync_reindex_locked(known_change="head_moved"):
+                self._autosync_head = head
+                # The reindex reseeded the tree signature: that is a full check.
+                self._autosync_last_full_check_ms = now_ms
+            return
+        if head is not None:
+            self._autosync_head = head
+        last = self._autosync_last_full_check_ms
+        if last is None or now_ms - last >= max(self._autosync_poll_ms, _AUTOSYNC_MIN_POLL_MS):
+            self._autosync_last_full_check_ms = now_ms
+            self._maybe_autosync_reindex_locked()
+
+    def _autosync_git_head(self) -> str | None:
+        """HEAD's commit sha; None for a non-git repo or when git fails."""
+        try:
+            result = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=self.repo_root,
+                capture_output=True,
+                text=True,
+                timeout=_AUTOSYNC_GIT_HEAD_TIMEOUT_S,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        head = result.stdout.strip()
+        return head if result.returncode == 0 and head else None
 
     def _detected_repo_languages(self) -> frozenset[str]:
         """Lightweight language detection from file extensions in the symbol index."""
@@ -15027,15 +15083,23 @@ class CodeContextEngine:
         return frozenset(langs)
 
     def _record_autosync_event(self, *, event: str, reason: str, reindexed: bool) -> None:
+        at = datetime.now(UTC).isoformat()
+        history = self._autosync_history
+        if event == "full_check" and history and (history[-1]["event"], history[-1]["reason"]) == (event, reason):
+            # Consecutive idle checks share one entry, so they never evict the
+            # reindex, error and bootstrap entries from the bounded history.
+            history[-1] = {**history[-1], "at": at, "count": history[-1]["count"] + 1}
+            return
         entry = {
-            "at": datetime.now(UTC).isoformat(),
+            "at": at,
             "event": event,
             "reason": reason,
             "reindexed": reindexed,
+            "count": 1,
         }
-        self._autosync_history.append(entry)
-        if len(self._autosync_history) > 20:
-            self._autosync_history = self._autosync_history[-20:]
+        history.append(entry)
+        if len(history) > 20:
+            self._autosync_history = history[-20:]
 
     def _json_safe(self, value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
