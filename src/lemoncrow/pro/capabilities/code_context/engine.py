@@ -14793,6 +14793,17 @@ class CodeContextEngine:
         self._autosync_stop.set()
         self._stop_file_watcher()
 
+    def stop_autosync(self) -> None:
+        """Stop this engine's background index refresh, permanently.
+
+        Queries keep working; this instance just stops polling the tree and
+        spawning reindexes. Call it when replacing the engine: the worker thread
+        references the engine, so dropping every other reference does not stop
+        it, and a replaced engine otherwise refreshes the index for the life of
+        the process.
+        """
+        self._stop_autosync_worker()
+
     # --- File watcher (event-driven via watchdog) ---
 
     def _start_file_watcher(self) -> None:

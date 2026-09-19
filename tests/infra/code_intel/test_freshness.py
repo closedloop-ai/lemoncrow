@@ -198,6 +198,53 @@ def test_version_bump_evicts_and_rebuilds(make_workspace: WorkspaceFactory) -> N
     assert cache.evictions == 1
 
 
+def test_a_superseded_entry_is_retired_once(make_workspace: WorkspaceFactory) -> None:
+    """Eviction has to end what the evicted value started, not just forget it."""
+    root = make_workspace(files=_FILES, symbols=_SYMBOLS, index_version=1)
+    retired: list[object] = []
+    cache = VersionedEngineCache("test", recheck_seconds=0.0, on_evict=retired.append)
+
+    first, _ = cache.get("k", root, object)
+    cache.get("k", root, object)
+    assert retired == [], "a stable index retired its own live entry"
+
+    _set_index_version(root, 2)
+    second, _ = cache.get("k", root, object)
+
+    assert retired == [first]
+    assert second is not first
+
+
+def test_discard_and_clear_retire_what_they_drop(make_workspace: WorkspaceFactory) -> None:
+    root = make_workspace(files=_FILES, symbols=_SYMBOLS, index_version=1)
+    retired: list[object] = []
+    cache = VersionedEngineCache("test", recheck_seconds=0.0, on_evict=retired.append)
+
+    discarded, _ = cache.get("a", root, object)
+    cache.discard("a")
+    cleared, _ = cache.get("b", root, object)
+    cache.clear()
+
+    assert retired == [discarded, cleared]
+
+
+def test_a_failing_retirement_does_not_fail_the_lookup(make_workspace: WorkspaceFactory) -> None:
+    """The rebuilt value is already cached; a stop hook that raises must not lose it."""
+    root = make_workspace(files=_FILES, symbols=_SYMBOLS, index_version=1)
+
+    def refuse(_value: object) -> None:
+        raise RuntimeError("stop failed")
+
+    cache = VersionedEngineCache("test", recheck_seconds=0.0, on_evict=refuse)
+    first, _ = cache.get("k", root, object)
+    _set_index_version(root, 2)
+    second, freshness = cache.get("k", root, object)
+
+    assert second is not first
+    assert freshness == FRESHNESS_REBUILT
+    assert cache.peek("k") is second
+
+
 def test_first_build_is_fresh_not_rebuilt(make_workspace: WorkspaceFactory) -> None:
     """Nothing was superseded on a cold cache; only an eviction is 'rebuilt'."""
     root = make_workspace(files=_FILES, symbols=_SYMBOLS)

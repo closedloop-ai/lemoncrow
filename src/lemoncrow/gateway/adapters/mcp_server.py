@@ -8879,6 +8879,7 @@ _code_engine_for_current_call: threading.local = threading.local()
 # from the one before it.
 _code_index_freshness_for_current_call: threading.local = threading.local()
 
+
 # Process-level engine cache keyed by resolved repo path.
 # Reusing the same engine across tool calls avoids re-opening the SQLite DB
 # and restarting autosync threads on every invocation — critical for both
@@ -8889,7 +8890,17 @@ _code_index_freshness_for_current_call: threading.local = threading.local()
 # still serving it at version 23, returning empty results for every query with
 # no error of any kind. VersionedEngineCache stamps each entry and rebuilds on a
 # bump, and raises IndexRebuilding mid-reindex rather than answering with [].
-_code_engine_cache = VersionedEngineCache("code_engine")
+#
+# A rebuild must also stop the engine it replaces. Each engine runs its own
+# autosync thread, which keeps it alive, so a superseded engine kept polling
+# and spawning reindexes: one more loop per index bump, until the daemon ran a
+# reindex storm that held the index-write lock nearly all the time and
+# code_search answered "index is being rebuilt" for most calls.
+def _retire_code_engine(engine: Any) -> None:
+    engine.stop_autosync()
+
+
+_code_engine_cache = VersionedEngineCache("code_engine", on_evict=_retire_code_engine)
 
 # ``cache_key -> (capability, engine_it_was_built_from)``.
 #

@@ -49,9 +49,13 @@ class _FakeEngine:
         type(self).instances += 1
         self.root = root
         self.db_path = str(root)
+        self.stopped = False
 
     def index_ready(self) -> bool:
         return True
+
+    def stop_autosync(self) -> None:
+        self.stopped = True
 
 
 @pytest.fixture
@@ -110,7 +114,11 @@ def _isolated_caches(monkeypatch: pytest.MonkeyPatch) -> None:
 
     _FakeEngine.instances = 0
     monkeypatch.setattr(code_context, "CodeContextEngine", _FakeEngine)
-    monkeypatch.setattr(mcp_server, "_code_engine_cache", VersionedEngineCache("test", recheck_seconds=0.0))
+    monkeypatch.setattr(
+        mcp_server,
+        "_code_engine_cache",
+        VersionedEngineCache("test", recheck_seconds=0.0, on_evict=mcp_server._code_engine_cache.on_evict),
+    )
     monkeypatch.setattr(mcp_server, "_scoped_context_cache", {})
     mcp_server._code_index_freshness_for_current_call.value = None
     mcp_server._code_engine_for_current_call.value = None
@@ -138,6 +146,21 @@ def test_index_version_bump_rebuilds_the_engine(indexed_repo: Path) -> None:
     assert second is not first, "engine survived a 22-generation index bump"
     assert _FakeEngine.instances == 2
     assert mcp_server._code_index_freshness_for_current_call.value == FRESHNESS_REBUILT
+
+
+def test_a_rebuilt_engine_stops_the_one_it_replaced(indexed_repo: Path) -> None:
+    """A superseded engine left the cache but kept running.
+
+    Its autosync thread held it alive, so each index bump added one more loop
+    polling the tree and spawning its own reindex -- a storm that kept the
+    index-write lock held and made code_search answer "being rebuilt".
+    """
+    first = mcp_server._code_context_engine(str(indexed_repo))
+    _bump(indexed_repo, 2)
+    second = mcp_server._code_context_engine(str(indexed_repo))
+
+    assert first.stopped, "the replaced engine was left running"
+    assert not second.stopped
 
 
 class _FakeScoped:
@@ -281,11 +304,12 @@ def test_freshness_does_not_leak_into_the_next_call(indexed_repo: Path) -> None:
 
 
 def test_runtime_cache_reset_clears_the_engine_cache(indexed_repo: Path) -> None:
-    mcp_server._code_context_engine(str(indexed_repo))
+    first = mcp_server._code_context_engine(str(indexed_repo))
     assert len(mcp_server._code_engine_cache) == 1
 
     mcp_server._code_engine_cache.clear()
 
     assert len(mcp_server._code_engine_cache) == 0
+    assert first.stopped, "a cleared engine was left running"
     mcp_server._code_context_engine(str(indexed_repo))
     assert _FakeEngine.instances == 2
