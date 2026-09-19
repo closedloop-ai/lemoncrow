@@ -3737,9 +3737,8 @@ class CodeContextEngine:
         self._autosync_pending_events = 0
         self._autosync_reindex_count = 0
         self._autosync_history: list[dict[str, Any]] = []
-        # Git HEAD at the last tick (None until the first reading), and the
-        # monotonic ms of the last full-tree check (None until the first one).
         self._autosync_head: str | None = None
+        # Monotonic ms, unlike the wall-clock _autosync_last_sync_ms.
         self._autosync_last_full_check_ms: int | None = None
         # Counts completed tool calls; used to pace the periodic heap trim.
         self._tool_call_count: int = 0
@@ -14749,8 +14748,8 @@ class CodeContextEngine:
         """Reindex if the tree changed; True iff a reindex ran and succeeded.
 
         ``known_change`` names a change the caller already detected (the file
-        watcher, or a HEAD move). It skips the ``_source_tree_signature()`` stat
-        walk before the reindex and is recorded as the reindex's reason.
+        watcher, or a HEAD move). It forces the reindex, bypassing the tree
+        check and the debounce window, and is recorded as the reindex's reason.
         """
         if known_change is not None:
             self._autosync_state = "syncing"

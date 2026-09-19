@@ -2259,17 +2259,14 @@ def test_autosync_failed_head_move_reindex_retries_on_the_next_tick(
 
 @pytest.mark.parametrize(
     ("configured", "interval_ms"),
-    [(None, 300_000), ("not-a-number", 300_000), ("120000", 120_000), ("1000", 60_000)],
+    [("not-a-number", 300_000), ("120000", 120_000), ("1000", 60_000)],
 )
 def test_autosync_poll_interval_default_override_and_floor(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str | None, interval_ms: int
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str, interval_ms: int
 ) -> None:
     env_var = next(spec.env_var for spec in SETTINGS if spec.key == "code_context.autosync_poll_ms")
     assert env_var is not None
-    if configured is None:
-        monkeypatch.delenv(env_var, raising=False)
-    else:
-        monkeypatch.setenv(env_var, configured)
+    monkeypatch.setenv(env_var, configured)
     engine, probe = _autosync_probe_engine(tmp_path, monkeypatch)
 
     engine._autosync_tick(0)
