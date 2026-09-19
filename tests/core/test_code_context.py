@@ -2192,6 +2192,18 @@ def test_autosync_idle_ticks_walk_the_tree_once_per_poll_interval(
     assert [event["event"] for event in engine._autosync_history] == ["bootstrap", "full_check"]
 
 
+def test_autosync_idle_full_checks_fold_into_one_history_entry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LEMONCROW_CODE_AUTOSYNC_POLL_MS", raising=False)
+    engine, _ = _autosync_probe_engine(tmp_path, monkeypatch)
+
+    # Two idle hours: 24 full checks, more than the 20-entry history holds.
+    for check in range(25):
+        engine._autosync_tick(check * 5 * _AUTOSYNC_MINUTE_MS)
+
+    history = [(event["event"], event["count"]) for event in engine._autosync_history]
+    assert history == [("bootstrap", 1), ("full_check", 24)]
+
+
 def test_autosync_tree_change_without_head_move_waits_for_the_poll_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

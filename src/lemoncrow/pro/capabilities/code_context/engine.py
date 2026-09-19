@@ -15083,15 +15083,23 @@ class CodeContextEngine:
         return frozenset(langs)
 
     def _record_autosync_event(self, *, event: str, reason: str, reindexed: bool) -> None:
+        at = datetime.now(UTC).isoformat()
+        history = self._autosync_history
+        if event == "full_check" and history and (history[-1]["event"], history[-1]["reason"]) == (event, reason):
+            # Consecutive idle checks share one entry, so they never evict the
+            # reindex, error and bootstrap entries from the bounded history.
+            history[-1] = {**history[-1], "at": at, "count": history[-1]["count"] + 1}
+            return
         entry = {
-            "at": datetime.now(UTC).isoformat(),
+            "at": at,
             "event": event,
             "reason": reason,
             "reindexed": reindexed,
+            "count": 1,
         }
-        self._autosync_history.append(entry)
-        if len(self._autosync_history) > 20:
-            self._autosync_history = self._autosync_history[-20:]
+        history.append(entry)
+        if len(history) > 20:
+            self._autosync_history = history[-20:]
 
     def _json_safe(self, value: Any) -> Any:
         if value is None or isinstance(value, (str, int, float, bool)):
