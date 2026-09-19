@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import random
+import threading
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -17,6 +18,7 @@ import pytest
 
 from lemoncrow.gateway.adapters import mcp_server
 from lemoncrow.gateway.adapters.mcp_server import tool_smart_edit
+from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1644,3 +1646,231 @@ def test_bash_cwd_is_what_teaches_edit_where_the_session_is(monkeypatch: pytest.
     # A bash call without an explicit cwd must not clear what we know.
     mcp_server._record_session_cwd("bash", {})
     assert mcp_server._last_session_cwd == "/recorded"
+
+
+# ---------------------------------------------------------------------------
+# Edit-triggered reindexing: once per edit, and off the response path when the
+# edit is rooted at the workspace root
+# ---------------------------------------------------------------------------
+
+_EDIT_REINDEX_THREAD = "lemoncrow-edit-reindex"
+
+
+def _join_edit_reindexes() -> None:
+    for thread in threading.enumerate():
+        if thread.name == _EDIT_REINDEX_THREAD:
+            thread.join(timeout=30)
+
+
+def _record_reindexes(
+    monkeypatch: pytest.MonkeyPatch, responded: threading.Event, *, run: bool = False
+) -> list[dict[str, Any]]:
+    """Record every ``CodeContextEngine._reindex_files`` call; with *run*, then run it.
+
+    A call off the test's thread first waits for *responded*, which the test
+    sets once the edit response is back. So a reindex the response waited on
+    times out there and records ``after_response=False``.
+    """
+    calls: list[dict[str, Any]] = []
+    original = CodeContextEngine._reindex_files
+    test_thread = threading.current_thread()
+
+    def _record(self: CodeContextEngine, file_paths: list[str]) -> None:
+        if threading.current_thread() is not test_thread:
+            responded.wait(timeout=5)
+        calls.append(
+            {
+                "root": Path(self.repo_root),
+                "paths": sorted(str(p) for p in file_paths),
+                "thread": threading.current_thread().name,
+                "after_response": responded.is_set(),
+            }
+        )
+        if run:
+            original(self, file_paths)
+
+    monkeypatch.setattr(CodeContextEngine, "_reindex_files", _record)
+    return calls
+
+
+def test_workspace_root_edit_reindexes_once_after_the_response(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One reindex, on the background thread; the response takes no index-write lock."""
+    target = workspace / "mod.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    responded = threading.Event()
+    calls = _record_reindexes(monkeypatch, responded, run=True)
+    lock_takers: list[str] = []
+    original_lock = CodeContextEngine._index_write_lock
+
+    def _spy_lock(self: CodeContextEngine, *args: Any, **kwargs: Any) -> Any:
+        lock_takers.append(threading.current_thread().name)
+        return original_lock(self, *args, **kwargs)
+
+    monkeypatch.setattr(CodeContextEngine, "_index_write_lock", _spy_lock)
+
+    payload = _edit(
+        {
+            "post_edit_hooks": False,
+            "edits": [{"file_path": "mod.py", "old_string": "VALUE = 1", "new_string": "VALUE = 2"}],
+        }
+    )
+    locks_before_response = list(lock_takers)
+    responded.set()
+    _join_edit_reindexes()
+
+    assert "failed" not in payload, payload
+    assert locks_before_response == []
+    assert calls == [
+        {
+            "root": workspace.resolve(),
+            "paths": [str(target.resolve())],
+            "thread": _EDIT_REINDEX_THREAD,
+            "after_response": True,
+        }
+    ]
+    assert lock_takers and set(lock_takers) == {_EDIT_REINDEX_THREAD}
+
+
+def test_edit_rooted_outside_the_workspace_root_reindexes_before_responding(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The workspace's background reindex cannot reach a worktree, so the edit keeps its synchronous one."""
+    wt = _repo_with_worktree(workspace)
+    target = wt / "wt_only.py"
+    target.write_text("VALUE = 1\n", encoding="utf-8")
+    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    responded = threading.Event()
+    calls = _record_reindexes(monkeypatch, responded)
+
+    payload = _edit(
+        {
+            "post_edit_hooks": False,
+            "edits": [{"file_path": "wt_only.py", "old_string": "VALUE = 1", "new_string": "VALUE = 2"}],
+        }
+    )
+    responded.set()
+    _join_edit_reindexes()
+
+    assert "failed" not in payload, payload
+    assert [call for call in calls if call["root"] == wt.resolve()] == [
+        {
+            "root": wt.resolve(),
+            "paths": [str(target.resolve())],
+            "thread": threading.current_thread().name,
+            "after_response": False,
+        }
+    ]
+
+
+def test_partial_failure_reindexes_the_files_it_wrote(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-atomic edit that fails part-way still wrote files, and only those are reindexed."""
+    wrote = workspace / "wrote.py"
+    wrote.write_text("VALUE = 1\n", encoding="utf-8")
+    (workspace / "untouched.py").write_text("OTHER = 1\n", encoding="utf-8")
+    responded = threading.Event()
+    calls = _record_reindexes(monkeypatch, responded)
+
+    payload = _edit(
+        {
+            "post_edit_hooks": False,
+            "atomic": False,
+            "edits": [
+                {"file_path": "wrote.py", "old_string": "VALUE = 1", "new_string": "VALUE = 2"},
+                {"file_path": "untouched.py", "old_string": "no such string", "new_string": "x"},
+            ],
+        }
+    )
+    responded.set()
+    _join_edit_reindexes()
+
+    assert payload["failed"], payload
+    assert wrote.read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert calls == [
+        {
+            "root": workspace.resolve(),
+            "paths": [str(wrote.resolve())],
+            "thread": _EDIT_REINDEX_THREAD,
+            "after_response": True,
+        }
+    ]
+
+
+def test_edit_reindex_off_switch_disables_both_reindexes(workspace: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """LEMONCROW_EDIT_REINDEX=0: no background reindex, and no synchronous one for a worktree edit."""
+    monkeypatch.setenv("LEMONCROW_EDIT_REINDEX", "0")
+    wt = _repo_with_worktree(workspace)
+    (workspace / "main_only.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (wt / "wt_only.py").write_text("VALUE = 1\n", encoding="utf-8")
+    responded = threading.Event()
+    calls = _record_reindexes(monkeypatch, responded)
+
+    for path in (str(workspace / "main_only.py"), "wt_only.py"):
+        monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt) if path == "wt_only.py" else None)
+        payload = _edit(
+            {
+                "post_edit_hooks": False,
+                "edits": [{"file_path": path, "old_string": "VALUE = 1", "new_string": "VALUE = 2"}],
+            }
+        )
+        assert "failed" not in payload, payload
+    responded.set()
+    _join_edit_reindexes()
+
+    assert (wt / "wt_only.py").read_text(encoding="utf-8") == "VALUE = 2\n"
+    assert calls == []
+
+
+_SQUARE = "def area_of_square(side):\n    return side * side\n"
+
+
+def test_search_after_the_background_reindex_finds_a_symbol_the_edit_added(workspace: Path) -> None:
+    (workspace / "shapes.py").write_text(_SQUARE, encoding="utf-8")
+    mcp_server._op_index(repo_root=str(workspace), force=True)
+
+    _edit(
+        {
+            "post_edit_hooks": False,
+            "edits": [
+                {
+                    "file_path": "shapes.py",
+                    "old_string": "    return side * side\n",
+                    "new_string": "    return side * side\n\n\ndef perimeter_of_square(side):\n    return 4 * side\n",
+                }
+            ],
+        }
+    )
+    _join_edit_reindexes()
+
+    hits = mcp_server._code_context_engine(str(workspace)).search_symbols("perimeter_of_square", snippet="full")
+    assert [hit.snippet for hit in hits if hit.qualified_name == "perimeter_of_square"] == [
+        "def perimeter_of_square(side):\n    return 4 * side"
+    ]
+
+
+def test_search_before_the_background_reindex_serves_fresh_snippets(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Until the reindex lands, search-time freshness re-reads an edited file's symbols."""
+    (workspace / "shapes.py").write_text(_SQUARE, encoding="utf-8")
+    mcp_server._op_index(repo_root=str(workspace), force=True)
+    monkeypatch.setattr(mcp_server, "_reindex_edited_files", lambda repo_root, touched_paths: None)
+
+    _edit(
+        {
+            "post_edit_hooks": False,
+            "edits": [
+                {
+                    "file_path": "shapes.py",
+                    "old_string": _SQUARE,
+                    "new_string": '"""Shapes."""\n\nUNIT = 1\n\n\ndef area_of_square(side):\n    return side**2\n',
+                }
+            ],
+        }
+    )
+
+    hits = mcp_server._code_context_engine(str(workspace)).search_symbols("area_of_square", snippet="full")
+    assert [hit.snippet for hit in hits if hit.qualified_name == "area_of_square"] == [
+        "def area_of_square(side):\n    return side**2"
+    ]

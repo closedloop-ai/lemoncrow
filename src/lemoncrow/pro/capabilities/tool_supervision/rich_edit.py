@@ -406,9 +406,13 @@ def _atomic_write(path: Path, text: str) -> None:
         tmp = Path(handle.name)
     if path.exists():
         # tmp.replace() discards the destination's metadata, stripping the exec
-        # bit from scripts/hooks. Carry the original mode (and other stat) over.
+        # bit from scripts/hooks. Carry the original mode (and other stat) over,
+        # but not its timestamps: this is a new write, and every mtime-keyed
+        # change check (search-time freshness, the index's incremental fast
+        # skip) has to see it.
         with contextlib.suppress(OSError):
             shutil.copystat(path, tmp)
+            os.utime(tmp)
             os.chmod(tmp, os.stat(path).st_mode)
     tmp.replace(path)
 
@@ -552,8 +556,13 @@ def apply_rich_edits(
     repo_root: str | Path | None = None,
     atomic: bool = True,
     allowed_roots: list[Path] | None = None,
+    reindex: bool = True,
 ) -> dict[str, Any]:
-    """Apply rich LemonCrow edits in memory, writing each touched file once."""
+    """Apply rich LemonCrow edits in memory, writing each touched file once.
+
+    With ``reindex`` (the default) every written file is reindexed before this
+    returns. A caller that refreshes the index itself passes ``reindex=False``.
+    """
     root = _repo_root(repo_root)
     backups: dict[Path, bytes | None] = {}
     file_state: dict[Path, str] = {}
@@ -868,12 +877,10 @@ def apply_rich_edits(
 
         for path, content in file_state.items():
             _atomic_write(path, content)
-        # Synchronously reindex every written file so the DB index_version is
-        # bumped before the edit response is returned. Combined with the
-        # _index_version_cached = None reset in mcp_server.py this ensures the
-        # next explore call gets a cache miss and re-queries the fresh FTS5
-        # index rather than returning stale pre-edit results.
-        if file_state:
+        # Reindex every written file before returning, so the caller's next
+        # query sees this edit. The throwaway engine bumps the DB index_version,
+        # not the cached one on any long-lived engine.
+        if reindex and file_state:
             try:
                 from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
@@ -950,6 +957,14 @@ def apply_rich_edits(
         for path, content in file_state.items():
             with contextlib.suppress(Exception):
                 _atomic_write(path, content)
+        # A partial application wrote files too, and they need the same reindex.
+        if reindex and file_state:
+            try:
+                from lemoncrow.pro.capabilities.code_context import CodeContextEngine
+
+                CodeContextEngine(root, autosync_enabled=False)._reindex_files([str(path) for path in file_state])
+            except Exception:
+                logging.exception("Non-fatal: post-edit reindex failed")
         return {
             "applied": applied,
             "failed": failed,

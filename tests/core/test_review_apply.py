@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 from lemoncrow.pro.capabilities.live_reviewer import apply as review_apply
 from lemoncrow.pro.capabilities.live_reviewer.apply import apply_review_patches, patch_findings
 
@@ -59,6 +60,37 @@ def test_apply_review_patches_selected_index(monkeypatch: pytest.MonkeyPatch, tm
     assert result["count"] == 1
     assert (repo / "a.py").read_text(encoding="utf-8") == "a = 1\n"  # untouched
     assert (repo / "b.py").read_text(encoding="utf-8") == "b = 2\n"
+
+
+@pytest.mark.parametrize("with_failing_patch", [False, True], ids=["all-applied", "partial"])
+def test_apply_review_patches_leaves_the_index_current(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, with_failing_patch: bool
+) -> None:
+    """The reviewer has no background reindex, so its written files are indexed before it returns."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "shapes.py").write_text("def area(side):\n    return side * side\n", encoding="utf-8")
+    CodeContextEngine(repo, autosync_enabled=False).index_repo()
+    findings = [
+        {
+            "type": "patch",
+            "file": "shapes.py",
+            "old_string": "    return side * side\n",
+            "new_string": "    return side * side\n\n\ndef perimeter(side):\n    return 4 * side\n",
+            "reason": "r",
+        }
+    ]
+    if with_failing_patch:
+        findings.append(
+            {"type": "patch", "file": "shapes.py", "old_string": "no such text", "new_string": "x", "reason": "r"}
+        )
+    monkeypatch.setattr(review_apply, "latest_verdict", lambda root, sid: {"findings": findings})
+
+    result = apply_review_patches(tmp_path, repo, "sid")
+
+    assert bool(result["failed"]) is with_failing_patch
+    hits = CodeContextEngine(repo, autosync_enabled=False).search_symbols("perimeter", auto_index=False)
+    assert [hit.qualified_name for hit in hits] == ["perimeter"]
 
 
 def test_apply_review_patches_none_when_no_patches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
