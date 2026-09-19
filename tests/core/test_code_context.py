@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from lemoncrow.core.settings_registry import SETTINGS
 from lemoncrow.infra.code_intel.astgrep import PatternMatch, PatternSearchResult
 from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 from lemoncrow.pro.capabilities.code_context.budget import BudgetPacker
@@ -2107,38 +2108,17 @@ def test_autosync_incremental_reindex_updates_index_after_edit(tmp_path: Path, m
     assert any(event["event"] == "reindex" for event in status["autosync"]["history"])
 
 
+_AUTOSYNC_MINUTE_MS = 60_000
+
+
 def test_autosync_worker_reindexes_without_search_trigger(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LEMONCROW_CODE_AUTOSYNC_POLL_MS", raising=False)
     _write_fixture_repo(tmp_path)
-    monkeypatch.setenv("LEMONCROW_CODE_AUTOSYNC_DEBOUNCE_MS", "50")
-    monkeypatch.setenv("LEMONCROW_CODE_AUTOSYNC_POLL_MS", "100")
-    # Bypass the production-code poll floor (1000ms) so the worker detects
-    # changes within ~200ms instead of ~2s.
-    monkeypatch.setattr(
-        "lemoncrow.pro.capabilities.code_context.engine.CodeContextEngine._parse_autosync_poll_ms",
-        lambda self, raw_value: max(100, int(raw_value)) if raw_value else 100,
-    )
-    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite")
-
-    for _ in range(40):
-        if engine._current_index_version() > 0:
-            break
-        time.sleep(0.05)
-    if engine._current_index_version() <= 0:
-        engine.index_repo()
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    engine.index_repo()
+    engine._autosync_tick(0)  # the worker's first tick seeds the tree signature
     version_before = engine._current_index_version()
-    assert version_before > 0
 
-    # Wait for the autosync worker to seed its initial source-tree signature
-    # so the file write happens *after* the seed, guaranteeing the next
-    # worker poll detects the change.
-    for _ in range(40):
-        if engine._autosync_signature is not None:
-            break
-        time.sleep(0.05)
-
-    # Modern filesystems (tmpfs, ext4, xfs) have nanosecond timestamps;
-    # a brief pause is sufficient to ensure the edit timestamp advances.
-    time.sleep(0.05)
     (tmp_path / "src" / "orders.py").write_text(
         "class OrderService:\n"
         "    def calculate_total(self, items: list[int]) -> int:\n"
@@ -2148,17 +2128,175 @@ def test_autosync_worker_reindexes_without_search_trigger(tmp_path: Path, monkey
         "    pass\n",
         encoding="utf-8",
     )
+    engine._autosync_last_sync_ms -= 60_000  # outside the debounce window
+    engine._autosync_tick(5 * _AUTOSYNC_MINUTE_MS)  # the next full check, with a real reindex
 
-    for _ in range(40):
-        if engine._current_index_version() > version_before:
-            break
-        time.sleep(0.05)
-    if engine._current_index_version() <= version_before:
-        engine.index_repo(force=False)
-
+    assert engine._current_index_version() > version_before
     found = engine.search_symbols("BackgroundSyncedService", mode="lexical", limit=5, auto_index=False)
     assert found
     assert found[0].symbol_name == "BackgroundSyncedService"
+
+
+class _AutosyncProbe:
+    """Counts one engine's full-tree checks and stands in for its reindex subprocess."""
+
+    def __init__(self, engine: CodeContextEngine, monkeypatch: pytest.MonkeyPatch, reindex_results: list[bool]) -> None:
+        self.tree_walks = 0
+        # For each reindex, the tree walks counted when it started.
+        self.reindexes: list[int] = []
+        real_signature = engine._source_tree_signature
+
+        def signature() -> str:
+            self.tree_walks += 1
+            return real_signature()
+
+        def run_index_subprocess(*, force: bool = False) -> bool:
+            self.reindexes.append(self.tree_walks)
+            return reindex_results.pop(0) if reindex_results else True
+
+        monkeypatch.setattr(engine, "_source_tree_signature", signature)
+        monkeypatch.setattr(engine, "_run_index_subprocess", run_index_subprocess)
+        monkeypatch.setattr(engine, "index_ready", lambda: True)
+        monkeypatch.setattr(engine, "_maybe_refresh_zoekt_index", lambda: None)
+
+
+def _autosync_probe_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, git: bool = False, reindex_results: list[bool] | None = None
+) -> tuple[CodeContextEngine, _AutosyncProbe]:
+    repo = tmp_path / "repo"
+    if git:
+        _init_git_fixture_repo(repo)
+    else:
+        repo.mkdir()
+    _write_fixture_repo(repo)
+    if git:
+        _commit_all(repo, "initial")
+    engine = CodeContextEngine(repo, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    return engine, _AutosyncProbe(engine, monkeypatch, reindex_results or [])
+
+
+def test_autosync_idle_ticks_walk_the_tree_once_per_poll_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LEMONCROW_CODE_AUTOSYNC_POLL_MS", raising=False)
+    engine, probe = _autosync_probe_engine(tmp_path, monkeypatch)
+
+    walks_after_each_tick = []
+    for minute in range(1, 11):
+        engine._autosync_tick(minute * _AUTOSYNC_MINUTE_MS)
+        walks_after_each_tick.append(probe.tree_walks)
+
+    # The first tick seeds the signature; the next check is 5 minutes later.
+    assert walks_after_each_tick == [1, 1, 1, 1, 1, 2, 2, 2, 2, 2]
+    assert probe.reindexes == []
+    assert [event["event"] for event in engine._autosync_history] == ["bootstrap", "full_check"]
+
+
+def test_autosync_tree_change_without_head_move_waits_for_the_poll_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LEMONCROW_CODE_AUTOSYNC_POLL_MS", raising=False)
+    engine, probe = _autosync_probe_engine(tmp_path, monkeypatch, git=True)
+    engine._autosync_tick(0)
+
+    (engine.repo_root / "src" / "orders.py").write_text("class WrittenOutsideLemonCrow:\n    pass\n", encoding="utf-8")
+    engine._autosync_last_sync_ms -= 60_000  # outside the debounce window
+    for minute in range(1, 5):
+        engine._autosync_tick(minute * _AUTOSYNC_MINUTE_MS)
+    assert probe.reindexes == []
+
+    engine._autosync_tick(5 * _AUTOSYNC_MINUTE_MS)
+
+    assert len(probe.reindexes) == 1
+    assert engine._autosync_history[-1]["reason"] == "source_signature_changed"
+
+
+def test_autosync_head_move_reindexes_on_the_next_tick_without_a_tree_walk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("LEMONCROW_CODE_AUTOSYNC_POLL_MS", raising=False)
+    engine, probe = _autosync_probe_engine(tmp_path, monkeypatch, git=True)
+    engine._autosync_tick(0)  # the first reading only seeds HEAD
+    assert probe.reindexes == []
+
+    (engine.repo_root / "src" / "orders.py").write_text("class Committed:\n    pass\n", encoding="utf-8")
+    new_head = _commit_all(engine.repo_root, "move HEAD")
+    walks_before = probe.tree_walks
+    engine._autosync_tick(_AUTOSYNC_MINUTE_MS)
+
+    assert probe.reindexes == [walks_before]
+    assert engine._autosync_head == new_head
+    last_event = engine._autosync_history[-1]
+    assert (last_event["event"], last_event["reason"], last_event["reindexed"]) == ("reindex", "head_moved", True)
+
+    # The reindex reseeded the signature, so it counts as the full check.
+    walks_after_reindex = probe.tree_walks
+    for minute in range(2, 6):
+        engine._autosync_tick(minute * _AUTOSYNC_MINUTE_MS)
+    assert probe.tree_walks == walks_after_reindex
+    engine._autosync_tick(6 * _AUTOSYNC_MINUTE_MS)
+    assert probe.tree_walks == walks_after_reindex + 1
+    assert len(probe.reindexes) == 1
+
+
+def test_autosync_failed_head_move_reindex_retries_on_the_next_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, probe = _autosync_probe_engine(tmp_path, monkeypatch, git=True, reindex_results=[False, True])
+    engine._autosync_tick(0)
+    old_head = engine._autosync_head
+    (engine.repo_root / "src" / "orders.py").write_text("class Committed:\n    pass\n", encoding="utf-8")
+    new_head = _commit_all(engine.repo_root, "move HEAD")
+
+    engine._autosync_tick(_AUTOSYNC_MINUTE_MS)
+    assert len(probe.reindexes) == 1
+    assert engine._autosync_head == old_head
+
+    engine._autosync_tick(2 * _AUTOSYNC_MINUTE_MS)
+    assert len(probe.reindexes) == 2
+    assert engine._autosync_head == new_head
+
+
+@pytest.mark.parametrize(
+    ("configured", "interval_ms"),
+    [(None, 300_000), ("not-a-number", 300_000), ("120000", 120_000), ("1000", 60_000)],
+)
+def test_autosync_poll_interval_default_override_and_floor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str | None, interval_ms: int
+) -> None:
+    env_var = next(spec.env_var for spec in SETTINGS if spec.key == "code_context.autosync_poll_ms")
+    assert env_var is not None
+    if configured is None:
+        monkeypatch.delenv(env_var, raising=False)
+    else:
+        monkeypatch.setenv(env_var, configured)
+    engine, probe = _autosync_probe_engine(tmp_path, monkeypatch)
+
+    engine._autosync_tick(0)
+    engine._autosync_tick(interval_ms - 1)
+    assert probe.tree_walks == 1
+    engine._autosync_tick(interval_ms)
+    assert probe.tree_walks == 2
+
+
+def test_autosync_tick_leaves_change_detection_to_a_live_file_watcher(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _LiveWatcher:
+        def is_alive(self) -> bool:
+            return True
+
+    engine, probe = _autosync_probe_engine(tmp_path, monkeypatch)
+    head_reads: list[int] = []
+    monkeypatch.setattr(engine, "_autosync_git_head", lambda: head_reads.append(1))
+    monkeypatch.setattr(engine, "_file_watcher", _LiveWatcher())
+
+    for minute in range(11):
+        engine._autosync_tick(minute * _AUTOSYNC_MINUTE_MS)
+
+    assert head_reads == []
+    assert probe.tree_walks == 0
+    assert probe.reindexes == []
 
 
 def test_incremental_index_noop_does_not_bump_version(tmp_path: Path) -> None:
