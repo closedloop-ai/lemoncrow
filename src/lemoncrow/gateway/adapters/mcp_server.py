@@ -7722,6 +7722,11 @@ def _silence_clean_edit_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _edit_reindex_enabled() -> bool:
+    """Whether an MCP edit reindexes the files it wrote (operator off-switch, default on)."""
+    return os.environ.get("LEMONCROW_EDIT_REINDEX", "").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _reindex_edited_files(repo_root: Path, touched_paths: list[str]) -> None:
     """Refresh the shared code index for the files an edit wrote, off the response path.
 
@@ -7737,7 +7742,7 @@ def _reindex_edited_files(repo_root: Path, touched_paths: list[str]) -> None:
     """
     if not touched_paths:
         return
-    if os.environ.get("LEMONCROW_EDIT_REINDEX", "").strip().lower() in ("0", "false", "no", "off"):
+    if not _edit_reindex_enabled():
         return
 
     def _run() -> None:
@@ -8167,9 +8172,7 @@ def tool_smart_edit(
         # engine for the workspace root, which drops paths outside it, so an edit
         # rooted anywhere else (an inferred worktree, an explicit root=) keeps
         # the synchronous one.
-        _sync_reindex = _edit_root.resolve() != _repo_root_resolved and os.environ.get(
-            "LEMONCROW_EDIT_REINDEX", ""
-        ).strip().lower() not in ("0", "false", "no", "off")
+        _sync_reindex = _edit_root.resolve() != _repo_root_resolved and _edit_reindex_enabled()
         result = apply_rich_edits(
             edits,
             atomic=atomic,

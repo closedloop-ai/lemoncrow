@@ -587,6 +587,19 @@ def apply_rich_edits(
     _current_edit: dict[str, Any] | None = None  # tracks the edit in-flight for error hints
     _current_edit_idx: int = -1
 
+    def _reindex_written() -> None:
+        # Reindex every written file before returning, so the caller's next
+        # query sees this edit. The throwaway engine bumps the DB index_version,
+        # not the cached one on any long-lived engine.
+        if not (reindex and file_state):
+            return
+        try:
+            from lemoncrow.pro.capabilities.code_context import CodeContextEngine
+
+            CodeContextEngine(root, autosync_enabled=False)._reindex_files([str(path) for path in file_state])
+        except Exception:
+            logging.exception("Non-fatal: post-edit reindex failed")
+
     try:
         for _current_edit_idx, edit in enumerate(edits):
             _current_edit = edit
@@ -877,17 +890,7 @@ def apply_rich_edits(
 
         for path, content in file_state.items():
             _atomic_write(path, content)
-        # Reindex every written file before returning, so the caller's next
-        # query sees this edit. The throwaway engine bumps the DB index_version,
-        # not the cached one on any long-lived engine.
-        if reindex and file_state:
-            try:
-                from lemoncrow.pro.capabilities.code_context import CodeContextEngine
-
-                _idx_engine = CodeContextEngine(root, autosync_enabled=False)
-                _idx_engine._reindex_files([str(path) for path in file_state])
-            except Exception:
-                logging.exception("Non-fatal: post-edit reindex failed")
+        _reindex_written()
         if resolved_symbol_edits:
             for resolved in resolved_symbol_edits:
                 record_symbol_edit_memory(resolved)
@@ -957,13 +960,7 @@ def apply_rich_edits(
         for path, content in file_state.items():
             with contextlib.suppress(Exception):
                 _atomic_write(path, content)
-        if reindex and file_state:
-            try:
-                from lemoncrow.pro.capabilities.code_context import CodeContextEngine
-
-                CodeContextEngine(root, autosync_enabled=False)._reindex_files([str(path) for path in file_state])
-            except Exception:
-                logging.exception("Non-fatal: post-edit reindex failed")
+        _reindex_written()
         return {
             "applied": applied,
             "failed": failed,
