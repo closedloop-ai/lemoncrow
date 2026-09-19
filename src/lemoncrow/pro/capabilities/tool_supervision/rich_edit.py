@@ -957,7 +957,6 @@ def apply_rich_edits(
         for path, content in file_state.items():
             with contextlib.suppress(Exception):
                 _atomic_write(path, content)
-        # A partial application wrote files too, and they need the same reindex.
         if reindex and file_state:
             try:
                 from lemoncrow.pro.capabilities.code_context import CodeContextEngine

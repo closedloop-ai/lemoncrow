@@ -7725,14 +7725,10 @@ def _silence_clean_edit_result(result: dict[str, Any]) -> dict[str, Any]:
 def _reindex_edited_files(repo_root: Path, touched_paths: list[str]) -> None:
     """Refresh the shared code index for the files an edit wrote, off the response path.
 
-    For an edit rooted at the workspace root this is the only reindex the edit
-    triggers: the handler tells ``apply_rich_edits`` to skip its synchronous one.
     Incremental: re-extracts only *touched_paths*, never a full rebuild. It runs
     on a daemon thread through the long-lived, process-shared engine, so that
     engine's index-version cache moves with the reindex and the next code tool
-    call sees the change. The shared engine drops paths outside *repo_root*,
-    which is why an edit rooted anywhere else keeps the synchronous reindex.
-    Fail-open.
+    call sees the change. That engine drops paths outside *repo_root*. Fail-open.
 
     LEMONCROW_EDIT_REINDEX=0 turns off edit-triggered reindexing for MCP edits
     entirely: no background reindex here, and no synchronous reindex for an edit
@@ -8182,9 +8178,8 @@ def tool_smart_edit(
             reindex=_sync_reindex,
         )
         _phase_write_ms = int((time.monotonic() - _phase_start) * 1000)
-        # What this call wrote: each touched file whose bytes moved off its
-        # pre-edit snapshot. A non-atomic partial failure still wrote the files
-        # its applied edits touched; a rolled-back apply wrote nothing.
+        # A non-atomic partial failure still wrote the files its applied edits
+        # touched; a rolled-back apply wrote nothing.
         _written: list[str] = []
         if not result.get("rolled_back"):
             for _fp, _existed, _before in snapshots.values():
@@ -8399,10 +8394,10 @@ def tool_smart_edit(
             ],
         )
         _phase_contract_ms = int((time.monotonic() - _contract_start) * 1000)
-    # Runs after the response is sent. A query that lands before it finishes
-    # still gets fresh snippets, because search-time freshness reindexes any
-    # returned file whose mtime moved. A symbol this edit newly added becomes
-    # searchable only once this reindex completes.
+    # A query that lands before this background reindex finishes still gets
+    # fresh snippets, because search-time freshness reindexes any returned file
+    # whose mtime moved. A symbol this edit newly added becomes searchable only
+    # once the reindex completes.
     if _written and not result.get("rolled_back"):
         _reindex_edited_files(repo_root, _written)
     if (_phase_write_ms + _phase_hooks_ms + _phase_contract_ms) >= _edit_timing_floor_ms():
