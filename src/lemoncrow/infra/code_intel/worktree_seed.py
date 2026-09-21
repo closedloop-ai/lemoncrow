@@ -729,15 +729,19 @@ def forget_worktree(root: Path | str) -> None:
 def retire_worktree_engine(key: str, idle_s: float) -> bool:
     """Retire policy for the daemon's engine cache: True retires the entry at *key*.
 
-    Only worktree engines retire: when their directory is gone, or when they have
-    had no request for :func:`worktree_engine_idle_s`. A main checkout's engine
-    never does. A retiring worktree is forgotten here, Zoekt routing included.
+    Only worktree engines retire: when the worktree is gone, or when they have had
+    no request for :func:`worktree_engine_idle_s`. A main checkout's engine never
+    does. A retiring worktree is forgotten here, Zoekt routing included.
+
+    Gone means its ``.git`` file is gone, not its directory: a reindex still
+    running when ``git worktree remove`` deleted the checkout writes its store
+    back, and that recreates the directory.
     """
     with _lock:
         tracked = key in _worktrees
     if not tracked:
         return False
-    if Path(key).is_dir() and idle_s < worktree_engine_idle_s():
+    if (Path(key) / ".git").is_file() and idle_s < worktree_engine_idle_s():
         return False
     forget_worktree(key)
     return True

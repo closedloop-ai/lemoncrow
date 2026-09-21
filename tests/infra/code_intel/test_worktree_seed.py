@@ -297,6 +297,8 @@ def test_a_removed_worktrees_engine_retires_within_one_tick(repos: tuple[Path, P
     engine._autosync_tick(0)
     assert engine._autosync_stop.is_set(), "the engine's own tick kept running on a removed worktree"
     assert not (worktree / ".lemoncrow").exists(), "the tick recreated the removed worktree's store"
+    # A reindex that was mid-write when the worktree went writes its store back.
+    (worktree / ".lemoncrow" / "workspace").mkdir(parents=True)
 
     retired = mcp_server._code_engine_cache.sweep()
     assert retired == [str(worktree)]
