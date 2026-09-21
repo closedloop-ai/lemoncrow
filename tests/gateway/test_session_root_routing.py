@@ -53,6 +53,7 @@ def _isolated(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setattr(mcp_server, "_code_engine_cache", cache)
     monkeypatch.setattr(mcp_server, "_scoped_context_cache", {})
     yield
+    cache.clear()
     cache.stop_sweeper()
 
 
@@ -193,6 +194,39 @@ def test_a_query_repeated_in_another_checkout_is_answered_and_blanked_only_in_th
     assert f"shared_target L{1 + _SHIFT}-L{2 + _SHIFT}" in in_a, in_a
     assert "shared_target L1-L2" in in_b and f"repo_root: {wt_b}" in in_b, in_b
     assert repeated_in_a.startswith("no exact match") and "shared_target" not in repeated_in_a, repeated_in_a
+
+
+def _fresh_worktree(main: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A worktree the daemon has never opened, with pkg/only_c.py (zeta_only_c) that only it has.
+
+    Engines opened from here have autosync on (tests/gateway/conftest.py forces it
+    off), so opening the worktree seeds it and runs the real post-seed first refresh.
+    """
+    forced_off = CodeContextEngine.__init__
+
+    def with_autosync(self: CodeContextEngine, *args: Any, **kwargs: Any) -> None:
+        forced_off(self, *args, **kwargs)
+        self._autosync_enabled = True
+
+    monkeypatch.setattr(CodeContextEngine, "__init__", with_autosync)
+    worktree = (main.parent / "wt_c").resolve()
+    _git(main, "worktree", "add", "-q", "-b", "c", str(worktree))
+    (worktree / "pkg" / "only_c.py").write_text("def zeta_only_c():\n    return 'c'\n", encoding="utf-8")
+    return worktree
+
+
+def test_the_first_search_in_a_fresh_worktree_waits_for_its_first_refresh(
+    repos: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AC-1.3: the first answer comes from the worktree's own files, not the main checkout's seed."""
+    wt_c = _fresh_worktree(repos[0], monkeypatch)
+    session_id = _session()
+    _record_cwd(session_id, wt_c)
+
+    first = _search(session_id, "zeta_only_c")
+
+    assert "pkg/only_c.py" in first and f"repo_root: {wt_c}" in first.splitlines()[0], first
+    assert mcp_server._INDEX_REFRESHING_NOTE not in first, first
 
 
 def _other_repos_worktree(tmp_path: Path) -> Path:

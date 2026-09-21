@@ -60,12 +60,14 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
 __all__ = [
     "ALIAS_KEY_PREFIX",
     "BUSY",
+    "FIRST_REFRESH_WAIT_S",
     "INDEX_DBS",
     "SEEDED",
     "SEEDED_FROM_KEY",
     "UNAVAILABLE",
     "WORKTREE_ENGINE_IDLE_ENV",
     "SeedResult",
+    "await_first_refresh",
     "checkpoint_index",
     "ensure_seeded",
     "forget_worktree",
@@ -103,6 +105,14 @@ _WRITE_LOCK_WAIT_S = 2.0
 #: How often the factory re-checks a worktree it already has an engine for, so a
 #: worktree whose index went stale (main rebuilt to a new format) gets re-seeded.
 SEED_RECHECK_S = 60.0
+#: Seconds after a just-seeded worktree's first refresh starts during which code
+#: tool calls on that worktree wait for it, so a session's first answers come from
+#: the worktree's own files instead of the main checkout's seed. The window is
+#: counted from the refresh's start, not per call: a refresh slower than this
+#: costs the worktree's callers one wait in total, and every call after the window
+#: answers from the seed, marked refreshing. A small worktree's first refresh
+#: lands in about a second.
+FIRST_REFRESH_WAIT_S = 10.0
 
 WORKTREE_ENGINE_IDLE_ENV = "LEMONCROW_WORKTREE_ENGINE_IDLE_S"
 #: Seconds a worktree engine may go without a request before the daemon unloads
@@ -121,6 +131,9 @@ _lock = threading.Lock()
 _worktrees: dict[str, Path] = {}
 #: Monotonic time a worktree's seed need was last checked.
 _checked_at: dict[str, float] = {}
+#: Worktree root -> (monotonic end of its wait window, set when done) for each
+#: post-seed first refresh still running. The refresh removes its own entry.
+_first_refreshes: dict[str, tuple[float, threading.Event]] = {}
 #: Serialises ensure_seeded's check-and-seed within the process. Two threads
 #: opening one unseeded worktree would otherwise both seed it: the loser's
 #: non-blocking flock on the worktree's own index fails and surfaces as
@@ -680,23 +693,51 @@ def seeded_main_root(root: Path) -> Path | None:
     return main if facts is not None and facts.seeded_from is not None else None
 
 
-def _first_refresh(engine: Any) -> None:
+def _first_refresh(engine: Any, key: str, done: threading.Event) -> None:
     try:
         with engine._autosync_lock:
             engine._maybe_autosync_reindex_locked(known_change="seeded")
     except Exception:
         logger.exception("worktree_seed: first refresh after the seed failed")
+    finally:
+        with _lock:
+            pending = _first_refreshes.get(key)
+            if pending is not None and pending[1] is done:
+                del _first_refreshes[key]
+        done.set()
 
 
-def start_first_refresh(engine: Any) -> None:
-    """Bring a just-seeded engine's index to the worktree's files now, off the request path.
+def start_first_refresh(engine: Any, root: Path | str) -> None:
+    """Bring a just-seeded engine's index to the worktree *root*'s files now, off the request path.
 
-    Queries answer from the seed meanwhile, marked refreshing. Without this the
-    worktree's own edits would wait for autosync's next full-tree poll.
+    Code tool calls on *root* wait for it through :func:`await_first_refresh`.
+    Without it the worktree's own edits would wait for autosync's next full-tree
+    poll.
     """
     if not getattr(engine, "_autosync_enabled", False):
         return
-    threading.Thread(target=_first_refresh, args=(engine,), name="lemoncrow-worktree-seed-refresh", daemon=True).start()
+    key = str(root)
+    done = threading.Event()
+    with _lock:
+        _first_refreshes[key] = (time.monotonic() + FIRST_REFRESH_WAIT_S, done)
+    threading.Thread(
+        target=_first_refresh, args=(engine, key, done), name="lemoncrow-worktree-seed-refresh", daemon=True
+    ).start()
+
+
+def await_first_refresh(root: Path | str) -> bool | None:
+    """Wait for *root*'s post-seed first refresh until :data:`FIRST_REFRESH_WAIT_S` after it started.
+
+    None when no first refresh is running for *root*, True when it finished in
+    time, False when it is still running: the caller then answers from the seed
+    and says the index is refreshing. Holds no lock while it waits.
+    """
+    with _lock:
+        pending = _first_refreshes.get(str(root))
+    if pending is None:
+        return None
+    deadline, done = pending
+    return done.wait(max(0.0, deadline - time.monotonic()))
 
 
 def worktree_engine_idle_s() -> float:

@@ -179,6 +179,7 @@ from lemoncrow.infra.code_intel.freshness import (  # noqa: F401  (IndexRebuildi
     FRESHNESS_REFRESHING,
     IndexRebuilding,
     VersionedEngineCache,
+    note_refreshing,
     reset_readiness_probes,
     take_refreshing,
 )
@@ -9033,9 +9034,17 @@ def _code_context_engine(repo_root: str = ".") -> Any:
         cached=cache_key in _code_engine_cache,
         before_swap=lambda: _code_engine_cache.discard(cache_key),
     )
-    engine, freshness = _code_engine_cache.get(cache_key, resolved, lambda: CodeContextEngine(resolved))
     if seed is not None and seed.seeded:
-        worktree_seed.start_first_refresh(engine)
+        seeded_engine, _ = _code_engine_cache.get(cache_key, resolved, lambda: CodeContextEngine(resolved))
+        worktree_seed.start_first_refresh(seeded_engine, cache_key)
+    # Waited out before the engine is fetched, so the index probe sees the
+    # refreshed index instead of the refresh's write lock.
+    refreshed = worktree_seed.await_first_refresh(cache_key)
+    if refreshed:
+        _code_engine_cache.recheck(cache_key)
+    engine, freshness = _code_engine_cache.get(cache_key, resolved, lambda: CodeContextEngine(resolved))
+    if refreshed is False:
+        note_refreshing()
     _code_index_freshness_for_current_call.value = freshness
     return engine
 
