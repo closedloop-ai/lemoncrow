@@ -5844,9 +5844,12 @@ _RANGE_READ_SIGS: OrderedDict[str, dict[str, tuple[int, int, bool, bytes]]] = Or
 _range_read_sigs_lock = threading.Lock()
 _MAX_RANGE_READ_SIG_SESSIONS = _MAX_HTTP_SESSION_LEDGERS
 
-# Per-session recent code_search queries, same session-bucketing rationale as
-# _RANGE_READ_SIGS above (HTTP: per client session; stdio: one process-wide
-# "_global" bucket per host window). Feeds _check_repeat_query's near-
+# Per-session, per-checkout recent code_search queries, same session-bucketing
+# rationale as _RANGE_READ_SIGS above (HTTP: per client session; stdio: one
+# process-wide "_global" bucket per host window). Keyed by the checkout the
+# search answered from as well: a session that moves into a linked worktree
+# (or names one through absolute paths) asks a different index, so the same
+# words there are a new question, not a repeat. Feeds _check_repeat_query's near-
 # duplicate nudge -- measured 11 near-duplicate code_search calls in a single
 # debt-benchmark rep (2026-07-25): "fail-on-stale stale-days debt_cmd",
 # "stale_days fail_on_stale debt stale age git blame", "_line_age_days git
@@ -5860,7 +5863,7 @@ _MAX_RANGE_READ_SIG_SESSIONS = _MAX_HTTP_SESSION_LEDGERS
 # previous, unrelated chat, possibly hours earlier) would be wrongly blanked.
 # Bounding to _RECENT_QUERY_WINDOW_SECONDS keeps the check scoped to "this
 # same burst of searching", not "this process's entire lifetime".
-_RECENT_CODE_SEARCH_QUERIES: OrderedDict[str, deque[tuple[float, str, frozenset[str]]]] = OrderedDict()
+_RECENT_CODE_SEARCH_QUERIES: OrderedDict[tuple[str, str], deque[tuple[float, str, frozenset[str]]]] = OrderedDict()
 _recent_code_search_queries_lock = threading.Lock()
 _MAX_RECENT_QUERY_SESSIONS = _MAX_HTTP_SESSION_LEDGERS
 _RECENT_QUERY_HISTORY = 3
@@ -5896,26 +5899,28 @@ def _query_words(query: str) -> frozenset[str]:
     return frozenset(w for w in _QUERY_WORD_RE.findall(query.lower()) if len(w) >= 3)
 
 
-def _recent_code_search_queries() -> deque[tuple[float, str, frozenset[str]]]:
-    """The current session's recent-query bucket (see _RECENT_CODE_SEARCH_QUERIES)."""
+def _recent_code_search_queries(root: str) -> deque[tuple[float, str, frozenset[str]]]:
+    """The current session's recent-query bucket for checkout *root* (see _RECENT_CODE_SEARCH_QUERIES)."""
     led = getattr(_request_ledger, "value", None)
     sid = led.session_id if isinstance(led, RunLedger) and led.session_id else "_global"
+    key = (sid, root)
     with _recent_code_search_queries_lock:
-        bucket = _RECENT_CODE_SEARCH_QUERIES.get(sid)
+        bucket = _RECENT_CODE_SEARCH_QUERIES.get(key)
         if bucket is None:
             if len(_RECENT_CODE_SEARCH_QUERIES) >= _MAX_RECENT_QUERY_SESSIONS:
                 _RECENT_CODE_SEARCH_QUERIES.popitem(last=False)
             bucket = deque(maxlen=_RECENT_QUERY_HISTORY)
-            _RECENT_CODE_SEARCH_QUERIES[sid] = bucket
+            _RECENT_CODE_SEARCH_QUERIES[key] = bucket
         else:
-            _RECENT_CODE_SEARCH_QUERIES.move_to_end(sid)
+            _RECENT_CODE_SEARCH_QUERIES.move_to_end(key)
         return bucket
 
 
-def _check_repeat_query(query: str) -> bool:
+def _check_repeat_query(query: str, root: str) -> bool:
     """True when *query* overlaps heavily (Jaccard >= floor) with a query this
-    session ran within the last _RECENT_QUERY_WINDOW_SECONDS -- re-phrasing the
-    same investigation rarely surfaces anything new. A hard signal, not a
+    session ran against checkout *root* within the last
+    _RECENT_QUERY_WINDOW_SECONDS -- re-phrasing the same investigation rarely
+    surfaces anything new. A hard signal, not a
     hint: an explanatory sentence here just adds tokens to a response the
     caller has already shown it skims past and searches again anyway (measured
     across debt-benchmark reps). The caller returns blank results instead --
@@ -5925,7 +5930,7 @@ def _check_repeat_query(query: str) -> bool:
     coincidental word overlap with a stale query from a previous chat.
     """
     words = _query_words(query)
-    bucket = _recent_code_search_queries()
+    bucket = _recent_code_search_queries(root)
     now = time.monotonic()
     is_repeat = False
     if words:
@@ -11146,7 +11151,7 @@ def tool_code_search(
     # engine entirely and returns blank -- no explanatory text (measured: the
     # caller skims past prose hints and searches again anyway; blank results
     # cost nothing and say the same thing).
-    if _check_repeat_query(query):
+    if _check_repeat_query(query, str(workspace_root)):
         return _attach_code_search_savings({"exact_match": False, "files": []}, workspace_root)
     # Normalise: paths param accepts list, comma-sep string, or single path
     # (the legacy `path` kwarg is folded into `paths` by param_aliases).

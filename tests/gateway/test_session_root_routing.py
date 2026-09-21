@@ -176,6 +176,25 @@ def test_absolute_paths_inside_a_worktree_route_to_it_even_from_the_main_checkou
     assert str(wt_a) in message and str(wt_b) in message, message
 
 
+def test_a_query_repeated_in_another_checkout_is_answered_and_blanked_only_in_the_same_one(
+    repos: tuple[Path, Path, Path],
+) -> None:
+    """The near-repeat suppression counts a query as a repeat only against the checkout it was asked in."""
+    main, wt_a, wt_b = repos
+    session_id = _session()
+    _record_cwd(session_id, main)
+    assert "shared_target L1-L2" in _search(session_id, "shared_target")
+
+    _record_cwd(session_id, wt_a)  # what EnterWorktree leaves behind
+    in_a = _search(session_id, "shared_target")
+    in_b = _search(session_id, "shared_target", paths=[str(wt_b / "pkg")])
+    repeated_in_a = _search(session_id, "shared_target")
+
+    assert f"shared_target L{1 + _SHIFT}-L{2 + _SHIFT}" in in_a, in_a
+    assert "shared_target L1-L2" in in_b and f"repo_root: {wt_b}" in in_b, in_b
+    assert repeated_in_a.startswith("no exact match") and "shared_target" not in repeated_in_a, repeated_in_a
+
+
 def _other_repos_worktree(tmp_path: Path) -> Path:
     other = tmp_path / "other"
     other.mkdir()
