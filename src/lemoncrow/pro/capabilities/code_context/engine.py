@@ -173,6 +173,14 @@ def _query_is_natural_language(query: str) -> bool:
 
 
 _MAX_FILE_BYTES = 1_000_000
+# file_line_fts.rowid is (files.rowid << _LINE_ROWID_BITS) | line, so one file's
+# line rows occupy one contiguous rowid range and a reindex drops them with a
+# single range delete instead of scanning the whole table on the UNINDEXED
+# file_path. Every line number has to fit in the low bits, which a file capped at
+# _MAX_FILE_BYTES bytes -- hence at most that many lines -- always does.
+_LINE_ROWID_BITS = 20
+_LINE_ROWID_MASK = (1 << _LINE_ROWID_BITS) - 1
+assert _MAX_FILE_BYTES <= _LINE_ROWID_MASK, "_LINE_ROWID_BITS cannot address every line of a _MAX_FILE_BYTES file"
 logger = logging.getLogger(__name__)
 
 
@@ -343,7 +351,8 @@ _SEARCH_COMPACT_DEFAULT_KEYS = set([*_SEARCH_ESSENTIAL_KEYS, "score", "commit_sh
 _LINEAGE_INDEX_VERSION = 2
 # Bump when source selection or symbol/text extraction semantics change in a way
 # an incremental mtime/hash check cannot see for unchanged files.
-_CODE_INDEXER_SEMANTICS_VERSION = 2
+# 3: FTS5 rows carry explicit rowids derived from files.rowid / symbols.rowid.
+_CODE_INDEXER_SEMANTICS_VERSION = 3
 _LINEAGE_DEFAULT_SCORE_PENALTY = 0.1
 
 # --- File-watcher constants ---
@@ -3985,8 +3994,23 @@ class CodeContextEngine:
         conn: sqlite3.Connection,
         results: list[_FileIndexData],
     ) -> None:
-        """Batch-insert all extracted data using ``executemany`` (single writer)."""
+        """Batch-insert all extracted data using ``executemany`` (single writer).
+
+        Every FTS5 row is written with an explicit rowid taken from the regular
+        table it mirrors, which is what lets :meth:`_delete_files_index` find it
+        again without a full-table scan. That makes the rowid a key: exactly one
+        FTS row may exist per ``files`` / ``symbols`` row, so a path or symbol_id
+        repeated inside one batch is written once.
+        """
         # --- files ---
+        seen_rels: set[str] = set()
+        deduped: list[_FileIndexData] = []
+        for d in results:
+            if d.rel in seen_rels:
+                continue
+            seen_rels.add(d.rel)
+            deduped.append(d)
+        results = deduped
         conn.executemany(
             """
             INSERT INTO files(repo_id, file_path, language, content_hash, size_bytes, mtime_ns, indexed_at)
@@ -4000,6 +4024,14 @@ class CodeContextEngine:
             """,
             [(self.repo_id, d.rel, d.language, d.content_hash, d.size_bytes, d.mtime_ns) for d in results],
         )
+        file_rowids: dict[str, int] = {
+            str(row["file_path"]): int(row["rowid"])
+            for row in conn.execute(
+                "SELECT rowid, file_path FROM files "
+                "WHERE repo_id = ? AND file_path IN (SELECT value FROM json_each(?))",
+                (self.repo_id, json.dumps(sorted(seen_rels))),
+            )
+        }
 
         # --- symbols + FTS ---
         symbol_rows: list[
@@ -4023,10 +4055,18 @@ class CodeContextEngine:
         ] = []
         fts_rows: list[tuple[str, str, str, str, str, str]] = []
         trigram_rows: list[tuple[str, str, str, str]] = []  # (symbol_id, name_plain, qualified_name, file_path)
+        seen_symbol_ids: set[str] = set()
         for d in results:
             for i, sym in enumerate(d.symbols):
                 raw_id = f"{self.repo_id}:{d.rel}:{sym.qualified_name}:{sym.start_byte}:{d.content_hash}"
                 sid = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:24]
+                if sid in seen_symbol_ids:
+                    # Two extracted symbols collapsing to one symbol_id (same file,
+                    # qualified name and start byte) yield one `symbols` row under
+                    # INSERT OR IGNORE, hence one rowid -- and a second FTS row for
+                    # that rowid would be a duplicate key, not a second symbol.
+                    continue
+                seen_symbol_ids.add(sid)
                 symbol_rows.append(
                     (
                         sid,
@@ -4068,25 +4108,46 @@ class CodeContextEngine:
             """,
             symbol_rows,
         )
+        symbol_rowids: dict[str, int] = {
+            str(row["symbol_id"]): int(row["rowid"])
+            for row in conn.execute(
+                "SELECT rowid, symbol_id FROM symbols WHERE symbol_id IN (SELECT value FROM json_each(?))",
+                (json.dumps(sorted(seen_symbol_ids)),),
+            )
+        }
         conn.executemany(
-            "INSERT INTO symbol_fts(symbol_id, name, qualified_name, signature, file_path, source) VALUES (?, ?, ?, ?, ?, ?)",
-            fts_rows,
+            "INSERT INTO symbol_fts(rowid, symbol_id, name, qualified_name, signature, file_path, source) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [(symbol_rowids[r[0]], r[0], r[1], r[2], r[3], r[4], r[5]) for r in fts_rows if r[0] in symbol_rowids],
         )
         conn.executemany(
-            "INSERT INTO symbol_trigram(symbol_id, name, qualified_name, file_path) VALUES (?, ?, ?, ?)",
-            trigram_rows,
+            "INSERT INTO symbol_trigram(rowid, symbol_id, name, qualified_name, file_path) VALUES (?, ?, ?, ?, ?)",
+            [(symbol_rowids[r[0]], r[0], r[1], r[2], r[3]) for r in trigram_rows if r[0] in symbol_rowids],
         )
         conn.executemany(
-            "INSERT INTO file_path_trigram(repo_id, file_path) VALUES (?, ?)",
-            [(self.repo_id, d.rel) for d in results],
+            "INSERT INTO file_path_trigram(rowid, repo_id, file_path) VALUES (?, ?, ?)",
+            [(file_rowids[d.rel], self.repo_id, d.rel) for d in results if d.rel in file_rowids],
         )
 
         # --- line text + FTS ---
-        line_rows: list[tuple[str, str, int, str]] = []
+        line_rows: list[tuple[int, str, str, int, str]] = []
         for d in results:
-            line_rows.extend((self.repo_id, d.rel, line_no, text) for line_no, text in d.text_lines if text.strip())
+            base = file_rowids.get(d.rel)
+            if base is None:
+                continue
+            base <<= _LINE_ROWID_BITS
+            for line_no, text in d.text_lines:
+                if not text.strip():
+                    continue
+                if line_no > _LINE_ROWID_MASK:
+                    # Past the rowid range reserved for this file; packing it anyway
+                    # would write into the next file's range. Only reachable if a file
+                    # grew past _MAX_FILE_BYTES between its stat and its read.
+                    logger.warning("context_engine: %s exceeds %d lines; indexing the first", d.rel, _LINE_ROWID_MASK)
+                    break
+                line_rows.append((base | line_no, self.repo_id, d.rel, line_no, text))
         conn.executemany(
-            "INSERT INTO file_line_fts(repo_id, file_path, line, text) VALUES (?, ?, ?, ?)",
+            "INSERT INTO file_line_fts(rowid, repo_id, file_path, line, text) VALUES (?, ?, ?, ?, ?)",
             line_rows,
         )
 
@@ -4275,10 +4336,37 @@ class CodeContextEngine:
 
             if force:
                 # --- Full rebuild: wipe everything, then parallel-extract + batch-write ---
-                conn.execute("DELETE FROM file_line_fts")
-                conn.execute("DELETE FROM symbol_fts")
-                conn.execute("DELETE FROM symbol_trigram")
-                conn.execute("DELETE FROM file_path_trigram")
+                # DROP + CREATE rather than DELETE: emptying file_line_fts row by row
+                # is 12.4M deletes on a large repo. Python's sqlite3 opens a
+                # transaction implicitly for DML but never for DDL, so without an
+                # explicit BEGIN the first DROP would commit on its own and show every
+                # reader an empty index for the length of the rebuild.
+                if not conn.in_transaction:
+                    conn.execute("BEGIN")
+                # file_line_fts lives in the attached fts database; the rest in main.
+                conn.execute("DROP TABLE IF EXISTS fts.file_line_fts")
+                conn.execute(
+                    "CREATE VIRTUAL TABLE fts.file_line_fts USING fts5("
+                    " repo_id UNINDEXED, file_path UNINDEXED, line UNINDEXED, text)"
+                )
+                conn.execute("DROP TABLE IF EXISTS main.symbol_fts_vocab")
+                conn.execute("DROP TABLE IF EXISTS main.symbol_fts")
+                conn.execute(
+                    "CREATE VIRTUAL TABLE main.symbol_fts USING fts5("
+                    " symbol_id UNINDEXED, name, qualified_name, signature,"
+                    " file_path UNINDEXED, source, prefix='2 3 4 5 6')"
+                )
+                conn.execute("CREATE VIRTUAL TABLE main.symbol_fts_vocab USING fts5vocab(symbol_fts, 'row')")
+                conn.execute("DROP TABLE IF EXISTS main.symbol_trigram")
+                conn.execute(
+                    "CREATE VIRTUAL TABLE main.symbol_trigram USING fts5("
+                    " symbol_id UNINDEXED, name, qualified_name, file_path, tokenize='trigram')"
+                )
+                conn.execute("DROP TABLE IF EXISTS main.file_path_trigram")
+                conn.execute(
+                    "CREATE VIRTUAL TABLE main.file_path_trigram USING fts5("
+                    " repo_id UNINDEXED, file_path, tokenize='trigram')"
+                )
                 conn.execute("DELETE FROM symbols")
                 conn.execute("DELETE FROM imports")
                 conn.execute('DELETE FROM "references"')
@@ -4509,26 +4597,43 @@ class CodeContextEngine:
     def _delete_files_index(self, conn: sqlite3.Connection, rels: list[str]) -> None:
         """Remove every indexed row for the files *rels*, in one pass per table.
 
-        The FTS5 tables are keyed by rowid alone -- ``file_path`` and ``symbol_id``
-        are UNINDEXED columns -- so any delete filtered on them scans the whole
-        table. Issued once per file, that was ~2 s per file on a 12M-line index:
-        an incremental run after a pull (hundreds of changed files) took longer
-        than the autosync subprocess's 600 s timeout, was killed before it
-        committed, and the next run started over. Filtering every table on the
-        whole batch at once costs one scan per FTS table per run. The regular
-        tables are indexed on these columns, so the batch costs them nothing.
+        ``file_path`` and ``symbol_id`` are UNINDEXED columns of the FTS5 tables, so
+        a delete filtered on either scans the whole table -- ~2 s per run on a
+        12M-line index, and an incremental run after a pull outlived the autosync
+        subprocess's 600 s timeout, was killed before it committed, and started over.
+        Every FTS row is therefore written under a rowid taken from the regular table
+        it mirrors (``_apply_file_data_batch``), which the regular tables index on
+        ``file_path``, so each delete below is a rowid seek. EXPLAIN QUERY PLAN on a
+        12M-line index: ``SCAN symbol_fts VIRTUAL TABLE INDEX 0:=`` for the rowid IN
+        form and ``0:><`` for the file_line_fts range, against a constraint-free
+        ``0:`` for the file_path filter they replace.
         """
         if not rels:
             return
         batch = json.dumps(rels)
         paths = "SELECT value FROM json_each(?)"
         symbols = f"SELECT symbol_id FROM symbols WHERE repo_id = ? AND file_path IN ({paths})"
-        conn.execute(f"DELETE FROM file_line_fts WHERE repo_id = ? AND file_path IN ({paths})", (self.repo_id, batch))
-        conn.execute(
-            f"DELETE FROM file_path_trigram WHERE repo_id = ? AND file_path IN ({paths})", (self.repo_id, batch)
+        # Read the rowids before the regular tables lose the rows that carry them.
+        file_rowids = [
+            int(row[0])
+            for row in conn.execute(
+                f"SELECT rowid FROM files WHERE repo_id = ? AND file_path IN ({paths})", (self.repo_id, batch)
+            )
+        ]
+        symbol_rowids = json.dumps(
+            [
+                int(row[0])
+                for row in conn.execute(
+                    f"SELECT rowid FROM symbols WHERE repo_id = ? AND file_path IN ({paths})", (self.repo_id, batch)
+                )
+            ]
         )
-        conn.execute(f"DELETE FROM symbol_trigram WHERE symbol_id IN ({symbols})", (self.repo_id, batch))
-        conn.execute(f"DELETE FROM symbol_fts WHERE symbol_id IN ({symbols})", (self.repo_id, batch))
+        for file_rowid in file_rowids:
+            low = file_rowid << _LINE_ROWID_BITS
+            conn.execute("DELETE FROM file_line_fts WHERE rowid BETWEEN ? AND ?", (low, low | _LINE_ROWID_MASK))
+        conn.execute(f"DELETE FROM file_path_trigram WHERE rowid IN ({paths})", (json.dumps(file_rowids),))
+        conn.execute(f"DELETE FROM symbol_trigram WHERE rowid IN ({paths})", (symbol_rowids,))
+        conn.execute(f"DELETE FROM symbol_fts WHERE rowid IN ({paths})", (symbol_rowids,))
         # Prune persisted embeddings for these files' symbols *before* the symbols
         # themselves. symbol_id encodes the file content hash, so an edited or
         # removed file yields fresh ids -- without this the old vectors orphan
@@ -11386,15 +11491,16 @@ class CodeContextEngine:
         if conn.execute("SELECT 1 FROM symbol_trigram LIMIT 1").fetchone() is None:
             if conn.execute("SELECT 1 FROM symbols LIMIT 1").fetchone() is not None:
                 conn.execute(
-                    "INSERT INTO symbol_trigram(symbol_id, name, qualified_name, file_path) "
-                    "SELECT symbol_id, symbol_name, qualified_name, file_path FROM symbols"
+                    "INSERT INTO symbol_trigram(rowid, symbol_id, name, qualified_name, file_path) "
+                    "SELECT rowid, symbol_id, symbol_name, qualified_name, file_path FROM symbols"
                 )
         # Backfill the file-level path trigram index for DBs built before it existed
         # (see _search_symbols_local's path channel).
         if conn.execute("SELECT 1 FROM file_path_trigram LIMIT 1").fetchone() is None:
             if conn.execute("SELECT 1 FROM files LIMIT 1").fetchone() is not None:
                 conn.execute(
-                    "INSERT INTO file_path_trigram(repo_id, file_path) SELECT DISTINCT repo_id, file_path FROM files"
+                    "INSERT INTO file_path_trigram(rowid, repo_id, file_path) "
+                    "SELECT rowid, repo_id, file_path FROM files"
                 )
         # Migration: symbol_fts built before the prefix indexes existed. FTS5 cannot
         # add prefix indexes to an existing table, so drop and recreate it empty
@@ -13494,6 +13600,12 @@ class CodeContextEngine:
                     return
                 with self._connect() as conn:
                     self._init_schema(conn)
+                    if self._stored_indexer_semantics_version(conn) != _CODE_INDEXER_SEMANTICS_VERSION:
+                        # The stored index predates the rowid-keyed FTS scheme, so its
+                        # FTS rowids mean nothing: deleting by one would drop another
+                        # symbol's row, and inserting at one would collide. The full
+                        # rebuild that the version mismatch forces picks these files up.
+                        return
                     self._delete_files_index(conn, rels)
                     results = (
                         self._parallel_extract(existing_paths, total=len(existing_paths)) if existing_paths else []
