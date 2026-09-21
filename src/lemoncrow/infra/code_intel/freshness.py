@@ -71,6 +71,7 @@ __all__ = [
     "VersionedEngineCache",
     "index_state",
     "note_refreshing",
+    "refreshing_noted",
     "require_ready",
     "reset_readiness_probes",
     "take_refreshing",
@@ -176,6 +177,11 @@ def take_refreshing() -> bool:
     seen = bool(getattr(_refreshing_seen, "value", False))
     _refreshing_seen.value = False
     return seen
+
+
+def refreshing_noted() -> bool:
+    """What :func:`take_refreshing` would return now, without clearing the mark."""
+    return bool(getattr(_refreshing_seen, "value", False))
 
 
 def note_refreshing() -> None:

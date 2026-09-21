@@ -180,6 +180,7 @@ from lemoncrow.infra.code_intel.freshness import (  # noqa: F401  (IndexRebuildi
     IndexRebuilding,
     VersionedEngineCache,
     note_refreshing,
+    refreshing_noted,
     reset_readiness_probes,
     take_refreshing,
 )
@@ -5917,15 +5918,17 @@ def _recent_code_search_queries(root: str) -> deque[tuple[float, str, frozenset[
         return bucket
 
 
-def _check_repeat_query(query: str, root: str) -> bool:
+def _check_repeat_query(query: str, root: str, *, record: bool = True) -> bool:
     """True when *query* overlaps heavily (Jaccard >= floor) with a query this
     session ran against checkout *root* within the last
     _RECENT_QUERY_WINDOW_SECONDS -- re-phrasing the same investigation rarely
     surfaces anything new. A hard signal, not a
     hint: an explanatory sentence here just adds tokens to a response the
     caller has already shown it skims past and searches again anyway (measured
-    across debt-benchmark reps). The caller returns blank results instead --
-    always records *query* into the bucket either way. Time-bounded (not just
+    across debt-benchmark reps). The caller returns blank results instead.
+    *query* goes into the bucket either way, except a new one when *record* is
+    False: the caller records that with _record_code_search_query once it is
+    answered. Time-bounded (not just
     the last _RECENT_QUERY_HISTORY calls) so a brand-new, unrelated
     conversation on the same long-lived daemon never gets blanked because of a
     coincidental word overlap with a stale query from a previous chat.
@@ -5944,8 +5947,20 @@ def _check_repeat_query(query: str, root: str) -> bool:
             if len(words & prior_words) / len(union) >= _REPEAT_QUERY_SIMILARITY_FLOOR:
                 is_repeat = True
                 break
-    bucket.append((now, query, words))
+    if record or is_repeat:
+        bucket.append((now, query, words))
     return is_repeat
+
+
+def _record_code_search_query(query: str, root: str) -> None:
+    """Count *query*'s answer from checkout *root* toward _check_repeat_query.
+
+    Skipped for an answer read while the index was refreshing: it may predate the
+    files it was asked about, so a retry is a fair question, not a repeat.
+    """
+    if refreshing_noted():
+        return
+    _recent_code_search_queries(root).append((time.monotonic(), query, _query_words(query)))
 
 
 # Per-line digest: crc32 + byte length, 8 bytes a line. Both halves must match
@@ -11162,7 +11177,7 @@ def tool_code_search(
     # engine entirely and returns blank -- no explanatory text (measured: the
     # caller skims past prose hints and searches again anyway; blank results
     # cost nothing and say the same thing).
-    if _check_repeat_query(query, str(workspace_root)):
+    if _check_repeat_query(query, str(workspace_root), record=False):
         return _attach_code_search_savings({"exact_match": False, "files": []}, workspace_root)
     # Normalise: paths param accepts list, comma-sep string, or single path
     # (the legacy `path` kwarg is folded into `paths` by param_aliases).
@@ -11222,6 +11237,7 @@ def tool_code_search(
     # the agent reads only what it picks. Content-only shaping -- the ranked
     # file/candidate surface (and retrieval MRR) is untouched either way.
     shaped = _outline_lean_view(lean, keep_top2=include_source or bool(lean.get("exact_match")))
+    _record_code_search_query(query, str(workspace_root))
     return _attach_code_search_savings(shaped, workspace_root)
 
 

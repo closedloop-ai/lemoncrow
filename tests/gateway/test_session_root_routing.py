@@ -229,6 +229,48 @@ def test_the_first_search_in_a_fresh_worktree_waits_for_its_first_refresh(
     assert mcp_server._INDEX_REFRESHING_NOTE not in first, first
 
 
+def test_a_first_refresh_slower_than_the_wait_is_announced_and_a_retry_is_answered(
+    repos: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = threading.Event()
+    real_refresh = worktree_seed._first_refresh
+
+    def slow_refresh(engine: Any, *args: Any) -> None:
+        with engine._autosync_lock:  # keeps autosync's own poll off the index meanwhile
+            release.wait(timeout=60)
+            real_refresh(engine, *args)
+
+    monkeypatch.setattr(worktree_seed, "_first_refresh", slow_refresh)
+    monkeypatch.setattr(worktree_seed, "FIRST_REFRESH_WAIT_S", 0.2)
+    wt_c = _fresh_worktree(repos[0], monkeypatch)
+    session_id = _session()
+    _record_cwd(session_id, wt_c)
+
+    first = _search(session_id, "zeta_only_c")
+    release.set()
+    for thread in threading.enumerate():
+        if thread.name == "lemoncrow-worktree-seed-refresh":
+            thread.join(timeout=60)
+    retry = _search(session_id, "where is zeta_only_c defined")
+
+    assert mcp_server._INDEX_REFRESHING_NOTE in first, first
+    assert "pkg/only_c.py" in retry, retry
+
+
+def test_a_reworded_repeat_of_an_answer_from_the_refreshed_index_is_still_blanked(
+    repos: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wt_c = _fresh_worktree(repos[0], monkeypatch)
+    session_id = _session()
+    _record_cwd(session_id, wt_c)
+
+    first = _search(session_id, "zeta_only_c")
+    reworded = _search(session_id, "where is zeta_only_c defined")
+
+    assert mcp_server._INDEX_REFRESHING_NOTE not in first, first
+    assert reworded.startswith("no exact match") and "only_c" not in reworded, reworded
+
+
 def _other_repos_worktree(tmp_path: Path) -> Path:
     other = tmp_path / "other"
     other.mkdir()
