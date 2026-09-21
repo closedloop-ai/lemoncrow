@@ -45,6 +45,7 @@ from lemoncrow.infra.code_intel.astgrep import (
     PatternRewriteResult,
     PatternSearchResult,
 )
+from lemoncrow.infra.code_intel.store import CODE_INDEXER_SEMANTICS_VERSION as _CODE_INDEXER_SEMANTICS_VERSION
 from lemoncrow.infra.code_intel.worktree_seed import is_seeded_index, resolve_repo_id
 from lemoncrow.infra.tree_sitter.tags import Tag, detect_language, extract_tags
 from lemoncrow.pro.capabilities.code_context.ann_symbol_index import (
@@ -405,10 +406,6 @@ _DELETED_SEARCH_OPTIONAL_KEYS = [
 ]
 _SEARCH_COMPACT_DEFAULT_KEYS = set([*_SEARCH_ESSENTIAL_KEYS, "score", "commit_sha"])
 _LINEAGE_INDEX_VERSION = 2
-# Bump when source selection or symbol/text extraction semantics change in a way
-# an incremental mtime/hash check cannot see for unchanged files.
-# 3: FTS5 rows carry explicit rowids derived from files.rowid / symbols.rowid.
-_CODE_INDEXER_SEMANTICS_VERSION = 3
 _LINEAGE_DEFAULT_SCORE_PENALTY = 0.1
 
 # --- File-watcher constants ---

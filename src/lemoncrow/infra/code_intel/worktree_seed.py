@@ -44,7 +44,13 @@ from typing import Any
 
 from lemoncrow.core.foundation.paths import resolve_workspace_store_dir, workspace_store_dir
 from lemoncrow.infra.code_intel.freshness import INDEX_LOCK_SUFFIX, IndexRebuilding
-from lemoncrow.infra.code_intel.store import CODE_CONTEXT_DB, FTS_DB, INTEL_DB, VECTORS_DB
+from lemoncrow.infra.code_intel.store import (
+    CODE_CONTEXT_DB,
+    CODE_INDEXER_SEMANTICS_VERSION,
+    FTS_DB,
+    INTEL_DB,
+    VECTORS_DB,
+)
 
 try:
     import fcntl
@@ -250,12 +256,6 @@ def main_root_of(worktree: Path) -> Path | None:
         return main if main != worktree.resolve() else None
     except OSError:
         return None
-
-
-def _current_semantics_version() -> int:
-    from lemoncrow.pro.capabilities.code_context.engine import _CODE_INDEXER_SEMANTICS_VERSION
-
-    return _CODE_INDEXER_SEMANTICS_VERSION
 
 
 def _read_facts(db: Path, repo_id: str | None) -> _IndexFacts | None:
@@ -546,7 +546,7 @@ def seed_worktree_index(
     main_db = main_store / CODE_CONTEXT_DB
     main_lock = main_store / (CODE_CONTEXT_DB + INDEX_LOCK_SUFFIX)
     main_id = effective_repo_id(main)
-    current = _current_semantics_version()
+    current = CODE_INDEXER_SEMANTICS_VERSION
     unavailable = _main_unavailable(_read_facts(main_db, main_id), current)
     if unavailable is not None:
         if main_lock.exists() and _lock_held(main_lock):
@@ -643,7 +643,7 @@ def ensure_seeded(
     with _lock:
         _worktrees[key] = main
         _checked_at[key] = now
-    current = _current_semantics_version()
+    current = CODE_INDEXER_SEMANTICS_VERSION
     worktree_facts = _read_facts(workspace_store_dir(root) / CODE_CONTEXT_DB, None)
     main_facts = _read_facts(workspace_store_dir(main) / CODE_CONTEXT_DB, effective_repo_id(main))
     reason = "reseed" if reseed else _seed_reason(worktree_facts, main_facts, current)
