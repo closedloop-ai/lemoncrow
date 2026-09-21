@@ -2620,6 +2620,61 @@ def test_a_migration_that_empties_files_rebuilds_instead_of_colliding_on_rowid(t
     assert [h.qualified_name for h in engine.search_symbols("OrderService", limit=5)]
 
 
+def test_a_new_repo_indexed_into_a_shared_db_leaves_the_other_repos_index_intact(tmp_path: Path) -> None:
+    """`files` being empty for *this* repo while the FTS tables hold rows is the
+    migration signature only when those rows are this repo's. A second repo's first
+    index into a db_path another repo already filled must stay incremental: the full
+    rebuild wipes every repo's rows, not just its own.
+    """
+    repo_a = tmp_path / "repo_a"
+    repo_b = tmp_path / "repo_b"
+    repo_a.mkdir()
+    (repo_b / "src").mkdir(parents=True)
+    _write_fixture_repo(repo_a)
+    (repo_b / "src" / "inventory.py").write_text(
+        "class InventoryLedger:\n    def reserve(self) -> int:\n        return 1\n", encoding="utf-8"
+    )
+    db_path = tmp_path / "shared.sqlite"
+    engine_a = CodeContextEngine(repo_a, db_path=db_path, autosync_enabled=False)
+    engine_b = CodeContextEngine(repo_b, db_path=db_path, autosync_enabled=False)
+    assert engine_a.repo_id != engine_b.repo_id
+
+    def a_rows() -> dict[str, int]:
+        with engine_a._connect() as conn:
+
+            def count(sql: str) -> int:
+                return int(conn.execute(sql, (engine_a.repo_id,)).fetchone()[0])
+
+            return {
+                "files": count("SELECT COUNT(*) FROM files WHERE repo_id = ?"),
+                "symbols": count("SELECT COUNT(*) FROM symbols WHERE repo_id = ?"),
+                "symbol_fts": count(
+                    "SELECT COUNT(*) FROM symbol_fts t JOIN symbols s ON s.rowid = t.rowid WHERE s.repo_id = ?"
+                ),
+                "file_path_trigram": count("SELECT COUNT(*) FROM file_path_trigram WHERE repo_id = ?"),
+                "file_line_fts": count("SELECT COUNT(*) FROM file_line_fts WHERE repo_id = ?"),
+                "symbol_match": count(
+                    "SELECT COUNT(*) FROM symbol_fts t JOIN symbols s ON s.rowid = t.rowid "
+                    "WHERE symbol_fts MATCH 'OrderService' AND s.repo_id = ?"
+                ),
+                "line_match": count(
+                    "SELECT COUNT(*) FROM file_line_fts WHERE file_line_fts MATCH 'calculate_total' AND repo_id = ?"
+                ),
+            }
+
+    engine_a.index_repo(force=False)
+    before = a_rows()
+    assert all(before.values()), before
+
+    indexed_b = engine_b.index_repo(force=False)
+
+    assert indexed_b.files_indexed == 1
+    assert a_rows() == before
+    _assert_every_fts_row_is_keyed_to_the_row_it_mirrors(engine_a)
+    assert [h.qualified_name for h in engine_a.search_symbols("OrderService", limit=5)]
+    assert [h.qualified_name for h in engine_b.search_symbols("InventoryLedger", limit=5)]
+
+
 def test_the_full_rebuild_recreates_the_fts_tables_exactly_as_the_schema_defines_them(tmp_path: Path) -> None:
     """The rebuild drops and recreates the FTS5 tables. A column, tokenizer or prefix
     set that drifts from `_init_schema`'s would be rebuilt into an index every later

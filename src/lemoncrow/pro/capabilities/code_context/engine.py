@@ -4656,9 +4656,16 @@ class CodeContextEngine:
             return False
         if conn.execute("SELECT 1 FROM files WHERE repo_id = ? LIMIT 1", (self.repo_id,)).fetchone() is not None:
             return True
-        for table in ("file_path_trigram", "symbol_fts", "symbol_trigram", "fts.file_line_fts"):
+        # Only the tables keyed on files.rowid can collide: those migrations leave
+        # `symbols`, and so the symbol_fts/symbol_trigram rowids, intact. The probe is
+        # scoped to this repo because a shared db_path holds other repos' rows too, and
+        # the rebuild a False forces wipes every repo's index, not just this one's.
+        for table in ("file_path_trigram", "fts.file_line_fts"):
             with contextlib.suppress(sqlite3.Error):
-                if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None:
+                if (
+                    conn.execute(f"SELECT 1 FROM {table} WHERE repo_id = ? LIMIT 1", (self.repo_id,)).fetchone()
+                    is not None
+                ):
                     return False
         return True
 
