@@ -177,12 +177,13 @@ def test_exclusion_source_names_only_the_rules_that_fired(
 
     It was a fixed string, so a report whose only exclusion was a skipped
     directory still named git-ignore, which no path used, and never named the
-    skipped directory, which did.
+    skipped directory, which did. ``data/fixture.py`` stays untracked: the
+    skipped directory never passes over a tracked file.
     """
     _write(workspace_root, "data/fixture.py", "def rows():\n    return []\n")
     _write(workspace_root, "prompts/prompt.txt", "Review this diff.\n")
     root = _index_one_file(workspace_root, make_workspace)
-    _git_init(root, "data/fixture.py", "prompts/prompt.txt")
+    _git_init(root, "prompts/prompt.txt")
 
     report = check_coverage(paths=["prompts/prompt.txt", "src/a.py", "data/fixture.py"], repo_root=root)
 
@@ -212,7 +213,7 @@ def _index_one_file(workspace_root: Path, make_workspace: WorkspaceFactory) -> P
 
 
 def test_skipped_directory_reports_excluded_with_rule(workspace_root: Path, make_workspace: WorkspaceFactory) -> None:
-    """A supported language under ``data/`` is still never indexed: excluded, not missing."""
+    """An untracked file in a supported language under ``data/`` is never indexed: excluded, not missing."""
     _write(workspace_root, "data/fixture.py", "def rows():\n    return []\n")
     root = _index_one_file(workspace_root, make_workspace)
 
@@ -402,3 +403,64 @@ def test_on_demand_indexing_still_takes_a_new_source_file(workspace_root: Path) 
     assert "src/added.py" in files
     assert "src/added.py" in symbols
     assert _state_of(check_coverage(paths=["src/added.py"], repo_root=root), "src/added.py") == "indexed"
+
+
+_TRACKED_IN_SKIP_DIRS = ("build/[id]/page.py", "data/rows.py", "results/route.py")
+
+
+def _symbol_names(db_path: Path, rel: str) -> set[str]:
+    with sqlite3.connect(db_path) as conn:
+        return {str(row[0]) for row in conn.execute("SELECT symbol_name FROM symbols WHERE file_path = ?", (rel,))}
+
+
+def test_a_tracked_file_is_indexed_whatever_its_directory_is_called(workspace_root: Path) -> None:
+    """Both entry points and the verdict agree: git tracking outranks the skipped-directory list.
+
+    A Next.js route under ``build/[id]/`` is source its owner committed. The
+    untracked file beside it is still passed over by the directory name, and an
+    edit's re-index admits the one and not the other.
+    """
+    from lemoncrow.pro.capabilities.code_context import CodeContextEngine
+
+    root = workspace_root.resolve()
+    _write(root, "src/app.py", "def app():\n    return 1\n")
+    for rel in _TRACKED_IN_SKIP_DIRS:
+        _write(root, rel, "def tracked_fn():\n    return 1\n")
+    _write(root, "build/scratch.py", "def scratch():\n    return 1\n")
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True, capture_output=True, timeout=30)
+    subprocess.run(
+        ["git", "--literal-pathspecs", "add", "--", "src/app.py", *_TRACKED_IN_SKIP_DIRS],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        timeout=30,
+    )
+    engine = CodeContextEngine(root, autosync_enabled=False)
+    engine.index_repo()
+
+    report = check_coverage(paths=[*_TRACKED_IN_SKIP_DIRS, "build/scratch.py"], repo_root=root)
+    assert {entry.path: (entry.state, entry.rule) for entry in report.paths} == {
+        **{rel: ("indexed", None) for rel in _TRACKED_IN_SKIP_DIRS},
+        "build/scratch.py": ("excluded", "skipped-directory"),
+    }
+
+    # What an edit to each does: the tracked route is re-extracted, the untracked file stays out.
+    _write(root, "build/[id]/page.py", "def page_v2():\n    return 2\n")
+    engine._reindex_files(["build/[id]/page.py", "build/scratch.py"])
+
+    files, _symbols = _indexed_paths(engine.db_path)
+    assert _symbol_names(engine.db_path, "build/[id]/page.py") == {"page_v2"}
+    assert "build/scratch.py" not in files
+    assert _state_of(check_coverage(paths=["build/[id]/page.py"], repo_root=root), "build/[id]/page.py") == "indexed"
+
+
+def test_lemoncrow_ignore_still_binds_a_tracked_file(workspace_root: Path, make_workspace: WorkspaceFactory) -> None:
+    """``.lemoncrow/.ignore`` is the explicit opt-out for tracked files; tracking does not override it."""
+    _write(workspace_root, ".lemoncrow/.ignore", "fixtures/\n")
+    _write(workspace_root, "fixtures/dump.py", "def dump():\n    return 1\n")
+    root = _index_one_file(workspace_root, make_workspace)
+    _git_init(root, "fixtures/dump.py")
+
+    (entry,) = check_coverage(paths=["fixtures/dump.py"], repo_root=root).paths
+
+    assert (entry.state, entry.rule) == ("excluded", "lemoncrow-ignore")

@@ -210,3 +210,27 @@ def test_iter_source_files_respects_lemoncrow_ignore_git_tracked(tmp_path: Path)
     files = {path.relative_to(tmp_path).as_posix() for path in iter_source_files(tmp_path)}
 
     assert files == {"src/keep.py"}
+
+
+def test_iter_source_files_takes_tracked_files_whatever_their_directory_is_called(tmp_path: Path) -> None:
+    """A tracked file is indexed under any directory name; the skip list judges only untracked files."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    tracked = [
+        "src/keep.py",
+        "app/[orgSlug]/build/[id]/page.ts",
+        "insights/data/source.ts",
+        "compute/results/route.ts",
+        "node_modules/vendored/index.js",
+        "dist/action.js",
+    ]
+    untracked = ["build/scratch.py", "data/dump.py", ".venv/lib/site.py", "node_modules/dep/index.js"]
+    for rel in [*tracked, *untracked]:
+        (tmp_path / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / rel).write_text("export const x = 1;\n" if rel.endswith((".ts", ".js")) else "X = 1\n")
+    subprocess.run(["git", "--literal-pathspecs", "add", "--", *tracked], cwd=tmp_path, check=True)
+
+    files = {path.relative_to(tmp_path).as_posix() for path in iter_source_files(tmp_path)}
+
+    assert files == set(tracked)

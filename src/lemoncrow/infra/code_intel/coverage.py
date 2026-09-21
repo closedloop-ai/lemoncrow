@@ -55,6 +55,7 @@ from lemoncrow.infra.code_intel.inclusion import (
     exclusion_rule,
     free_tier_selection,
     git_ignored,
+    git_tracked,
     load_lemoncrow_ignore_spec,
     run_git,
     source_file_patterns,
@@ -214,6 +215,7 @@ def _exclusion(
     rel: str,
     selection: _IndexSelection,
     ignored: frozenset[str],
+    tracked: frozenset[str],
     patterns: Sequence[str],
 ) -> tuple[str, str]:
     """``(rule, reason)`` for an on-disk path the indexer's scan passed over.
@@ -223,7 +225,9 @@ def _exclusion(
     when the scan passed a path over for a reason no rule sees -- an untracked
     file inside a submodule, which ``git ls-files --others`` does not recurse.
     """
-    return exclusion_rule(rel, ignore_spec=selection.ignore_spec, ignored=ignored, patterns=patterns) or (
+    return exclusion_rule(
+        rel, ignore_spec=selection.ignore_spec, ignored=ignored, tracked=tracked, patterns=patterns
+    ) or (
         RULE_SOURCE_FILE_SCAN,
         REASON_SOURCE_FILE_SCAN,
     )
@@ -290,7 +294,9 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
 
     unindexed_on_disk = [rel for rel in candidates if rel not in indexed and (root / rel).exists()]
     selection = _index_selection(root) if unindexed_on_disk else _NO_SELECTION
-    ignored = git_ignored(root, [rel for rel in unindexed_on_disk if rel not in selection.selected])
+    passed_over = [rel for rel in unindexed_on_disk if rel not in selection.selected]
+    ignored = git_ignored(root, passed_over)
+    tracked = git_tracked(root, passed_over)
     patterns = source_file_patterns() if unindexed_on_disk else []
 
     entries: list[PathCoverage] = []
@@ -321,7 +327,7 @@ def check_coverage(paths: list[str] | None = None, repo_root: Path | str = ".") 
         elif not exists:
             entry = PathCoverage(rel, "missing", "not on disk and not indexed", language_name, 0)
         elif rel not in selection.selected:
-            rule, reason = _exclusion(rel, selection, ignored, patterns)
+            rule, reason = _exclusion(rel, selection, ignored, tracked, patterns)
             entry = PathCoverage(rel, "excluded", reason, language_name, 0, rule)
         elif rel not in selection.kept:
             entry = PathCoverage(rel, "excluded", "free-tier file cap", language_name, 0, RULE_FREE_TIER_FILE_CAP)

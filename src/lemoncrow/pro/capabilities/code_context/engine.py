@@ -8409,7 +8409,14 @@ class CodeContextEngine:
                     )
         if file_glob:
             hits = [hit for hit in hits if _matches_file_glob(hit.file_path, file_glob)]
-        hits = [hit for hit in hits if not should_skip_relative_path(hit.file_path)]
+        # Repo symbols already passed the index's file-selection rules, which take a
+        # tracked file whatever its directory is called; the directory-name filter
+        # still judges commit-history and external-dependency hits.
+        hits = [
+            hit
+            for hit in hits
+            if (scope == "repo" and hit.provenance != "commit") or not should_skip_relative_path(hit.file_path)
+        ]
         if provenance_filter is not None:
             hits = [h for h in hits if h.provenance == provenance_filter]
         if _is_precise_symbol_query(query):

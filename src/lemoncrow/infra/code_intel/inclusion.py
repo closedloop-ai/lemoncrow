@@ -15,6 +15,13 @@ reports ``excluded`` has no rows in the index to find. The scan itself calls
 *down* into this module, which is why nothing here imports from
 :mod:`lemoncrow.pro` at any scope -- the dependency runs one way.
 
+A file git tracks is the owner's word that it belongs to the project, so it is
+indexed whatever its directory is called: the skipped-directory list judges only
+files git does not track -- untracked, not-ignored files and every file of the
+non-git fallback walk -- where nothing else tells build output or a dependency
+tree apart from source. ``.lemoncrow/.ignore`` is an explicit opt-out and binds
+tracked files too; it is the way to keep a tracked data dump out.
+
 Fail-open by design: a rule that cannot be evaluated -- git missing, the
 directory not a repository, ``pathspec`` not installed -- admits the path, which
 is what the scan's own non-git fallback (``_iter_glob_source_files``) does.
@@ -44,6 +51,7 @@ __all__ = [
     "exclusion_rule",
     "free_tier_selection",
     "git_ignored",
+    "git_tracked",
     "indexable_paths",
     "load_lemoncrow_ignore_spec",
     "run_git",
@@ -64,7 +72,8 @@ REASON_SOURCE_FILE_SCAN = "not selected by the index's source-file scan"
 
 #: The indexer's file-selection rules, first match wins. The free-tier cap only
 #: ever applies to a path the scan selected, and every other rule only to a path
-#: it did not. ``source-file-scan`` closes the ladder: the scan's own glob gate
+#: it did not. ``skipped-directory`` and ``git-ignore`` never fire for a tracked
+#: file. ``source-file-scan`` closes the ladder: the scan's own glob gate
 #: does not take the path, and no narrower rule says why (an extension in the
 #: wrong case, an untracked file inside a submodule).
 EXCLUSION_RULES: tuple[str, ...] = (
@@ -76,6 +85,9 @@ EXCLUSION_RULES: tuple[str, ...] = (
     RULE_SOURCE_FILE_SCAN,
 )
 
+#: Directory names whose files are never indexed unless git tracks them. Only
+#: untracked files meet this list: a tracked file under ``build/`` or ``data/``
+#: is source its owner committed (a Next.js ``build/[id]/page.tsx`` route).
 _SKIP_PARTS = {
     ".git",
     ".lemoncrow",
@@ -242,11 +254,57 @@ def git_ignored(root: Path, candidates: Sequence[str]) -> frozenset[str]:
     return frozenset(entry for entry in output.split("\0") if entry)
 
 
+#: Pathspecs per ``git ls-files`` call in :func:`git_tracked`, so a batch of
+#: thousands of touched files stays well under the OS argument-length limit.
+_TRACKED_QUERY_CHUNK = 1000
+
+
+def git_tracked(root: Path, candidates: Sequence[str]) -> frozenset[str]:
+    """The repo-relative *candidates* git tracks in this checkout, submodules included.
+
+    The answer the scan's ``ls-files --cached --recurse-submodules`` pass gives,
+    asked only about *candidates* so an edit's re-index does not list the whole
+    repository. Pathspecs are literal: ``app/[id]/page.tsx`` is a path, not a glob.
+
+    Fail-open to the empty set: every candidate is then judged as untracked, by
+    the full rule ladder -- what the scan's own non-git fallback applies.
+    """
+    tracked: set[str] = set()
+    for start in range(0, len(candidates), _TRACKED_QUERY_CHUNK):
+        chunk = candidates[start : start + _TRACKED_QUERY_CHUNK]
+        try:
+            completed = subprocess.run(
+                [
+                    "git",
+                    "--literal-pathspecs",
+                    "-C",
+                    str(root),
+                    "ls-files",
+                    "-z",
+                    "--cached",
+                    "--recurse-submodules",
+                    "--",
+                    *chunk,
+                ],
+                capture_output=True,
+                check=False,
+                timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return frozenset()
+        if completed.returncode != 0:
+            return frozenset()
+        # Bytes, not text: a non-UTF-8 name must not raise out of an edit's re-index.
+        tracked.update(entry.decode("utf-8", errors="replace") for entry in completed.stdout.split(b"\0") if entry)
+    return frozenset(tracked)
+
+
 def exclusion_rule(
     rel: str,
     *,
     ignore_spec: Any | None,
     ignored: Container[str],
+    tracked: Container[str],
     patterns: Sequence[str] | None = None,
 ) -> tuple[str, str] | None:
     """``(rule, reason)`` for the first rule that passes *rel* over, else ``None``.
@@ -258,12 +316,14 @@ def exclusion_rule(
     scan drops on its patterns alone -- ``src/SHOUT.PY`` -- was admitted by the
     incremental entry point while coverage called it ``excluded``.
 
-    *patterns* defaults to the scan's own :data:`SOURCE_FILE_PATTERNS`; pass the
-    list once when classifying a batch.
+    A path in *tracked* (see :func:`git_tracked`) skips the skipped-directory
+    rung: git vouches for it. *patterns* defaults to the scan's own
+    :data:`SOURCE_FILE_PATTERNS`; pass the list once when classifying a batch.
     """
-    for part in Path(rel).parts:
-        if should_skip_relative_path(part):
-            return RULE_SKIPPED_DIRECTORY, f"skipped directory: {part}"
+    if rel not in tracked:
+        for part in Path(rel).parts:
+            if should_skip_relative_path(part):
+                return RULE_SKIPPED_DIRECTORY, f"skipped directory: {part}"
     if ignore_spec is not None and ignore_spec.match_file(rel):
         return RULE_LEMONCROW_IGNORE, ".lemoncrow/.ignore"
     if rel in ignored:
@@ -280,9 +340,10 @@ def indexable_paths(repo_root: Path, paths: Iterable[Path]) -> list[Path]:
 
     For the incremental entry point, where the candidates are the handful of
     files an edit touched rather than a whole scan: the ``.lemoncrow/.ignore``
-    spec is loaded once and git is asked once for the batch, so the cost is one
-    subprocess per reindex, not one per file. A path outside *repo_root* is
-    dropped -- no scan of this checkout would ever list it.
+    spec is loaded once and git is asked about the batch as a whole -- which
+    candidates it ignores, which it tracks -- so the cost is two subprocesses
+    per reindex, not per file. A path outside *repo_root* is dropped -- no scan
+    of this checkout would ever list it.
     """
     root = repo_root.resolve()
     pairs: list[tuple[Path, str]] = []
@@ -294,10 +355,12 @@ def indexable_paths(repo_root: Path, paths: Iterable[Path]) -> list[Path]:
     if not pairs:
         return []
     ignore_spec = load_lemoncrow_ignore_spec(root)
-    ignored = git_ignored(root, [rel for _path, rel in pairs])
+    rels = [rel for _path, rel in pairs]
+    ignored = git_ignored(root, rels)
+    tracked = git_tracked(root, rels)
     patterns = source_file_patterns()
     return [
         path
         for path, rel in pairs
-        if exclusion_rule(rel, ignore_spec=ignore_spec, ignored=ignored, patterns=patterns) is None
+        if exclusion_rule(rel, ignore_spec=ignore_spec, ignored=ignored, tracked=tracked, patterns=patterns) is None
     ]
