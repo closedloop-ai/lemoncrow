@@ -7722,24 +7722,27 @@ def _silence_clean_edit_result(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _edit_reindex_enabled() -> bool:
+    """Whether an MCP edit reindexes the files it wrote (operator off-switch, default on)."""
+    return os.environ.get("LEMONCROW_EDIT_REINDEX", "").strip().lower() not in ("0", "false", "no", "off")
+
+
 def _reindex_edited_files(repo_root: Path, touched_paths: list[str]) -> None:
-    """Immediately refresh the shared code index for files this edit touched.
+    """Refresh the shared code index for the files an edit wrote, off the response path.
 
-    Keeps ``search``/``explore`` consistent with the just-applied edit instead of
-    waiting for the engine's autosync poll (~10s). Incremental: re-extracts only
-    the touched files (O(edited files)), never a full rebuild, and runs against
-    the long-lived, process-shared engine so the next code tool call sees the
-    change.
+    Incremental: re-extracts only *touched_paths*, never a full rebuild. It runs
+    on a daemon thread through the long-lived, process-shared engine, so that
+    engine's index-version cache moves with the reindex and the next code tool
+    call sees the change. That engine drops paths outside *repo_root*. Fail-open.
 
-    Runs OFF the edit hot path on a daemon thread: a warm per-file reindex still
-    costs hundreds of ms, and the edit response must not block on it. The model's
-    next tool call is a network+thinking round-trip away, so the refresh lands
-    first in practice; the autosync poll is the backstop if it doesn't. Fail-open;
-    off-switch LEMONCROW_EDIT_REINDEX=0.
+    LEMONCROW_EDIT_REINDEX=0 turns off edit-triggered reindexing for MCP edits
+    entirely: no background reindex here, and no synchronous reindex for an edit
+    rooted elsewhere. Search-time freshness and the autosync poll still catch
+    the change. The live reviewer's apply path is unaffected.
     """
     if not touched_paths:
         return
-    if os.environ.get("LEMONCROW_EDIT_REINDEX", "").strip().lower() in ("0", "false", "no", "off"):
+    if not _edit_reindex_enabled():
         return
 
     def _run() -> None:
@@ -8162,14 +8165,37 @@ def tool_smart_edit(
         # rich_edit._resolve confines to [repo_root=_edit_root, *allowed_roots], so
         # passing only _extra_roots dropped the main checkout and refused every
         # absolute path under it while a worktree was inferred.
-        result = apply_rich_edits(edits, atomic=atomic, repo_root=_edit_root, allowed_roots=_allowed_edit_roots)
+        #
+        # An edit rooted at the workspace root is reindexed once, by the
+        # background _reindex_edited_files below, so apply_rich_edits skips its
+        # synchronous reindex. That background reindex goes through the shared
+        # engine for the workspace root, which drops paths outside it, so an edit
+        # rooted anywhere else (an inferred worktree, an explicit root=) keeps
+        # the synchronous one.
+        _sync_reindex = _edit_root.resolve() != _repo_root_resolved and _edit_reindex_enabled()
+        result = apply_rich_edits(
+            edits,
+            atomic=atomic,
+            repo_root=_edit_root,
+            allowed_roots=_allowed_edit_roots,
+            reindex=_sync_reindex,
+        )
         _phase_write_ms = int((time.monotonic() - _phase_start) * 1000)
+        # A non-atomic partial failure still wrote the files its applied edits
+        # touched; a rolled-back apply wrote nothing.
+        _written: list[str] = []
+        if not result.get("rolled_back"):
+            for _fp, _existed, _before in snapshots.values():
+                try:
+                    _after = _fp.read_text(encoding="utf-8") if _fp.exists() else None
+                except (OSError, UnicodeDecodeError):
+                    _after = None
+                if _after != _before or (_existed and _before is None):
+                    _written.append(str(_fp))
 
-        # Sync the long-lived engine's index-version cache so the next explore
-        # call gets a cache miss and re-queries the FTS5 index (which the
-        # background reindex thread and apply_rich_edits both keep up to date).
-        # Without this the cached version never changes between tool calls, so
-        # explore returns stale pre-edit results on every subsequent invocation.
+        # Drop the long-lived engine's cached index version so the next explore
+        # re-reads it. The background reindex also updates this cache itself when
+        # it bumps the version, so this is belt and braces.
         try:
             _code_context_engine(str(repo_root))._index_version_cached = None
         except Exception:
@@ -8371,9 +8397,12 @@ def tool_smart_edit(
             ],
         )
         _phase_contract_ms = int((time.monotonic() - _contract_start) * 1000)
-        # Incremental: refresh the shared index for the touched files now, so a
-        # follow-up search/explore reflects this edit without the autosync lag.
-        _reindex_edited_files(repo_root, [str(p) for p in paths.values()])
+    # A query that lands before this background reindex finishes still gets
+    # fresh snippets, because search-time freshness reindexes any returned file
+    # whose mtime moved. A symbol this edit newly added becomes searchable only
+    # once the reindex completes.
+    if _written and not result.get("rolled_back"):
+        _reindex_edited_files(repo_root, _written)
     if (_phase_write_ms + _phase_hooks_ms + _phase_contract_ms) >= _edit_timing_floor_ms():
         result["timing_ms"] = {
             "write": _phase_write_ms,
