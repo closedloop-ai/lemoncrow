@@ -8906,7 +8906,6 @@ def _retire_code_engine(engine: Any) -> None:
             del _scoped_context_cache[key]
 
 
-# Worktree engines retire when their worktree is removed or goes idle (worktree_seed).
 _code_engine_cache = VersionedEngineCache(
     "code_engine", on_evict=_retire_code_engine, retire=worktree_seed.retire_worktree_engine
 )

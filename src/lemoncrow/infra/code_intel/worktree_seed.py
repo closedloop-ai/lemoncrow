@@ -140,9 +140,6 @@ class _IndexFacts:
     seeded_from: str | None
 
 
-# -- repo identity -----------------------------------------------------------
-
-
 def path_repo_id(root: Path) -> str:
     """The engine's ``repo_id`` for *root* before any alias: a hash of its resolved path."""
     return hashlib.sha256(str(root.resolve()).encode("utf-8")).hexdigest()[:16]
@@ -188,9 +185,6 @@ def is_seeded_index(conn: sqlite3.Connection) -> bool:
         return False
 
 
-# -- worktree geometry -------------------------------------------------------
-
-
 def linked_worktree_of(workspace_root: Path, candidate_dir: Path) -> Path | None:
     """The linked worktree of ``workspace_root`` that contains ``candidate_dir``, else None.
 
@@ -229,9 +223,8 @@ def linked_worktree_of(workspace_root: Path, candidate_dir: Path) -> Path | None
 def main_root_of(worktree: Path) -> Path | None:
     """The main checkout *worktree* is a linked worktree of, else None.
 
-    Reads ``<worktree>/.git`` (``gitdir: <main>/.git/worktrees/<name>``) and the
-    admin directory's ``commondir``. None for a normal checkout, a submodule, a
-    bare repository's worktree, or anything unreadable.
+    None for a normal checkout, a submodule, a bare repository's worktree, or
+    anything unreadable.
     """
     marker = worktree / ".git"
     try:
@@ -257,9 +250,6 @@ def main_root_of(worktree: Path) -> Path | None:
         return main if main != worktree.resolve() else None
     except OSError:
         return None
-
-
-# -- reading an index --------------------------------------------------------
 
 
 def _current_semantics_version() -> int:
@@ -328,9 +318,6 @@ def _seed_reason(worktree_facts: _IndexFacts | None, main_facts: _IndexFacts | N
     if worktree_facts.seeded_from is None and main_facts is not None and worktree_facts.files < main_facts.files:
         return "partial"
     return None
-
-
-# -- locking and cloning -----------------------------------------------------
 
 
 @contextlib.contextmanager
@@ -537,9 +524,6 @@ def _swap(staging: Path, store: Path, parent: Path) -> None:
         shutil.rmtree(aside, ignore_errors=True)
 
 
-# -- seeding -----------------------------------------------------------------
-
-
 def seed_worktree_index(
     worktree_root: Path,
     main_root: Path,
@@ -614,7 +598,7 @@ def seed_worktree_index(
 
 
 def _route_zoekt(worktree: Path, main: Path, *, seeded: bool) -> None:
-    """Point a seeded worktree's Zoekt searches at its main checkout's server."""
+    """Serve *worktree*'s Zoekt searches from *main*'s server when *seeded*, else from its own."""
     try:
         from lemoncrow.infra.code_intel.zoekt.adapter import clear_zoekt_root_override, set_zoekt_root_override
     except ImportError:  # pragma: no cover - zoekt adapter is part of the package
@@ -704,9 +688,6 @@ def start_first_refresh(engine: Any) -> None:
     if not getattr(engine, "_autosync_enabled", False):
         return
     threading.Thread(target=_first_refresh, args=(engine,), name="lemoncrow-worktree-seed-refresh", daemon=True).start()
-
-
-# -- lifecycle ---------------------------------------------------------------
 
 
 def worktree_engine_idle_s() -> float:
