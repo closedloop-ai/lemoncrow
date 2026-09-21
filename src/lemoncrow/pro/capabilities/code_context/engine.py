@@ -4598,9 +4598,10 @@ class CodeContextEngine:
         """Remove every indexed row for the files *rels*, in one pass per table.
 
         ``file_path`` and ``symbol_id`` are UNINDEXED columns of the FTS5 tables, so
-        a delete filtered on either scans the whole table -- ~2 s per run on a
-        12M-line index, and an incremental run after a pull outlived the autosync
-        subprocess's 600 s timeout, was killed before it committed, and started over.
+        a delete filtered on either scans the whole table -- ~2 s per scan on a
+        12M-line index. Issued once per changed file, that made an incremental run
+        after a pull outlive the autosync subprocess's 600 s timeout: it was killed
+        before it committed, and the next run started over.
         Every FTS row is therefore written under a rowid taken from the regular table
         it mirrors (``_apply_file_data_batch``), which the regular tables index on
         ``file_path``, so each delete below is a rowid seek. EXPLAIN QUERY PLAN on a
