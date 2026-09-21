@@ -699,11 +699,14 @@ lc tools call grep --args '{"path":".","content_regex":"TODO"}'
 
 ### Excluding files from indexing
 
-`lc code index` walks git-visible files (`git ls-files`, so `.gitignore` is
-already honored) plus a built-in skip list for caches/build output. To
-exclude specific files -- data dumps, fixtures, generated JSON -- that are
-tracked in git and therefore not covered by `.gitignore`, add gitignore-syntax
-patterns to `.lemoncrow/.ignore`:
+`lc code index` indexes every git-tracked file in a supported language,
+whatever its directory is called. Files git does not track -- new files not
+yet added, and every file when the directory is not a git repository -- are
+indexed too, unless `.gitignore` excludes them or they sit under a built-in
+skip list of cache, dependency, and build-output directories (`node_modules`,
+`.venv`, `dist`, `build`, `data`, `results`, and similar). To exclude specific
+tracked files -- data dumps, fixtures, generated JSON -- that `.gitignore`
+cannot cover, add gitignore-syntax patterns to `.lemoncrow/.ignore`:
 
 ```gitignore
 # .lemoncrow/.ignore

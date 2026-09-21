@@ -1666,6 +1666,21 @@ def test_auto_mode_keeps_identifier_queries_on_exact_lexical_order(tmp_path: Pat
     assert payload["mode"] == "lexical"
 
 
+def test_search_symbols_keeps_tracked_files_under_skip_list_directory_names(tmp_path: Path) -> None:
+    """A tracked file under ``build/`` is indexed, so repo search must not drop it by directory name."""
+    _init_git_fixture_repo(tmp_path / "repo")
+    root = tmp_path / "repo"
+    (root / "build").mkdir()
+    (root / "build" / "pipeline.py").write_text("def assemble_release_bundle() -> int:\n    return 1\n")
+    _git(["add", "build/pipeline.py"], root)
+    engine = CodeContextEngine(root, db_path=tmp_path / "code.sqlite")
+    engine.index_repo()
+
+    hits = engine.search_symbols("assemble_release_bundle", limit=5, mode="lexical")
+
+    assert [(hit.file_path, hit.symbol_name) for hit in hits][:1] == [("build/pipeline.py", "assemble_release_bundle")]
+
+
 def test_search_symbols_lexical_planner_prioritizes_exact_and_case_insensitive_matches(
     tmp_path: Path,
 ) -> None:

@@ -51,11 +51,12 @@ def _iter_git_visible_source_files(
 ) -> list[Path]:
     # ``--recurse-submodules`` lists tracked files inside submodules too, but git
     # rejects it combined with ``--others``, so untracked files are fetched in a
-    # separate top-level-only call.
-    entries: list[bytes] = []
-    for extra_args in (
-        ("--cached", "--recurse-submodules"),
-        ("--others", "--exclude-standard"),
+    # separate top-level-only call. Which call listed an entry is kept: only an
+    # untracked file meets the skipped-directory list (see inclusion._SKIP_PARTS).
+    entries: list[tuple[bytes, bool]] = []
+    for extra_args, tracked in (
+        (("--cached", "--recurse-submodules"), True),
+        (("--others", "--exclude-standard"), False),
     ):
         try:
             completed = subprocess.run(
@@ -69,10 +70,10 @@ def _iter_git_visible_source_files(
             return []
         if completed.returncode != 0:
             return []
-        entries.extend(entry for entry in completed.stdout.split(b"\x00") if entry)
+        entries.extend((entry, tracked) for entry in completed.stdout.split(b"\x00") if entry)
     files: list[Path] = []
     total_raw = len(entries)
-    for i, raw_entry in enumerate(entries):
+    for i, (raw_entry, tracked) in enumerate(entries):
         if progress_callback is not None:
             progress_callback(i, total_raw)
         rel = raw_entry.decode("utf-8", errors="replace")
@@ -81,7 +82,7 @@ def _iter_git_visible_source_files(
         path = (repo_root / rel).resolve()
         if not path.is_file():
             continue
-        if should_skip_path(path, repo_root=repo_root):
+        if not tracked and should_skip_path(path, repo_root=repo_root):
             continue
         if ignore_spec is not None and ignore_spec.match_file(rel):
             continue
