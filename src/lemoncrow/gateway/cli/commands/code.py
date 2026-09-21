@@ -700,7 +700,11 @@ def code_host_remove_cmd(ctx: click.Context, engine: str, yes: bool) -> None:
 )
 @click.option("--include", "include_globs", multiple=True)
 @click.option("--exclude", "exclude_globs", multiple=True)
-@click.option("--reindex", is_flag=True, help="Full rebuild from scratch (default: incremental).")
+@click.option(
+    "--reindex",
+    is_flag=True,
+    help="Full rebuild from scratch (default: incremental); in a linked git worktree, re-seed from the main checkout's index when it can.",
+)
 @click.option(
     "--force",
     "steal_lock",
@@ -725,7 +729,10 @@ def code_index_cmd(
     """Index a repository into the SQLite FTS5 symbol store.
 
     Incremental by default (only re-indexes changed files). Use --reindex
-    for a full rebuild from scratch.
+    for a full rebuild from scratch. In a linked git worktree whose main
+    checkout has a current index, --reindex re-seeds from that index instead,
+    then re-indexes only the files that differ; a seeded worktree index is
+    never rebuilt.
     """
     if repo_root is None:
         # Resolve the same way the MCP code_search / read tools do
