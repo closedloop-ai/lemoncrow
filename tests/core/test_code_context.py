@@ -2595,6 +2595,91 @@ def test_an_index_at_the_previous_semantics_version_is_rebuilt_into_the_rowid_sc
     assert [h.qualified_name for h in engine.search_symbols("RenamedService", limit=5)]
 
 
+def test_a_migration_that_empties_files_rebuilds_instead_of_colliding_on_rowid(tmp_path: Path) -> None:
+    """Two schema migrations clear `files` and leave the FTS tables loaded so a normal
+    reindex repopulates them. The rowids handed back to the repopulated `files` rows
+    are the ones the surviving FTS rows already occupy: the rowid deletes match
+    nothing and the rowid inserts collide. An emptied `files` table also reads exactly
+    like a never-indexed one, so the stored semantics version cannot catch this.
+    """
+    _write_fixture_repo(tmp_path)
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    first = engine.index_repo(force=True)
+
+    with engine._connect() as conn:
+        conn.execute("DELETE FROM engine_state WHERE key = 'indexer_semantics_version'")
+        conn.execute("DELETE FROM files")
+        conn.commit()
+        for table in ("file_path_trigram", "file_line_fts", "symbol_trigram"):
+            assert int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]) > 0
+
+    recovered = engine.index_repo(force=False)
+
+    assert recovered.files_indexed == first.files_indexed
+    _assert_every_fts_row_is_keyed_to_the_row_it_mirrors(engine)
+    assert [h.qualified_name for h in engine.search_symbols("OrderService", limit=5)]
+
+
+def test_the_full_rebuild_recreates_the_fts_tables_exactly_as_the_schema_defines_them(tmp_path: Path) -> None:
+    """The rebuild drops and recreates the FTS5 tables. A column, tokenizer or prefix
+    set that drifts from `_init_schema`'s would be rebuilt into an index every later
+    `_schema_current` probe rejects, with nothing to re-migrate it.
+    """
+    _write_fixture_repo(tmp_path)
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    engine.index_repo(force=False)
+
+    def fts_shapes() -> dict[str, str]:
+        with engine._connect() as conn:
+            rows = conn.execute(
+                "SELECT name, sql FROM main.sqlite_master WHERE sql LIKE 'CREATE VIRTUAL%' "
+                "UNION ALL SELECT name, sql FROM fts.sqlite_master WHERE sql LIKE 'CREATE VIRTUAL%'"
+            ).fetchall()
+        # Compare from USING onward, so a schema qualifier or IF NOT EXISTS does not
+        # read as a shape change; whitespace around the punctuation likewise.
+        shapes = {}
+        for name, sql in rows:
+            body = re.sub(r"\s+", " ", str(sql)[str(sql).index(" USING ") :]).strip()
+            shapes[str(name)] = body.replace("( ", "(").replace(" )", ")").replace(" ,", ",")
+        return shapes
+
+    before = fts_shapes()
+    assert set(before) == {"symbol_fts", "symbol_fts_vocab", "symbol_trigram", "file_path_trigram", "file_line_fts"}
+
+    engine.index_repo(force=True)
+
+    assert fts_shapes() == before
+
+
+def test_the_post_rebuild_vacuum_is_skipped_once_the_rowids_it_would_renumber_go_sparse(tmp_path: Path) -> None:
+    """`files`/`symbols` are rowid tables with no INTEGER PRIMARY KEY, so VACUUM may
+    renumber them while the FTS5 shadow tables keyed on those rowids keep theirs. That
+    renumbering is the identity map only while the rowids are dense -- the state a
+    full rebuild leaves behind, and the only state the VACUUM may run in.
+    """
+    from lemoncrow.pro.capabilities.code_context.engine import _rowid_tables_dense
+
+    _write_fixture_repo(tmp_path)
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    engine.index_repo(force=True)
+    with engine._connect() as conn:
+        assert _rowid_tables_dense(conn)
+        first_indexed = str(conn.execute("SELECT file_path FROM files ORDER BY rowid LIMIT 1").fetchone()[0])
+
+    # Removing the lowest-rowid file leaves a hole at rowid 1, so COUNT no longer
+    # equals MAX(rowid) however the remaining files were numbered.
+    (tmp_path / first_indexed).unlink()
+    engine.index_repo(force=False)
+    with engine._connect() as conn:
+        assert not _rowid_tables_dense(conn)
+
+    engine.index_repo(force=True)
+
+    with engine._connect() as conn:
+        assert _rowid_tables_dense(conn)
+    _assert_every_fts_row_is_keyed_to_the_row_it_mirrors(engine)
+
+
 def test_dir_cached_relpath_resolves_exactly_like_safe_relpath(tmp_path: Path) -> None:
     """Resolving each directory once must not change what any file resolves to."""
     from lemoncrow.pro.capabilities.code_context.engine import _dir_cached_relpath, _safe_relpath

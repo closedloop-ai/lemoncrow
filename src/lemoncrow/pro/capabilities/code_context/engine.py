@@ -181,6 +181,61 @@ _MAX_FILE_BYTES = 1_000_000
 _LINE_ROWID_BITS = 20
 _LINE_ROWID_MASK = (1 << _LINE_ROWID_BITS) - 1
 assert _MAX_FILE_BYTES <= _LINE_ROWID_MASK, "_LINE_ROWID_BITS cannot address every line of a _MAX_FILE_BYTES file"
+# The one definition of each FTS5 table's shape. `_init_schema`, the fts.sqlite
+# bootstrap in `_init_secondary_schemas_locked` and the drop-and-recreate full
+# rebuild in `_index_repo_unsafe` all build their DDL from here, so a column,
+# tokenizer or prefix change reaches every one of them -- a rebuild that spelled
+# out its own DDL could silently recreate a table `_schema_current` then rejects.
+_FTS_TABLE_BODY: dict[str, str] = {
+    # prefix indexes turn the "term"* prefix-channel MATCH from a term-range scan +
+    # doclist merge into direct doclist seeks for prefixes of 2-6 chars (the bulk of
+    # what _fts_prefix_query_from_terms emits after IDF pruning). Results are
+    # identical; cost is index size. _schema_current greps the stored SQL for
+    # `prefix=`, so dropping it here also re-triggers that migration.
+    "symbol_fts": (
+        "fts5(symbol_id UNINDEXED, name, qualified_name, signature," " file_path UNINDEXED, source, prefix='2 3 4 5 6')"
+    ),
+    # Read-only term->document-frequency view over symbol_fts (zero write cost,
+    # auto-maintained). Powers IDF pruning of common query tokens.
+    "symbol_fts_vocab": "fts5vocab(symbol_fts, 'row')",
+    # Trigram tokenizer handles substring matching natively; signature is omitted
+    # (5x size amplification, and symbol_fts already covers it).
+    "symbol_trigram": "fts5(symbol_id UNINDEXED, name, qualified_name, file_path, tokenize='trigram')",
+    # One row per FILE (not per symbol like symbol_trigram): the path channel in
+    # _search_symbols_local matches path patterns against this much smaller table
+    # (file-cardinality: thousands even on a huge repo) and joins back to symbols via
+    # idx_symbols_repo_file, instead of scanning symbol_trigram's one-row-per-symbol
+    # duplication of every file's path.
+    "file_path_trigram": "fts5(repo_id UNINDEXED, file_path, tokenize='trigram')",
+    "file_line_fts": "fts5(repo_id UNINDEXED, file_path UNINDEXED, line UNINDEXED, text)",
+}
+
+
+def _fts_create_sql(table: str, *, schema: str = "", if_not_exists: bool = False) -> str:
+    """``CREATE VIRTUAL TABLE`` for one FTS5 table, from the single definition of its shape."""
+    exists = "IF NOT EXISTS " if if_not_exists else ""
+    qualified = f"{schema}.{table}" if schema else table
+    return f"CREATE VIRTUAL TABLE {exists}{qualified} USING {_FTS_TABLE_BODY[table]}"
+
+
+def _rowid_tables_dense(conn: sqlite3.Connection) -> bool:
+    """True when ``files`` and ``symbols`` occupy rowids 1..N with no gaps.
+
+    Both are rowid tables without an ``INTEGER PRIMARY KEY``, and SQLite is free to
+    renumber such a table's rowids during ``VACUUM`` -- while the FTS5 shadow tables
+    keyed on those rowids (``_apply_file_data_batch``) keep theirs, because every
+    shadow table does have one. The renumbering is the identity map only while the
+    rowids are already dense, which is exactly the state a full rebuild leaves
+    behind. Anywhere else a VACUUM would silently repoint every FTS row at a
+    different file or symbol, so the caller skips it: the cost is disk, not data.
+    """
+    for table in ("files", "symbols"):
+        row = conn.execute(f"SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM {table}").fetchone()
+        if row is None or int(row[0]) != int(row[1]):
+            return False
+    return True
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -4331,7 +4386,7 @@ class CodeContextEngine:
 
         with self._connect() as conn:
             self._init_schema(conn)
-            if not force and self._stored_indexer_semantics_version(conn) != _CODE_INDEXER_SEMANTICS_VERSION:
+            if not force and not self._rowid_scheme_trustworthy(conn):
                 force = True
 
             if force:
@@ -4344,29 +4399,19 @@ class CodeContextEngine:
                 if not conn.in_transaction:
                     conn.execute("BEGIN")
                 # file_line_fts lives in the attached fts database; the rest in main.
-                conn.execute("DROP TABLE IF EXISTS fts.file_line_fts")
-                conn.execute(
-                    "CREATE VIRTUAL TABLE fts.file_line_fts USING fts5("
-                    " repo_id UNINDEXED, file_path UNINDEXED, line UNINDEXED, text)"
+                # symbol_fts_vocab is an fts5vocab view over symbol_fts, so it drops
+                # first and is recreated last -- hence the reversed second pass.
+                _rebuilt = (
+                    ("fts", "file_line_fts"),
+                    ("main", "symbol_fts_vocab"),
+                    ("main", "symbol_fts"),
+                    ("main", "symbol_trigram"),
+                    ("main", "file_path_trigram"),
                 )
-                conn.execute("DROP TABLE IF EXISTS main.symbol_fts_vocab")
-                conn.execute("DROP TABLE IF EXISTS main.symbol_fts")
-                conn.execute(
-                    "CREATE VIRTUAL TABLE main.symbol_fts USING fts5("
-                    " symbol_id UNINDEXED, name, qualified_name, signature,"
-                    " file_path UNINDEXED, source, prefix='2 3 4 5 6')"
-                )
-                conn.execute("CREATE VIRTUAL TABLE main.symbol_fts_vocab USING fts5vocab(symbol_fts, 'row')")
-                conn.execute("DROP TABLE IF EXISTS main.symbol_trigram")
-                conn.execute(
-                    "CREATE VIRTUAL TABLE main.symbol_trigram USING fts5("
-                    " symbol_id UNINDEXED, name, qualified_name, file_path, tokenize='trigram')"
-                )
-                conn.execute("DROP TABLE IF EXISTS main.file_path_trigram")
-                conn.execute(
-                    "CREATE VIRTUAL TABLE main.file_path_trigram USING fts5("
-                    " repo_id UNINDEXED, file_path, tokenize='trigram')"
-                )
+                for _schema, _fts_table in _rebuilt:
+                    conn.execute(f"DROP TABLE IF EXISTS {_schema}.{_fts_table}")
+                for _schema, _fts_table in reversed(_rebuilt):
+                    conn.execute(_fts_create_sql(_fts_table, schema=_schema))
                 conn.execute("DELETE FROM symbols")
                 conn.execute("DELETE FROM imports")
                 conn.execute('DELETE FROM "references"')
@@ -4542,7 +4587,13 @@ class CodeContextEngine:
                 if _vac_db.exists():
                     with contextlib.suppress(Exception):
                         _vc = sqlite3.connect(str(_vac_db))
-                        _vc.execute("VACUUM")
+                        # VACUUM renumbers the rowids of a table with no INTEGER
+                        # PRIMARY KEY, and `files`/`symbols` rowids are what every FTS5
+                        # row is keyed on. Dense after the rebuild that just ran, that
+                        # renumbering is the identity map; sparse, it would repoint
+                        # every FTS row at another file, so leave the free pages be.
+                        if _vac_db != self.db_path or _rowid_tables_dense(_vc):
+                            _vc.execute("VACUUM")
                         _vc.close()
 
         with self._connect() as conn:
@@ -4584,6 +4635,32 @@ class CodeContextEngine:
             return int(row["value"])
         except (TypeError, ValueError):
             return None
+
+    def _rowid_scheme_trustworthy(self, conn: sqlite3.Connection) -> bool:
+        """True when this index's FTS5 rowids still identify the rows they mirror.
+
+        ``_apply_file_data_batch`` keys every FTS row on a ``files``/``symbols`` rowid
+        and ``_delete_files_index`` finds it again by that rowid alone, so both sides
+        have to come from the same index generation. Two states break that, and the
+        drop-and-recreate rebuild this returning False forces heals both: an index
+        written before the scheme existed (a stale stored semantics version), and a
+        schema migration that empties ``files`` while leaving the FTS tables loaded
+        (``_init_schema``'s pre-prefix symbol_fts migration and
+        ``_init_secondary_schemas_locked``'s references/call_edges reshape both do).
+        In the second state the rowids handed back to the repopulated ``files`` rows
+        are the ones the surviving FTS rows already occupy, so the deletes no-op and
+        the inserts collide -- and ``_stored_indexer_semantics_version`` cannot see it,
+        because an emptied ``files`` table reads exactly like a never-indexed one.
+        """
+        if self._stored_indexer_semantics_version(conn) != _CODE_INDEXER_SEMANTICS_VERSION:
+            return False
+        if conn.execute("SELECT 1 FROM files WHERE repo_id = ? LIMIT 1", (self.repo_id,)).fetchone() is not None:
+            return True
+        for table in ("file_path_trigram", "symbol_fts", "symbol_trigram", "fts.file_line_fts"):
+            with contextlib.suppress(sqlite3.Error):
+                if conn.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None:
+                    return False
+        return True
 
     def _stamp_indexer_semantics_version(self, conn: sqlite3.Connection) -> None:
         conn.execute(
@@ -11104,14 +11181,7 @@ class CodeContextEngine:
         self.fts_db_path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self.fts_db_path, timeout=30.0) as fc:
             fc.execute("PRAGMA journal_mode = WAL")
-            fc.executescript("""
-                CREATE VIRTUAL TABLE IF NOT EXISTS file_line_fts USING fts5(
-                    repo_id UNINDEXED,
-                    file_path UNINDEXED,
-                    line UNINDEXED,
-                    text
-                );
-            """)
+            fc.execute(_fts_create_sql("file_line_fts", if_not_exists=True))
 
         # Recompute AFTER the DDL: the files may have just been created, so the
         # pre-DDL identity (with (-1, -1) placeholders) must not be cached.
@@ -11399,40 +11469,6 @@ class CodeContextEngine:
                 doc_summary TEXT,
                 content_hash TEXT NOT NULL
             );
-            -- prefix indexes turn the "term"* prefix-channel MATCH from a
-            -- term-range scan + doclist merge into direct doclist seeks for
-            -- prefixes of 2-6 chars (the bulk of what _fts_prefix_query_from_terms
-            -- emits after IDF pruning). Results are identical; cost is index size.
-            CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts USING fts5(
-                symbol_id UNINDEXED,
-                name,
-                qualified_name,
-                signature,
-                file_path UNINDEXED,
-                source,
-                prefix='2 3 4 5 6'
-            );
-            -- Read-only term->document-frequency view over the FTS index (zero write
-            -- cost, auto-maintained). Powers IDF pruning of common query tokens.
-            CREATE VIRTUAL TABLE IF NOT EXISTS symbol_fts_vocab USING fts5vocab(symbol_fts, 'row');
-            CREATE VIRTUAL TABLE IF NOT EXISTS symbol_trigram USING fts5(
-                symbol_id UNINDEXED,
-                name,
-                qualified_name,
-                file_path,
-                tokenize='trigram'
-            );
-            -- One row per FILE (not per symbol like symbol_trigram): the path
-            -- channel in _search_symbols_local matches path patterns against this
-            -- much smaller table (file-cardinality: thousands even on a huge repo)
-            -- and joins back to symbols via idx_symbols_repo_file, instead of
-            -- scanning symbol_trigram's one-row-per-symbol duplication of every
-            -- file's path.
-            CREATE VIRTUAL TABLE IF NOT EXISTS file_path_trigram USING fts5(
-                repo_id UNINDEXED,
-                file_path,
-                tokenize='trigram'
-            );
             CREATE INDEX IF NOT EXISTS idx_symbols_repo_name_nocase
                 ON symbols(repo_id, symbol_name COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS idx_symbols_repo_qual_nocase
@@ -11468,6 +11504,8 @@ class CodeContextEngine:
             CREATE INDEX IF NOT EXISTS idx_commit_author_date ON commit_chunks(author_date);
             CREATE INDEX IF NOT EXISTS idx_commit_files ON commit_chunks(files_touched);
             """)
+        for _fts_table in ("symbol_fts", "symbol_fts_vocab", "symbol_trigram", "file_path_trigram"):
+            conn.execute(_fts_create_sql(_fts_table, if_not_exists=True))
         # Migration: older DBs predate the files.mtime_ns column used to fast-skip
         # unchanged files during incremental reindex. CREATE TABLE IF NOT EXISTS
         # never adds a column to an existing table, so add it here when absent.
@@ -11482,11 +11520,7 @@ class CodeContextEngine:
             _trig_cols = {str(row[1]) for row in conn.execute("PRAGMA table_info(symbol_trigram)")}
             if "signature" in _trig_cols:
                 conn.execute("DROP TABLE IF EXISTS symbol_trigram")
-                conn.execute(
-                    "CREATE VIRTUAL TABLE symbol_trigram USING fts5("
-                    " symbol_id UNINDEXED, name, qualified_name, file_path,"
-                    " tokenize='trigram')"
-                )
+                conn.execute(_fts_create_sql("symbol_trigram"))
         # Backfill the substring trigram index for DBs built before it existed, so the
         # substring/path channels use the index instead of full-scanning symbols.
         if conn.execute("SELECT 1 FROM symbol_trigram LIMIT 1").fetchone() is None:
@@ -11514,12 +11548,12 @@ class CodeContextEngine:
         if _fts_sql_row is not None and "prefix=" not in str(_fts_sql_row[0] or ""):
             conn.execute("DROP TABLE IF EXISTS symbol_fts_vocab")
             conn.execute("DROP TABLE IF EXISTS symbol_fts")
-            conn.execute(
-                "CREATE VIRTUAL TABLE symbol_fts USING fts5("
-                " symbol_id UNINDEXED, name, qualified_name, signature,"
-                " file_path UNINDEXED, source, prefix='2 3 4 5 6')"
-            )
-            conn.execute("CREATE VIRTUAL TABLE symbol_fts_vocab USING fts5vocab(symbol_fts, 'row')")
+            conn.execute(_fts_create_sql("symbol_fts"))
+            conn.execute(_fts_create_sql("symbol_fts_vocab"))
+            # `files` is emptied so the change detector sees every file as new, which
+            # leaves file_path_trigram / file_line_fts holding rows under rowids the
+            # repopulated `files` rows will be handed again. _rowid_scheme_trustworthy
+            # recognises that state and forces the full rebuild that clears them.
             conn.execute("DELETE FROM files")
         conn.execute("INSERT OR IGNORE INTO engine_state(key, value) VALUES ('index_version', '0')")
         # Self-heal DBs built before planner statistics were collected: with data
@@ -13601,11 +13635,11 @@ class CodeContextEngine:
                     return
                 with self._connect() as conn:
                     self._init_schema(conn)
-                    if self._stored_indexer_semantics_version(conn) != _CODE_INDEXER_SEMANTICS_VERSION:
-                        # The stored index predates the rowid-keyed FTS scheme, so its
-                        # FTS rowids mean nothing: deleting by one would drop another
-                        # symbol's row, and inserting at one would collide. The full
-                        # rebuild that the version mismatch forces picks these files up.
+                    if not self._rowid_scheme_trustworthy(conn):
+                        # The stored index's FTS rowids mean nothing: deleting by one
+                        # would drop another symbol's row, and inserting at one would
+                        # collide. The full rebuild this state forces in
+                        # _index_repo_unsafe picks these files up instead.
                         return
                     self._delete_files_index(conn, rels)
                     results = (
