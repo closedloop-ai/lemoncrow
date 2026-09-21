@@ -100,7 +100,11 @@ SEED_RECHECK_S = 60.0
 
 WORKTREE_ENGINE_IDLE_ENV = "LEMONCROW_WORKTREE_ENGINE_IDLE_S"
 #: Seconds a worktree engine may go without a request before the daemon unloads
-#: it. Set from the measured per-engine RSS: see ``code_context.worktree_engine_idle_s``.
+#: it (``code_context.worktree_engine_idle_s``). Measured on a symphony-alpha clone
+#: (17,870 indexed files): five seeded worktree engines added 190 MiB RSS to a
+#: process holding main's -- 140 MiB of it with the first, ~13 MiB for each one
+#: after -- and reopening one takes about a second. Half an hour keeps an engine
+#: through a pause in a session at that price.
 DEFAULT_WORKTREE_ENGINE_IDLE_S = 1800.0
 
 _STAGING_PREFIX = ".seed-"
