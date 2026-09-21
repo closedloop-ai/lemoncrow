@@ -11,6 +11,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -263,6 +264,42 @@ def test_mains_lock_held_reports_seeding_then_the_next_call_seeds(
     engine = _open(worktree)
     assert "seeded_from" in _state(worktree)
     assert "alpha_0" in _names(engine, "alpha_0")
+
+
+def test_concurrent_first_opens_of_a_worktree_seed_it_once(
+    repos: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon's warm-up and a first request, or two parallel tool calls, open one worktree at once."""
+    _main, worktree = repos
+    real_seed = worktree_seed.seed_worktree_index
+    calls: list[Path] = []
+    errors: list[Exception] = []
+    overlapped = threading.Event()
+
+    def open_worktree() -> None:
+        try:
+            worktree_seed.ensure_seeded(worktree)
+        except Exception as exc:
+            errors.append(exc)
+
+    rival = threading.Thread(target=open_worktree)
+
+    def spy_seed(root: Path, main: Path, **kwargs: Any) -> worktree_seed.SeedResult:
+        calls.append(root)
+        if len(calls) == 1:
+            rival.start()
+            overlapped.wait(timeout=1.0)  # set only when the rival reaches a seed of its own
+        else:
+            overlapped.set()
+        return real_seed(root, main, **kwargs)
+
+    monkeypatch.setattr(worktree_seed, "seed_worktree_index", spy_seed)
+    open_worktree()
+    rival.join(timeout=60)
+
+    assert calls == [worktree], "both openers seeded the worktree"
+    assert errors == []
+    assert "seeded_from" in _state(worktree)
 
 
 def test_an_alias_in_a_shared_database_leaves_the_other_repo_alone(repos: tuple[Path, Path], tmp_path: Path) -> None:

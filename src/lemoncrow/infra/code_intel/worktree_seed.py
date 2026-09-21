@@ -121,6 +121,15 @@ _lock = threading.Lock()
 _worktrees: dict[str, Path] = {}
 #: Monotonic time a worktree's seed need was last checked.
 _checked_at: dict[str, float] = {}
+#: Serialises ensure_seeded's check-and-seed within the process. Two threads
+#: opening one unseeded worktree would otherwise both seed it: the loser's
+#: non-blocking flock on the worktree's own index fails and surfaces as
+#: IndexRebuilding, or it seeds again and swaps files under the engine the first
+#: one just handed out.
+#: lc-debt: one lock for every worktree, so checking one waits out another's seed
+#: (seconds, once per worktree per index format); upgrade path: per-root locks
+#: dropped by forget_worktree.
+_seed_lock = threading.Lock()
 
 
 @dataclass(frozen=True)
@@ -643,14 +652,14 @@ def ensure_seeded(
     with _lock:
         _worktrees[key] = main
         _checked_at[key] = now
-    current = CODE_INDEXER_SEMANTICS_VERSION
-    worktree_facts = _read_facts(workspace_store_dir(root) / CODE_CONTEXT_DB, None)
-    main_facts = _read_facts(workspace_store_dir(main) / CODE_CONTEXT_DB, effective_repo_id(main))
-    reason = "reseed" if reseed else _seed_reason(worktree_facts, main_facts, current)
-    if reason is None:
-        _route_zoekt(root, main, seeded=worktree_facts is not None and worktree_facts.seeded_from is not None)
-        return None
-    result = seed_worktree_index(root, main, lock_wait_s=lock_wait_s, before_swap=before_swap)
+    with _seed_lock:
+        worktree_facts = _read_facts(workspace_store_dir(root) / CODE_CONTEXT_DB, None)
+        main_facts = _read_facts(workspace_store_dir(main) / CODE_CONTEXT_DB, effective_repo_id(main))
+        reason = "reseed" if reseed else _seed_reason(worktree_facts, main_facts, CODE_INDEXER_SEMANTICS_VERSION)
+        if reason is None:
+            _route_zoekt(root, main, seeded=worktree_facts is not None and worktree_facts.seeded_from is not None)
+            return None
+        result = seed_worktree_index(root, main, lock_wait_s=lock_wait_s, before_swap=before_swap)
     if result.status == BUSY:
         with _lock:
             _checked_at.pop(key, None)
