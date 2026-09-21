@@ -66,6 +66,7 @@ from lemoncrow.core.foundation.models import RawArtifact, Trace, to_jsonable
 from lemoncrow.core.foundation.redaction import redact
 from lemoncrow.core.foundation.rubric_gate import run_rubric
 from lemoncrow.gateway.adapters.mcp import ledger as _ledger
+from lemoncrow.gateway.adapters.mcp import session_root
 from lemoncrow.gateway.adapters.mcp.bash import (  # noqa: F401  (registers bash tool + re-exports)
     _BASH_STATS_MAX_KEYS,
     _BASH_STATS_PRUNE_TO,
@@ -3748,34 +3749,28 @@ def tool_review_feedback_addressed(
     }
 
 
-_last_session_cwd: str | None = None
-"""Most recent explicit ``cwd`` seen on a ``bash`` call, or None.
-
-This server is a long-lived process whose own ``os.getcwd()`` is fixed at
-launch, and MCP carries no per-call session cwd (we implement no ``roots``
-capability). So when a session enters a git worktree, :func:`_workspace_root`
-keeps naming the *main checkout*. A bash call's explicit ``cwd`` is the only
-place the session's real working directory reaches this process, which is why
-bash honored the worktree and edit did not. Recorded here and used to resolve
-relative edit paths -- see :func:`_session_worktree_root`.
-
-lc-debt: process-global, so a shared HTTP-mode server hosting two sessions on
-the SAME repo could let one session's worktree cwd redirect the other's
-relative edits (a foreign repo is already rejected by the
-``<root>/.git/worktrees`` check, and the redirect is always disclosed).
-Upgrade path: key this by MCP session id once the dispatcher threads one
-through, or drop it entirely if the protocol ever carries a per-call cwd.
-"""
-
-
 def _record_session_cwd(name: str, args: Any) -> None:
-    """Remember a bash call's cwd, the only session-cwd signal this server gets."""
-    global _last_session_cwd
+    """Remember a bash call's explicit cwd for the calling session (session_root step 4)."""
     if name != "bash" or not isinstance(args, dict):
         return
     cwd = args.get("cwd")
     if isinstance(cwd, str) and cwd.strip():
-        _last_session_cwd = cwd.strip()
+        session_root.record_bash_cwd(_request_session_identity()[0], cwd.strip())
+
+
+def _session_root_identity() -> str:
+    """The calling session's id, for its recorded cwd; "" when the request names none.
+
+    A daemon request without a session id borrows nobody's: the daemon's own
+    resolution names whichever session started it. A stdio server serves one
+    window, so its own resolution is that window's session.
+    """
+    session_id, _host = _request_session_identity()
+    if session_id:
+        return session_id
+    if _ledger._request_bridge_id():
+        return ""
+    return _resolved_host_session_id()
 
 
 def _linked_worktree_root(workspace_root: Path, candidate_dir: Path) -> Path | None:
@@ -3784,16 +3779,21 @@ def _linked_worktree_root(workspace_root: Path, candidate_dir: Path) -> Path | N
 
 
 def _session_worktree_root(workspace_root: Path) -> Path | None:
-    """The linked git worktree the session is working in, else None.
+    """The linked git worktree the session is working in, else None (see session_root.path_root)."""
+    found = session_root.path_root(workspace_root)
+    return None if found.source == session_root.WORKSPACE else found.root
 
-    Returns None for every uncertain case -- no recorded cwd, a plain
-    directory, a worktree belonging to a different repo -- so resolution falls
-    back to the workspace root exactly as before.
-    """
-    recorded = _last_session_cwd
-    if not recorded:
-        return None
-    return _linked_worktree_root(workspace_root, Path(recorded))
+
+def _session_code_root() -> Path:
+    """The checkout this request's code tools answer from (see session_root.code_root)."""
+    return session_root.code_root(_workspace_root()).root
+
+
+def _session_read_path(file_path: str) -> Path:
+    """A read path; a relative one resolves in the worktree the session is working in."""
+    candidate = Path(file_path)
+    worktree = None if candidate.is_absolute() else _session_worktree_root(_workspace_root())
+    return worktree / candidate if worktree is not None else _workspace_path(file_path)
 
 
 # Thread-local slot for passing real tokens_saved from tool handlers to the
@@ -5529,6 +5529,8 @@ def render_tool_result_text(name: str, result: Any) -> str | None:
             if isinstance(resolved_against, str) and resolved_against:
                 if payload.get("resolved_against_source") == "explicit":
                     text = f"{text} | resolved against root {resolved_against} (explicit root argument)"
+                elif payload.get("resolved_against_source") == "session_cwd":
+                    text = f"{text} | resolved against worktree {resolved_against} (from session cwd)"
                 else:
                     text = f"{text} | resolved against worktree {resolved_against} (from last bash cwd)"
             vcs_raw = payload.get("vcs_status")
@@ -6123,7 +6125,7 @@ def _smart_read_single(
     # handles it uniformly (range read is already bounded and efficient).
     if tail_lines is not None and range is None and not expand:
         try:
-            total = sum(1 for _ in open(_workspace_path(target_path), encoding="utf-8", errors="replace"))
+            total = sum(1 for _ in open(_session_read_path(target_path), encoding="utf-8", errors="replace"))
             start = max(1, total - tail_lines + 1)
             range = f"{start}-"
         except OSError:
@@ -6133,7 +6135,7 @@ def _smart_read_single(
     # host's own permission layer gates the tool call. Writes/edits, by contrast,
     # are confined to the workspace (see tool_smart_edit). Relative paths still
     # resolve against the workspace root.
-    resolved = _workspace_path(target_path)
+    resolved = _session_read_path(target_path)
     # Freshness ledger: recorded below, once the actual view served (exact vs
     # a lossy projection) is known -- see _record_read_sig's exact= kwarg.
     # A ranged read is served EXACTLY as requested -- never silently widened.
@@ -6945,6 +6947,13 @@ def _ambiguous_relative_edit_paths(
         if len(hits) > 1:
             ambiguous.append((raw, hits))
     return ambiguous
+
+
+def _edits_name_relative_paths(edits: list[dict[str, Any]]) -> bool:
+    """Whether any edit resolves against a root: a relative path, or none at all (a symbol edit)."""
+    return any(
+        not Path(_snapshot_path(str(edit.get("file_path") or edit.get("path") or ""))).is_absolute() for edit in edits
+    )
 
 
 def _snapshot_paths(paths: dict[str, Path]) -> dict[str, tuple[Path, bool, str | None]]:
@@ -7827,13 +7836,16 @@ def tool_smart_edit(
     # (<repo>/.claude/worktrees/...) sit *under* that root. Resolve relative
     # paths against the worktree the session is demonstrably working in.
     #
-    # This is an INFERENCE (from the last bash cwd), so it is never silent:
-    # `resolved_against` rides on the result, survives the clean-success
-    # squelch, and renders as a suffix on the one-liner. Absolute paths are
-    # unaffected -- _resolve_snapshot_path only applies a root to relative ones.
-    # A caller who knows the checkout passes `root` and skips the guessing
-    # entirely; see _resolve_explicit_edit_root.
-    _session_worktree = _session_worktree_root(repo_root)
+    # This is an INFERENCE (from the session's recorded cwd, else its last bash
+    # cwd -- see session_root.path_root), so it is never silent when it moved a
+    # relative path: `resolved_against` rides on the result, survives the
+    # clean-success squelch, and renders as a suffix on the one-liner. Absolute
+    # paths are unaffected -- _resolve_snapshot_path only applies a root to
+    # relative ones. A caller who knows the checkout passes `root` and skips the
+    # guessing entirely; see _resolve_explicit_edit_root.
+    _session = session_root.path_root(repo_root)
+    _session_worktree = None if _session.source == session_root.WORKSPACE else _session.root
+    _inferred_from = "the session's cwd" if _session.source == session_root.SESSION_CWD else "the last bash cwd"
     edits = [_normalize_edit_aliases(e) for e in edits]
     _require_edits(edits)
 
@@ -7900,7 +7912,7 @@ def tool_smart_edit(
                         "paths": [raw for raw, _hits in _ambiguous],
                         "error": (
                             f"ambiguous relative edit path: {_collisions}. The worktree was inferred "
-                            "from the last bash cwd, not named by you -- pass an absolute path, or "
+                            f"from {_inferred_from}, not named by you -- pass an absolute path, or "
                             "root=<dir>, to say which checkout you mean"
                         ),
                     }
@@ -8387,9 +8399,9 @@ def tool_smart_edit(
     if _explicit_root is not None:
         result["resolved_against"] = str(_explicit_root)
         result["resolved_against_source"] = "explicit"
-    elif _session_worktree is not None:
+    elif _session_worktree is not None and _edits_name_relative_paths(edits):
         result["resolved_against"] = str(_session_worktree)
-        result["resolved_against_source"] = "inferred"
+        result["resolved_against_source"] = "session_cwd" if _session.source == session_root.SESSION_CWD else "inferred"
     return _silence_clean_edit_result(result)
 
 
@@ -8926,11 +8938,12 @@ _scoped_context_cache_lock: threading.Lock = threading.Lock()
 def _code_repo_root(repo_root: str | None) -> Path:
     """Resolve a caller-supplied repo root the way the code engine does.
 
-    A relative root is taken against the active workspace, not the process cwd,
-    so open code-intel modules address the same repo the engine indexed.
+    A relative root is taken against the request's session root (see
+    session_root.code_root), not the process cwd, so open code-intel modules
+    address the same repo the engine indexed.
     """
     root = Path(repo_root or ".")
-    return (root if root.is_absolute() else _workspace_root() / root).resolve()
+    return (root if root.is_absolute() else _session_code_root() / root).resolve()
 
 
 # Every lazy `from lemoncrow.pro...` on the code path lands in one mypyc group
@@ -9004,9 +9017,8 @@ def _code_context_engine(repo_root: str = ".") -> Any:
     _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
-    workspace = str(_workspace_root())
     root = Path(repo_root)
-    resolved = (root if root.is_absolute() else Path(workspace) / root).resolve()
+    resolved = (root if root.is_absolute() else _session_code_root() / root).resolve()
     cache_key = str(resolved)
     # A linked worktree's index starts as a clone of its main checkout's.
     seed = worktree_seed.ensure_seeded(
@@ -9037,9 +9049,8 @@ def _scoped_context_capability(repo_root: str = ".") -> Any:
     _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.scoped_context import ScopedContextCapability
 
-    workspace = str(_workspace_root())
     root = Path(repo_root)
-    resolved = (root if root.is_absolute() else Path(workspace) / root).resolve()
+    resolved = (root if root.is_absolute() else _session_code_root() / root).resolve()
     cache_key = str(resolved)
     engine = _code_context_engine(str(resolved))
     entry = _scoped_context_cache.get(cache_key)
@@ -9058,9 +9069,8 @@ def _workspace_code_router(repo_root: str = ".") -> Any:
     _warm_pro_code_modules()
     from lemoncrow.pro.capabilities.code_context.workspace_router import WorkspaceCodeRouter
 
-    workspace = str(_workspace_root())
     root = Path(repo_root)
-    resolved = root if root.is_absolute() else Path(workspace) / root
+    resolved = root if root.is_absolute() else _session_code_root() / root
     return WorkspaceCodeRouter(
         repo_root=resolved,
         engine_factory=lambda target_root: _code_context_engine(str(target_root)),
@@ -11131,7 +11141,7 @@ def tool_code_search(
     as already read -- do not re-open those files with `read`.
     """
     _ = force  # consumed by the dedup dispatcher wrapper (mcp_server._handle), not here
-    workspace_root = _workspace_root()
+    workspace_root = _session_code_root()
     # Check BEFORE doing any search work: a flagged repeat query skips the
     # engine entirely and returns blank -- no explanatory text (measured: the
     # caller skims past prose hints and searches again anyway; blank results
@@ -11503,7 +11513,7 @@ def tool_smart_search(
         raise ValueError("query is required for semantic search; use grep for regex/glob/symbol search")
     from lemoncrow.pro.capabilities.grounded_loop.search_first import search_first
 
-    workspace_root = _workspace_root()
+    workspace_root = _session_code_root()
 
     def indexed_search(
         *,
@@ -12596,9 +12606,14 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
         # N10 — request-scoped project isolation. Honor an Mcp-Project-Path-style
         # override for the lifetime of this request only; absent -> unchanged.
         _prior_project = _set_request_project(_extract_request_project(params, args if isinstance(args, dict) else {}))
-        # A bash cwd is the only place the session's real working directory
-        # reaches this long-lived process; record it so edit can resolve
-        # relative paths against a worktree the session has entered.
+        _prior_session_root = session_root.begin_request(
+            session_id=_session_root_identity,
+            bash_key=_request_session_identity()[0],
+            paths=session_root.routed_paths(name, args),
+            store_root=_lemoncrow_root,
+        )
+        # On hosts without the plugin's hook a bash cwd is the only place the
+        # session's working directory reaches this process; record it per session.
         _record_session_cwd(name, args)
         _call_duration_ms: int = 0
         _call_started = time.perf_counter()
@@ -12704,6 +12719,7 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
 
                     # Compute MD text for read-heavy tools
                     rendered_text = render_tool_result_text(name, result)
+                    rendered_text = session_root.disclose(result, rendered_text)
 
                     # Pull the internal `calls_saved` credit out of `result` NOW,
                     # before the JSON-dump fallback below can serialize it verbatim.
@@ -13079,6 +13095,7 @@ def _handle(request: dict[str, Any]) -> dict[str, Any] | _Deferred | None:
         finally:
             # Always drop the request-scoped project override (N10).
             _clear_request_project(_prior_project)
+            session_root.end_request(_prior_session_root)
 
     return _err(rid, -32601, f"unknown method: {method}")
 

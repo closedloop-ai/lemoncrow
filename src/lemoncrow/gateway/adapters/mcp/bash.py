@@ -21,6 +21,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, cast
 
+from lemoncrow.gateway.adapters.mcp import session_root
 from lemoncrow.gateway.adapters.mcp.deferral import (
     _defer_bash_enabled,
     _deferral_supported,
@@ -450,7 +451,10 @@ def _run_bash_tool(
     # directory) so the command still runs instead of hard-failing.
     if not Path(workspace).is_dir():
         workspace = os.getcwd()
-    effective_cwd = cwd or workspace
+    # A command with no cwd runs in the linked worktree the session's recorded
+    # cwd puts it in (session_root step 3), else the workspace as before.
+    _session_worktree = None if cwd else session_root.session_worktree(Path(workspace))
+    effective_cwd = cwd or (str(_session_worktree) if _session_worktree is not None else workspace)
 
     if action in {"poll", "kill", "status", "update", "send"}:
         if not session_id:
