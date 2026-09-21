@@ -200,10 +200,16 @@ def test_the_first_refresh_reextracts_only_what_differs_from_main(
     assert "omega_wt" not in _names(_open(main), "omega_wt"), "the worktree's refresh wrote main's index"
 
 
-def test_a_partial_worktree_index_is_replaced_by_a_seed(repos: tuple[Path, Path]) -> None:
+@pytest.mark.parametrize("stamped", [False, True], ids=["edit-reindex", "format-stamped"])
+def test_a_partial_worktree_index_is_replaced_by_a_seed(repos: tuple[Path, Path], stamped: bool) -> None:
+    """Today's edit-triggered indexes carry no format stamp; one built by a current indexer does."""
     _main, worktree = repos
     partial = CodeContextEngine(worktree, autosync_enabled=False)
-    partial._reindex_files([str(worktree / "pkg" / "mod0.py")])
+    if stamped:
+        partial.index_repo(force=True, include_globs=["pkg/mod0.py"])
+        assert "indexer_semantics_version" in _state(worktree)
+    else:
+        partial._reindex_files([str(worktree / "pkg" / "mod0.py")])
     assert _file_count(worktree) == 1 and "seeded_from" not in _state(worktree)
 
     engine = _open(worktree)
@@ -284,6 +290,8 @@ def test_a_removed_worktrees_engine_retires_within_one_tick(repos: tuple[Path, P
     main, worktree = repos
     main_engine = _open(main)
     engine = _open(worktree)
+    mcp_server._scoped_context_capability(str(worktree))
+    assert str(worktree) in mcp_server._scoped_context_cache
     shutil.rmtree(worktree)
 
     engine._autosync_tick(0)
@@ -293,6 +301,7 @@ def test_a_removed_worktrees_engine_retires_within_one_tick(repos: tuple[Path, P
     retired = mcp_server._code_engine_cache.sweep()
     assert retired == [str(worktree)]
     assert str(worktree) not in mcp_server._code_engine_cache
+    assert str(worktree) not in mcp_server._scoped_context_cache, "a scoped capability pinned the retired engine"
     assert str(main) in mcp_server._code_engine_cache
     assert not main_engine._autosync_stop.is_set()
     assert zoekt_adapter._ROOT_OVERRIDES == {}
@@ -344,3 +353,4 @@ def test_the_main_checkout_engine_is_unchanged(repos: tuple[Path, Path]) -> None
     assert _state(main) == before
     assert not [key for key in before if key.startswith("repo_id_alias:") or key == "seeded_from"]
     assert zoekt_adapter.get_zoekt_supervisor(main).checkout_root == main
+    assert not worktree_seed.retire_worktree_engine(str(main), float("inf")), "main was tracked as a worktree"
