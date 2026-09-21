@@ -267,6 +267,24 @@ def test_reads_and_cwd_less_bash_follow_the_session_into_its_worktree(repos: tup
     assert str(wt_a) not in _text(in_main, "bash", {"command": "pwd -P"})
 
 
+def test_a_file_read_in_full_in_the_main_checkout_does_not_block_its_worktree_copys_cat(
+    repos: tuple[Path, Path, Path],
+) -> None:
+    """The redundant-dump check resolves a relative path where the cwd-less command runs."""
+    main, wt_a, _wt_b = repos
+    session_id = _session()
+    _record_cwd(session_id, main)
+    _text(session_id, "read", {"files": ["pkg/shared.py:full"]})
+
+    _record_cwd(session_id, wt_a)
+    worktree_copy = _text(session_id, "bash", {"command": "cat pkg/shared.py"})
+    _text(session_id, "read", {"files": ["pkg/shared.py:full"]})
+    reread = _text(session_id, "bash", {"command": "cat pkg/shared.py"})
+
+    assert "# a0" in worktree_copy, worktree_copy
+    assert reread.startswith("[lc: already read in full"), reread
+
+
 def test_the_resolved_against_note_appears_only_for_a_relative_path(repos: tuple[Path, Path, Path]) -> None:
     """AC-2.5: an absolute path owes nothing to the inferred worktree, so it says nothing about it."""
     _main, wt_a, wt_b = repos

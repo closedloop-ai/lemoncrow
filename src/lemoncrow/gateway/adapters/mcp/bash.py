@@ -1066,6 +1066,12 @@ def _render_bash_text(result: dict[str, Any]) -> str:
     return ""
 
 
+def _session_worktree_cwd() -> str | None:
+    """The session's linked worktree, where a command with no ``cwd`` runs (see _run_bash_tool), else None."""
+    worktree = session_root.session_worktree(Path(os.environ.get("CLAUDE_WORKSPACE_ROOT") or os.getcwd()))
+    return None if worktree is None else str(worktree)
+
+
 def _lift_bash_command_list(args: dict[str, Any], known_params: frozenset[str]) -> dict[str, Any]:
     """Recover list-for-string args: command=[...] -> commands, id=[...] -> ids."""
     cmd = args.get("command")
@@ -1257,7 +1263,7 @@ def tool_bash(
         # bash(id=x) with no explicit action = wait for the run to finish.
         action = "poll"
     if action == "run" and command and not bg and not interactive:
-        _dump_notice = _check_redundant_file_dump(command, cwd)
+        _dump_notice = _check_redundant_file_dump(command, cwd or _session_worktree_cwd())
         if _dump_notice:
             return _dump_notice
     result = _run_bash_tool(
