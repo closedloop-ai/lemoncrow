@@ -27,6 +27,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,29 @@ def _lemoncrow_root() -> Path:
     if state.get("lemoncrow_root"):
         return Path(state["lemoncrow_root"])
     return Path.home() / ".lemoncrow"
+
+
+_SESSION_CWD_MAX_AGE_S = 7 * 24 * 3600
+
+
+def _prune_session_cwds(now: float | None = None) -> None:
+    """Delete session cwd records untouched for 7 days.
+
+    ``mcp_read_allow.py`` writes one per session, under the same store root, and
+    rewrites it only when the cwd changes; a live session whose record is pruned
+    gets it back on its next lc call.
+    """
+    configured = os.environ.get("LEMONCROW_ROOT", "").strip()
+    root = Path(configured).expanduser() if configured else Path.home() / ".lemoncrow"
+    cutoff = (time.time() if now is None else now) - _SESSION_CWD_MAX_AGE_S
+    try:
+        entries = list(os.scandir(root / "session_cwd"))
+    except OSError:
+        return
+    for entry in entries:
+        with suppress(OSError):
+            if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                os.unlink(entry.path)
 
 
 def _active_session_id() -> str | None:
@@ -262,6 +286,9 @@ def main() -> int:
     if payload.get("cwd") and payload.get("source", "startup") in ("startup", "clear"):
         with suppress(Exception):
             _emit_env_context(payload["cwd"])
+
+    with suppress(Exception):
+        _prune_session_cwds()
 
     session_id_raw: str = payload.get("session_id", "") or ""
     source: str = payload.get("source", "startup") or "startup"

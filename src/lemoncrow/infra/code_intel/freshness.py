@@ -70,6 +70,8 @@ __all__ = [
     "IndexState",
     "VersionedEngineCache",
     "index_state",
+    "note_refreshing",
+    "refreshing_noted",
     "require_ready",
     "reset_readiness_probes",
     "take_refreshing",
@@ -175,6 +177,16 @@ def take_refreshing() -> bool:
     seen = bool(getattr(_refreshing_seen, "value", False))
     _refreshing_seen.value = False
     return seen
+
+
+def refreshing_noted() -> bool:
+    """What :func:`take_refreshing` would return now, without clearing the mark."""
+    return bool(getattr(_refreshing_seen, "value", False))
+
+
+def note_refreshing() -> None:
+    """Flag this thread's call as answered from an index that is still being refreshed."""
+    _refreshing_seen.value = True
 
 
 def index_lock_path(repo_root: Path | str = ".") -> Path:
@@ -425,6 +437,10 @@ class VersionedEngineCache:
         """The index generation *key*'s cached value was built against."""
         entry = self._entries.get(key)
         return None if entry is None else entry.index_version
+
+    def recheck(self, key: str) -> None:
+        """Make the next :meth:`get` for *key* re-read the index state, whatever *recheck_seconds* says."""
+        self._probes.pop(key, None)
 
     def discard(self, key: str) -> None:
         with self._lock:

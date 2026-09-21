@@ -3615,7 +3615,7 @@ def test_check_repeat_query_flags_the_debt_benchmark_regression() -> None:
         "_line_age_days git blame annotate stale",
         "line age days git blame last modified",
     ]
-    flags = [mcp_server._check_repeat_query(q) for q in queries]
+    flags = [mcp_server._check_repeat_query(q, "/repo") for q in queries]
     assert all(isinstance(f, bool) for f in flags)
     assert flags[0] is False  # nothing recorded yet
     assert any(flags[1:]), "expected at least one repeat-query flag"
@@ -3623,15 +3623,15 @@ def test_check_repeat_query_flags_the_debt_benchmark_regression() -> None:
 
 def test_check_repeat_query_false_for_distinct_topics() -> None:
     mcp_server._RECENT_CODE_SEARCH_QUERIES.clear()
-    assert mcp_server._check_repeat_query("parse yaml config loader") is False
-    assert mcp_server._check_repeat_query("websocket reconnect backoff timer") is False
-    assert mcp_server._check_repeat_query("database connection pool sizing") is False
+    assert mcp_server._check_repeat_query("parse yaml config loader", "/repo") is False
+    assert mcp_server._check_repeat_query("websocket reconnect backoff timer", "/repo") is False
+    assert mcp_server._check_repeat_query("database connection pool sizing", "/repo") is False
 
 
 def test_check_repeat_query_records_into_session_bucket() -> None:
     mcp_server._RECENT_CODE_SEARCH_QUERIES.clear()
-    mcp_server._check_repeat_query("parse yaml config loader")
-    bucket = mcp_server._recent_code_search_queries()
+    mcp_server._check_repeat_query("parse yaml config loader", "/repo")
+    bucket = mcp_server._recent_code_search_queries("/repo")
     assert len(bucket) == 1
     assert bucket[0][1] == "parse yaml config loader"
     assert bucket[0][2] == mcp_server._query_words("parse yaml config loader")
@@ -3642,11 +3642,11 @@ def test_check_repeat_query_ignores_entries_outside_time_window() -> None:
     # session) -- a query from a previous, unrelated chat must not blank a
     # brand-new conversation's first call just because the words overlap.
     mcp_server._RECENT_CODE_SEARCH_QUERIES.clear()
-    mcp_server._check_repeat_query("fail-on-stale stale-days debt_cmd")
-    bucket = mcp_server._recent_code_search_queries()
+    mcp_server._check_repeat_query("fail-on-stale stale-days debt_cmd", "/repo")
+    bucket = mcp_server._recent_code_search_queries("/repo")
     ts, text, words = bucket[0]
     bucket[0] = (ts - mcp_server._RECENT_QUERY_WINDOW_SECONDS - 1, text, words)
-    assert mcp_server._check_repeat_query("stale_days fail_on_stale debt marker age") is False
+    assert mcp_server._check_repeat_query("stale_days fail_on_stale debt marker age", "/repo") is False
 
 
 def test_render_code_search_md_renders_blank_result_with_no_hint_text() -> None:

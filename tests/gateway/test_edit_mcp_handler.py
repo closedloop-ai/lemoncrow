@@ -17,6 +17,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from lemoncrow.gateway.adapters import mcp_server
+from lemoncrow.gateway.adapters.mcp import session_root
 from lemoncrow.gateway.adapters.mcp_server import tool_smart_edit
 from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
@@ -1353,6 +1354,13 @@ def _git(*args: str, cwd: Path) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
 
 
+def _set_bash_cwd(monkeypatch: pytest.MonkeyPatch, cwd: str | None) -> None:
+    """Start from an empty per-session bash cwd map, then record *cwd* for the stdio session."""
+    monkeypatch.setattr(session_root, "_bash_cwds", session_root.BashCwds())
+    if cwd is not None:
+        session_root.record_bash_cwd("", cwd)
+
+
 def _repo_with_worktree(root: Path) -> Path:
     """Init a git repo at `root` and add a linked worktree; return the worktree."""
     _git("init", "-q", cwd=root)
@@ -1376,7 +1384,7 @@ def test_relative_edit_follows_the_session_into_a_worktree(workspace: Path, monk
     """
     wt = _repo_with_worktree(workspace)
     (wt / "target.txt").write_text("WORKTREE\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
 
     payload = _edit(
         {
@@ -1403,7 +1411,7 @@ def test_relative_path_in_both_checkouts_is_refused_not_guessed(
     wt = _repo_with_worktree(workspace)
     (workspace / "target.txt").write_text("SHARED\n", encoding="utf-8")
     (wt / "target.txt").write_text("SHARED\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
 
     payload = _edit(
         {
@@ -1427,7 +1435,7 @@ def test_relative_create_under_an_inferred_worktree_is_not_refused(
 ) -> None:
     """A path that exists in no candidate root has nothing to collide with."""
     wt = _repo_with_worktree(workspace)
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
 
     text = _edit_text(
         {
@@ -1448,7 +1456,7 @@ def test_explicit_root_beats_the_inferred_worktree(workspace: Path, monkeypatch:
     wt = _repo_with_worktree(workspace)
     (workspace / "target.txt").write_text("SHARED\n", encoding="utf-8")
     (wt / "target.txt").write_text("SHARED\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
 
     text = _edit_text(
         {
@@ -1481,7 +1489,7 @@ def test_explicit_root_outside_the_workspace_is_refused(
     outside = tmp_path.parent / "outside-root"
     outside.mkdir(parents=True, exist_ok=True)
     (outside / "target.txt").write_text("OUTSIDE\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
 
     payload = _edit(
         {
@@ -1512,7 +1520,7 @@ def test_explicit_root_under_a_scratch_root_is_allowed(
     scratch.mkdir(parents=True, exist_ok=True)
     (scratch / "target.txt").write_text("SCRATCH\n", encoding="utf-8")
     monkeypatch.setattr(mcp_server, "_SCRATCH_EDIT_ROOTS", (scratch,))
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
 
     payload = _edit(
         {
@@ -1534,7 +1542,7 @@ def test_worktree_redirect_is_disclosed_to_the_model(workspace: Path, monkeypatc
     """
     wt = _repo_with_worktree(workspace)
     (wt / "target.txt").write_text("WORKTREE\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
 
     text = _edit_text(
         {
@@ -1551,7 +1559,7 @@ def test_no_worktree_evidence_keeps_the_main_checkout(workspace: Path, monkeypat
     """Without a worktree cwd, resolution is unchanged -- and says nothing."""
     _repo_with_worktree(workspace)
     (workspace / "target.txt").write_text("MAIN\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(workspace))
+    _set_bash_cwd(monkeypatch, str(workspace))
 
     text = _edit_text(
         {
@@ -1572,7 +1580,7 @@ def test_a_worktree_of_another_repo_does_not_redirect(
     other = tmp_path.parent / "other-repo"
     other.mkdir(parents=True, exist_ok=True)
     foreign_wt = _repo_with_worktree(other)
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(foreign_wt))
+    _set_bash_cwd(monkeypatch, str(foreign_wt))
 
     assert mcp_server._session_worktree_root(workspace) is None
 
@@ -1590,7 +1598,7 @@ def test_absolute_main_checkout_path_survives_a_worktree_inference(
     wt = _repo_with_worktree(workspace)
     target = workspace / "main_only.txt"
     target.write_text("MAIN\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
 
     payload = _edit(
         {
@@ -1619,7 +1627,7 @@ def test_absolute_edit_under_a_symlinked_workspace_root_is_not_an_escape(
     link.symlink_to(real, target_is_directory=True)
     monkeypatch.setenv("CLAUDE_WORKSPACE_ROOT", str(link))
     wt = _repo_with_worktree(real)
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
     (link / "main_only.txt").write_text("MAIN\n", encoding="utf-8")
 
     payload = _edit(
@@ -1634,18 +1642,19 @@ def test_absolute_edit_under_a_symlinked_workspace_root_is_not_an_escape(
 
 
 def test_bash_cwd_is_what_teaches_edit_where_the_session_is(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Only a bash call's cwd is recorded -- it is the sole session-cwd signal."""
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", None)
+    """Only a bash call's cwd is recorded, per session -- the session-cwd signal on hosts without the hook."""
+    _set_bash_cwd(monkeypatch, None)
+    bash_cwds = session_root._bash_cwds
 
     mcp_server._record_session_cwd("read", {"cwd": "/not/recorded"})
-    assert mcp_server._last_session_cwd is None
+    assert bash_cwds.get("") is None
 
     mcp_server._record_session_cwd("bash", {"cwd": "/recorded"})
-    assert mcp_server._last_session_cwd == "/recorded"
+    assert bash_cwds.get("") == "/recorded"
 
     # A bash call without an explicit cwd must not clear what we know.
     mcp_server._record_session_cwd("bash", {})
-    assert mcp_server._last_session_cwd == "/recorded"
+    assert bash_cwds.get("") == "/recorded"
 
 
 # ---------------------------------------------------------------------------
@@ -1740,7 +1749,7 @@ def test_edit_rooted_outside_the_workspace_root_reindexes_before_responding(
     wt = _repo_with_worktree(workspace)
     target = wt / "wt_only.py"
     target.write_text("VALUE = 1\n", encoding="utf-8")
-    monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt))
+    _set_bash_cwd(monkeypatch, str(wt))
     responded = threading.Event()
     calls = _record_reindexes(monkeypatch, responded)
 
@@ -1807,7 +1816,7 @@ def test_edit_reindex_off_switch_disables_both_reindexes(workspace: Path, monkey
     calls = _record_reindexes(monkeypatch, responded)
 
     for path in (str(workspace / "main_only.py"), "wt_only.py"):
-        monkeypatch.setattr(mcp_server, "_last_session_cwd", str(wt) if path == "wt_only.py" else None)
+        _set_bash_cwd(monkeypatch, str(wt) if path == "wt_only.py" else None)
         payload = _edit(
             {
                 "post_edit_hooks": False,

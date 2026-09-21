@@ -30,13 +30,24 @@ Stays silent (no decision at all) for every other tool, so it never overrides a
 user's own deny rule for something outside this list.
 
 Fail-open; opt-out via LEMONCROW_MCP_READ_ALLOW=0.
+
+It also records the session's working directory for every lc call, read-only or
+not and whatever the opt-out says: ``<store root>/session_cwd/<session id>``
+holds the payload's ``cwd``, which follows ``EnterWorktree``. The shared MCP
+daemon reads it to route the session's calls to the worktree it works in
+(``lemoncrow.gateway.adapters.mcp.session_root``). The record never changes
+this hook's output and never raises; SessionStart prunes records older than
+7 days.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import tempfile
+from pathlib import Path
 from typing import Any
 
 # MCP server key as registered by install_claude.sh (user scope: "lc",
@@ -122,14 +133,60 @@ def _allow(reason: str) -> None:
     )
 
 
+# A session id names a file, so it must never carry a path separator or a dot.
+_SESSION_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+
+
+def _session_cwd_dir() -> Path:
+    """``<store root>/session_cwd``, the store root resolved as ``lemoncrow`` resolves it."""
+    configured = os.environ.get("LEMONCROW_ROOT", "").strip()
+    root = Path(configured).expanduser() if configured else Path.home() / ".lemoncrow"
+    return root / "session_cwd"
+
+
+def _record_session_cwd(payload: dict[str, Any]) -> None:
+    """Write the payload's cwd to its session's file when it changed; never raise."""
+    session_id = payload.get("session_id")
+    cwd = payload.get("cwd")
+    if not isinstance(session_id, str) or not _SESSION_ID_RE.fullmatch(session_id):
+        return
+    if not isinstance(cwd, str) or not cwd.strip():
+        return
+    try:
+        directory = _session_cwd_dir()
+        if not directory.is_dir():
+            directory.mkdir(parents=True, exist_ok=True)
+            os.chmod(directory, 0o700)
+        target = directory / session_id
+        try:
+            if target.read_text(encoding="utf-8") == cwd:
+                return
+        except (OSError, UnicodeDecodeError):
+            pass
+        fd, tmp = tempfile.mkstemp(dir=directory, prefix=f".{session_id}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(cwd)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except Exception as exc:  # the permission decision must survive any failure here
+        print(f"lc: session cwd not recorded: {exc}", file=sys.stderr)
+
+
 def main() -> int:
-    if os.environ.get("LEMONCROW_MCP_READ_ALLOW", "1") == "0":
-        return 0
     try:
         payload: dict[str, Any] = json.loads(sys.stdin.read() or "{}")
     except (json.JSONDecodeError, TypeError, OSError):
         return 0
     if not isinstance(payload, dict):
+        return 0
+    _record_session_cwd(payload)
+    if os.environ.get("LEMONCROW_MCP_READ_ALLOW", "1") == "0":
         return 0
     tool = _read_only_tool(str(payload.get("tool_name") or ""), payload.get("tool_input"))
     if tool is None:
