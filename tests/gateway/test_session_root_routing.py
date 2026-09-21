@@ -361,6 +361,25 @@ def test_a_file_read_in_full_in_the_main_checkout_does_not_block_its_worktree_co
     assert reread.startswith("[lc: already read in full"), reread
 
 
+def test_a_missing_workspace_root_sends_the_dump_check_where_the_command_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CLAUDE_WORKSPACE_ROOT that is not a directory falls back to the process cwd for both."""
+    here = (tmp_path / "here").resolve()
+    here.mkdir()
+    (here / "notes.txt").write_text("already seen\n", encoding="utf-8")
+    (tmp_path / "a-file").write_text("", encoding="utf-8")
+    # Under a file, so nothing the daemon does can create it.
+    monkeypatch.setenv("CLAUDE_WORKSPACE_ROOT", str(tmp_path / "a-file" / "gone"))
+    session_id = _session()
+    _text(session_id, "read", {"files": [f"{here / 'notes.txt'}:full"]})
+    monkeypatch.chdir(here)
+
+    dumped = _text(session_id, "bash", {"command": "head notes.txt"})
+
+    assert dumped.startswith("[lc: already read in full"), dumped
+
+
 def test_the_resolved_against_note_appears_only_for_a_relative_path(repos: tuple[Path, Path, Path]) -> None:
     """AC-2.5: an absolute path owes nothing to the inferred worktree, so it says nothing about it."""
     _main, wt_a, wt_b = repos

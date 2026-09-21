@@ -443,16 +443,8 @@ def _run_bash_tool(
             return json.dumps(matches, ensure_ascii=False)
         return json.dumps(payload, ensure_ascii=False)
 
-    workspace = os.environ.get("CLAUDE_WORKSPACE_ROOT", os.getcwd())
-    # A misconfigured CLAUDE_WORKSPACE_ROOT -- e.g. a host path that leaked into
-    # a container via the environment and does not exist here -- would make every
-    # cwd-less command fail with a raw FileNotFoundError from Popen, surfaced as
-    # an opaque "MCP error -32000". Fall back to the process cwd (always a real
-    # directory) so the command still runs instead of hard-failing.
-    if not Path(workspace).is_dir():
-        workspace = os.getcwd()
-    _session_worktree = None if cwd else session_root.session_worktree(Path(workspace))
-    effective_cwd = cwd or (str(_session_worktree) if _session_worktree is not None else workspace)
+    workspace = _bash_workspace()
+    effective_cwd = cwd or _cwd_less_run_dir(workspace)
 
     if action in {"poll", "kill", "status", "update", "send"}:
         if not session_id:
@@ -1066,10 +1058,23 @@ def _render_bash_text(result: dict[str, Any]) -> str:
     return ""
 
 
-def _session_worktree_cwd() -> str | None:
-    """The session's linked worktree, where a command with no ``cwd`` runs (see _run_bash_tool), else None."""
-    worktree = session_root.session_worktree(Path(os.environ.get("CLAUDE_WORKSPACE_ROOT") or os.getcwd()))
-    return None if worktree is None else str(worktree)
+def _bash_workspace() -> str:
+    """The workspace root ``bash`` works under: CLAUDE_WORKSPACE_ROOT, else the process cwd.
+
+    A misconfigured CLAUDE_WORKSPACE_ROOT -- e.g. a host path that leaked into a
+    container via the environment and does not exist here -- would make every
+    cwd-less command fail with a raw FileNotFoundError from Popen, surfaced as an
+    opaque "MCP error -32000". It falls back to the process cwd (always a real
+    directory) so the command still runs instead of hard-failing.
+    """
+    workspace = os.environ.get("CLAUDE_WORKSPACE_ROOT", os.getcwd())
+    return workspace if Path(workspace).is_dir() else os.getcwd()
+
+
+def _cwd_less_run_dir(workspace: str) -> str:
+    """Where a command with no ``cwd`` runs: the session's linked worktree, else *workspace*."""
+    worktree = session_root.session_worktree(Path(workspace))
+    return workspace if worktree is None else str(worktree)
 
 
 def _lift_bash_command_list(args: dict[str, Any], known_params: frozenset[str]) -> dict[str, Any]:
@@ -1263,7 +1268,7 @@ def tool_bash(
         # bash(id=x) with no explicit action = wait for the run to finish.
         action = "poll"
     if action == "run" and command and not bg and not interactive:
-        _dump_notice = _check_redundant_file_dump(command, cwd or _session_worktree_cwd())
+        _dump_notice = _check_redundant_file_dump(command, cwd or _cwd_less_run_dir(_bash_workspace()))
         if _dump_notice:
             return _dump_notice
     result = _run_bash_tool(
