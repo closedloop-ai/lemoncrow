@@ -318,6 +318,12 @@ class VersionedEngineCache:
     background autosync thread references the engine, so an evicted engine never
     died. Every index bump left one more loop polling the tree and spawning its
     own reindex, and those reindexes bumped the version again.
+
+    *retire* decides which entries to drop on its own: it is called with each
+    key and the seconds since that key was last requested, and True discards the
+    entry (through *on_evict*). The check runs on every :meth:`get` and on a
+    background timer every *sweep_seconds*, so an entry nobody requests again
+    still goes.
     """
 
     def __init__(
@@ -326,15 +332,22 @@ class VersionedEngineCache:
         recheck_seconds: float = DEFAULT_RECHECK_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         on_evict: Callable[[Any], None] | None = None,
+        retire: Callable[[str, float], bool] | None = None,
+        sweep_seconds: float = 60.0,
     ) -> None:
         self.name = name
         self.recheck_seconds = float(recheck_seconds)
         self.on_evict = on_evict
+        self.retire = retire
+        self.sweep_seconds = float(sweep_seconds)
         self.evictions = 0
         self._clock = clock
         self._lock = threading.Lock()
         self._entries: dict[str, _Entry] = {}
         self._probes: dict[str, _Probe] = {}
+        self._last_access: dict[str, float] = {}
+        self._sweeper: threading.Thread | None = None
+        self._sweeper_stop = threading.Event()
 
     # -- probing -----------------------------------------------------------
 
@@ -363,6 +376,10 @@ class VersionedEngineCache:
         results from a torn index is the failure mode this whole module exists
         to remove.
         """
+        self._last_access[key] = self._clock()
+        if self.retire is not None:
+            self._ensure_sweeper()
+            self.sweep(skip=key)
         state = self.state_for(repo_root)
         if state.rebuilding:
             raise IndexRebuilding(repo_root, state.detail)
@@ -412,14 +429,58 @@ class VersionedEngineCache:
     def discard(self, key: str) -> None:
         with self._lock:
             entry = self._entries.pop(key, None)
+            self._probes.pop(key, None)
+            self._last_access.pop(key, None)
         if entry is not None:
             self._retire(entry.value)
+
+    def sweep(self, *, skip: str | None = None) -> list[str]:
+        """Discard every entry *retire* says to; returns the keys discarded."""
+        retire = self.retire
+        if retire is None:
+            return []
+        now = self._clock()
+        with self._lock:
+            idle = {key: now - self._last_access.get(key, now) for key in self._entries if key != skip}
+        retired: list[str] = []
+        for key, idle_seconds in idle.items():
+            try:
+                if not retire(key, idle_seconds):
+                    continue
+            except Exception:
+                logger.warning("%s: retire check for %s failed", self.name, key, exc_info=True)
+                continue
+            logger.info("%s: retiring %s after %.0fs idle", self.name, key, idle_seconds)
+            self.discard(key)
+            retired.append(key)
+        return retired
+
+    def _ensure_sweeper(self) -> None:
+        if self._sweeper is not None:
+            return
+        with self._lock:
+            if self._sweeper is not None:
+                return
+            self._sweeper = threading.Thread(target=self._sweep_loop, name=f"{self.name}-sweeper", daemon=True)
+        self._sweeper.start()
+
+    def _sweep_loop(self) -> None:
+        while not self._sweeper_stop.wait(self.sweep_seconds):
+            try:
+                self.sweep()
+            except Exception:
+                logger.warning("%s: sweep failed", self.name, exc_info=True)
+
+    def stop_sweeper(self) -> None:
+        """End the background sweep; :meth:`get` still sweeps."""
+        self._sweeper_stop.set()
 
     def clear(self) -> None:
         with self._lock:
             dropped = [entry.value for entry in self._entries.values()]
             self._entries.clear()
             self._probes.clear()
+            self._last_access.clear()
             self.evictions = 0
         for value in dropped:
             self._retire(value)

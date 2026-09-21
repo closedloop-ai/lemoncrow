@@ -700,7 +700,11 @@ def code_host_remove_cmd(ctx: click.Context, engine: str, yes: bool) -> None:
 )
 @click.option("--include", "include_globs", multiple=True)
 @click.option("--exclude", "exclude_globs", multiple=True)
-@click.option("--reindex", is_flag=True, help="Full rebuild from scratch (default: incremental).")
+@click.option(
+    "--reindex",
+    is_flag=True,
+    help="Full rebuild from scratch (default: incremental); in a linked git worktree, re-seed from the main checkout's index when it can.",
+)
 @click.option(
     "--force",
     "steal_lock",
@@ -725,7 +729,10 @@ def code_index_cmd(
     """Index a repository into the SQLite FTS5 symbol store.
 
     Incremental by default (only re-indexes changed files). Use --reindex
-    for a full rebuild from scratch.
+    for a full rebuild from scratch. In a linked git worktree whose main
+    checkout has a current index, --reindex re-seeds from that index instead,
+    then re-indexes only the files that differ; a seeded worktree index is
+    never rebuilt.
     """
     if repo_root is None:
         # Resolve the same way the MCP code_search / read tools do
@@ -734,8 +741,23 @@ def code_index_cmd(
         from lemoncrow.core.foundation.paths import resolve_workspace_root
 
         repo_root = str(resolve_workspace_root())
-    engine = _code_context_engine(repo_root, db_path=Path(db_path) if db_path else None)
+    from lemoncrow.infra.code_intel import worktree_seed
+
     force = reindex
+    seeded_worktree = False
+    if db_path is None:
+        # A linked worktree's index is seeded from its main checkout's, and --reindex
+        # re-seeds it: a full build would un-share every page of the clone.
+        from lemoncrow.infra.code_intel.freshness import IndexRebuilding
+
+        try:
+            seed = worktree_seed.ensure_seeded(Path(repo_root).resolve(), reseed=reindex)
+        except IndexRebuilding as exc:
+            raise click.ClickException(str(exc)) from exc
+        if seed is not None and seed.seeded:
+            force = False
+        seeded_worktree = worktree_seed.seeded_main_root(Path(repo_root).resolve()) is not None
+    engine = _code_context_engine(repo_root, db_path=Path(db_path) if db_path else None)
     if as_json:
         payload = engine.index_repo(
             force=force,
@@ -744,14 +766,16 @@ def code_index_cmd(
             include_globs=list(include_globs) or None,
             exclude_globs=list(exclude_globs) or None,
         ).model_dump(mode="json")
+        worktree_seed.checkpoint_index(Path(engine.db_path).parent)  # so a worktree seed finds a small WAL
         try:
             engine._deleted_history_adapter()._ensure_history_ready()
         except Exception:
             logging.exception("Failed to prepare background indexes")
-        try:
-            _trigger_zoekt_with_progress(Path(repo_root).resolve(), quiet=True)
-        except Exception:
-            logging.exception("Failed to prewarm Zoekt index")
+        if not seeded_worktree:  # a seeded worktree searches its main checkout's Zoekt index
+            try:
+                _trigger_zoekt_with_progress(Path(repo_root).resolve(), quiet=True)
+            except Exception:
+                logging.exception("Failed to prewarm Zoekt index")
         _emit(payload, as_json=True)
         return
 
@@ -765,9 +789,11 @@ def code_index_cmd(
         success_description="Indexed code",
         frame_prefix=frame_prefix,
     )
+    worktree_seed.checkpoint_index(Path(engine.db_path).parent)  # so a worktree seed finds a small WAL
 
     git_summary = _index_git_history_with_progress(engine, frame_prefix=frame_prefix)
-    _trigger_zoekt_with_progress(Path(repo_root).resolve(), frame_prefix=frame_prefix)
+    if not seeded_worktree:
+        _trigger_zoekt_with_progress(Path(repo_root).resolve(), frame_prefix=frame_prefix)
 
     stats_line = (
         f"{click.style('✓', fg='green')}  Indexed {payload['files_indexed']} files, {payload['symbols_indexed']} "

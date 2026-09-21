@@ -713,6 +713,34 @@ class ZoektServer:
         return None
 
 
+def _git_dirs(repo_root: Path) -> tuple[Path, Path] | None:
+    """``(gitdir, commondir)`` for a checkout: both ``.git`` in a normal one.
+
+    A linked worktree's ``.git`` is a file naming its own admin directory, which
+    holds its HEAD; branch refs live in the shared directory ``commondir`` names.
+    """
+    dot_git = repo_root / ".git"
+    if dot_git.is_dir():
+        return dot_git, dot_git
+    try:
+        text = dot_git.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not text.startswith("gitdir:"):
+        return None
+    gitdir = Path(text.split(":", 1)[1].strip())
+    if not gitdir.is_absolute():
+        gitdir = repo_root / gitdir
+    common = gitdir
+    try:
+        raw = (gitdir / "commondir").read_text(encoding="utf-8").strip()
+    except OSError:
+        raw = ""
+    if raw:
+        common = Path(raw) if Path(raw).is_absolute() else gitdir / raw
+    return gitdir, common
+
+
 def _read_git_head(repo_root: Path) -> str | None:
     """Resolve a repo's git HEAD to a commit sha via cheap file reads.
 
@@ -720,17 +748,22 @@ def _read_git_head(repo_root: Path) -> str | None:
     the symbolic ref string when the ref is packed/unborn -- still a stable
     change-detection key. None when the path is not a git repo.
     """
-    head_file = repo_root / ".git" / "HEAD"
+    dirs = _git_dirs(repo_root)
+    if dirs is None:
+        return None
+    gitdir, common = dirs
     try:
-        ref = head_file.read_text(encoding="utf-8").strip()
+        ref = (gitdir / "HEAD").read_text(encoding="utf-8").strip()
     except OSError:
         return None
     if ref.startswith("ref: "):
-        ref_path = repo_root / ".git" / ref[5:]
-        try:
-            return ref_path.read_text(encoding="utf-8").strip()
-        except OSError:
-            return ref
+        name = ref[5:]
+        for base in (gitdir, common):
+            try:
+                return (base / name).read_text(encoding="utf-8").strip()
+            except OSError:
+                continue
+        return ref
     return ref
 
 

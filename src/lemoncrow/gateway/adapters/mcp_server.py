@@ -165,6 +165,7 @@ from lemoncrow.gateway.adapters.mcp.tools_commodity import (  # noqa: F401  (reg
     tool_web_fetch,
 )
 from lemoncrow.gateway.adapters.mcp_branding import icon_metadata
+from lemoncrow.infra.code_intel import worktree_seed
 from lemoncrow.infra.code_intel.completeness import (
     CODE_OP_MATCH_KINDS,
     CODE_OP_OBJECTIVES,
@@ -3778,38 +3779,8 @@ def _record_session_cwd(name: str, args: Any) -> None:
 
 
 def _linked_worktree_root(workspace_root: Path, candidate_dir: Path) -> Path | None:
-    """The linked worktree of ``workspace_root`` that contains ``candidate_dir``, else None.
-
-    Detected without spawning git: a linked worktree's ``.git`` is a *file*
-    holding ``gitdir: <path>``, and for a worktree of THIS repo that path lives
-    under ``<workspace_root>/.git/worktrees/``. A normal checkout has ``.git``
-    as a directory, which ends the walk immediately.
-
-    Returns None for every uncertain case -- a plain directory, a worktree
-    belonging to a different repo, the workspace root itself.
-    """
-    try:
-        candidate = candidate_dir.expanduser().resolve()
-        if not candidate.is_dir():
-            return None
-        root = workspace_root.resolve()
-        worktrees_dir = (root / ".git" / "worktrees").resolve()
-        for directory in (candidate, *candidate.parents):
-            marker = directory / ".git"
-            if marker.is_dir():
-                return None  # a normal checkout, not a linked worktree
-            if not marker.is_file():
-                continue
-            gitdir = marker.read_text(encoding="utf-8").strip()
-            if not gitdir.startswith("gitdir:"):
-                return None
-            target = Path(gitdir.split(":", 1)[1].strip()).resolve()
-            if not target.is_relative_to(worktrees_dir):
-                return None  # a worktree, but of some other repo
-            return None if directory == root else directory
-    except OSError:
-        return None
-    return None
+    """The linked worktree of ``workspace_root`` that contains ``candidate_dir``, else None."""
+    return worktree_seed.linked_worktree_of(workspace_root, candidate_dir)
 
 
 def _session_worktree_root(workspace_root: Path) -> Path | None:
@@ -8929,9 +8900,15 @@ _code_index_freshness_for_current_call: threading.local = threading.local()
 # code_search answered "index is being rebuilt" for most calls.
 def _retire_code_engine(engine: Any) -> None:
     engine.stop_autosync()
+    # A scoped capability holds its engine; left cached it would pin a retired one.
+    with _scoped_context_cache_lock:
+        for key in [key for key, entry in _scoped_context_cache.items() if entry[1] is engine]:
+            del _scoped_context_cache[key]
 
 
-_code_engine_cache = VersionedEngineCache("code_engine", on_evict=_retire_code_engine)
+_code_engine_cache = VersionedEngineCache(
+    "code_engine", on_evict=_retire_code_engine, retire=worktree_seed.retire_worktree_engine
+)
 
 # ``cache_key -> (capability, engine_it_was_built_from)``.
 #
@@ -9031,7 +9008,15 @@ def _code_context_engine(repo_root: str = ".") -> Any:
     root = Path(repo_root)
     resolved = (root if root.is_absolute() else Path(workspace) / root).resolve()
     cache_key = str(resolved)
+    # A linked worktree's index starts as a clone of its main checkout's.
+    seed = worktree_seed.ensure_seeded(
+        resolved,
+        cached=cache_key in _code_engine_cache,
+        before_swap=lambda: _code_engine_cache.discard(cache_key),
+    )
     engine, freshness = _code_engine_cache.get(cache_key, resolved, lambda: CodeContextEngine(resolved))
+    if seed is not None and seed.seeded:
+        worktree_seed.start_first_refresh(engine)
     _code_index_freshness_for_current_call.value = freshness
     return engine
 

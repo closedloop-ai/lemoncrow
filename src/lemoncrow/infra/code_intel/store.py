@@ -24,6 +24,7 @@ from lemoncrow.core.foundation.paths import resolve_workspace_store_dir
 
 __all__ = [
     "CODE_CONTEXT_DB",
+    "CODE_INDEXER_SEMANTICS_VERSION",
     "FTS_DB",
     "INTEL_DB",
     "REPO_MAP_TAGS_DB",
@@ -46,6 +47,13 @@ INTEL_DB = "intel.sqlite"
 FTS_DB = "fts.sqlite"
 VECTORS_DB = "vectors.sqlite"
 REPO_MAP_TAGS_DB = "repo_map_tags.sqlite"
+
+#: The engine's indexer format, stamped into ``engine_state`` as
+#: ``indexer_semantics_version``. Bump when source selection or symbol/text
+#: extraction semantics change in a way an incremental mtime/hash check cannot
+#: see for unchanged files.
+#: 3: FTS5 rows carry explicit rowids derived from files.rowid / symbols.rowid.
+CODE_INDEXER_SEMANTICS_VERSION = 3
 
 # The engine holds WAL writers during a reindex; wait rather than fail fast.
 _BUSY_TIMEOUT_MS = 5_000

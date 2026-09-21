@@ -45,6 +45,8 @@ from lemoncrow.infra.code_intel.astgrep import (
     PatternRewriteResult,
     PatternSearchResult,
 )
+from lemoncrow.infra.code_intel.store import CODE_INDEXER_SEMANTICS_VERSION as _CODE_INDEXER_SEMANTICS_VERSION
+from lemoncrow.infra.code_intel.worktree_seed import is_seeded_index, resolve_repo_id
 from lemoncrow.infra.tree_sitter.tags import Tag, detect_language, extract_tags
 from lemoncrow.pro.capabilities.code_context.ann_symbol_index import (
     SymbolAnnIndex,
@@ -404,10 +406,6 @@ _DELETED_SEARCH_OPTIONAL_KEYS = [
 ]
 _SEARCH_COMPACT_DEFAULT_KEYS = set([*_SEARCH_ESSENTIAL_KEYS, "score", "commit_sha"])
 _LINEAGE_INDEX_VERSION = 2
-# Bump when source selection or symbol/text extraction semantics change in a way
-# an incremental mtime/hash check cannot see for unchanged files.
-# 3: FTS5 rows carry explicit rowids derived from files.rowid / symbols.rowid.
-_CODE_INDEXER_SEMANTICS_VERSION = 3
 _LINEAGE_DEFAULT_SCORE_PENALTY = 0.1
 
 # --- File-watcher constants ---
@@ -3715,8 +3713,9 @@ class CodeContextEngine:
         autosync_enabled: bool | None = None,
     ) -> None:
         self.repo_root = Path(repo_root).resolve()
-        self.repo_id = _repo_id(self.repo_root)
         self.db_path = Path(db_path).resolve() if db_path is not None else _default_db_path(self.repo_root)
+        # A seeded worktree index answers under its main checkout's id (worktree_seed).
+        self.repo_id = resolve_repo_id(self.db_path, _repo_id(self.repo_root))
         self._db_lock = _shared_db_lock(self.db_path)
         self._schema_ready = False
         self._cache = RetrievalCache(self.db_path)
@@ -4388,6 +4387,16 @@ class CodeContextEngine:
             self._init_schema(conn)
             if not force and not self._rowid_scheme_trustworthy(conn):
                 force = True
+            seeded = is_seeded_index(conn)
+            if force and seeded:
+                # A rebuild would rewrite every page this clone shares with the main
+                # checkout's index. The engine factory re-seeds it instead.
+                logger.warning(
+                    "context_engine: %s holds a seeded worktree index; not rebuilding it -- it needs a re-seed "
+                    "from the main checkout's index",
+                    self.db_path,
+                )
+                return self._current_index_stats()
 
             if force:
                 # --- Full rebuild: wipe everything, then parallel-extract + batch-write ---
@@ -4580,7 +4589,7 @@ class CodeContextEngine:
                 symbols_indexed = sum(len(r.symbols) for r in results)
                 imports_indexed = sum(len(r.imports) for r in results)
 
-        if force:
+        if force and not seeded:
             # Compact all DBs after a full rebuild — DELETE + re-insert leaves free pages
             # that inflate file size until VACUUMed (e.g. 87 MB → 31 MB for pylint).
             for _vac_db in (self.db_path, self.intel_db_path, self.vectors_db_path, self.fts_db_path):
@@ -15168,6 +15177,11 @@ class CodeContextEngine:
         watcher is alive: it already reindexes the files any change touches, a
         checkout included, so checking HEAD too would reindex a checkout twice.
         """
+        if not self.repo_root.is_dir():
+            # A removed git worktree. Stop before anything connects: opening the
+            # index would recreate its store inside the deleted checkout.
+            self._stop_autosync_worker()
+            return
         if not self.index_ready():
             # Still empty (e.g. the initial build lost an index-lock race
             # with a concurrent prewarm). Keep retrying until it exists.
