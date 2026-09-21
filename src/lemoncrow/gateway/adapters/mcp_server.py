@@ -5529,7 +5529,7 @@ def render_tool_result_text(name: str, result: Any) -> str | None:
             if isinstance(resolved_against, str) and resolved_against:
                 if payload.get("resolved_against_source") == "explicit":
                     text = f"{text} | resolved against root {resolved_against} (explicit root argument)"
-                elif payload.get("resolved_against_source") == "session_cwd":
+                elif payload.get("resolved_against_source") == session_root.SESSION_CWD:
                     text = f"{text} | resolved against worktree {resolved_against} (from session cwd)"
                 else:
                     text = f"{text} | resolved against worktree {resolved_against} (from last bash cwd)"
@@ -8406,7 +8406,9 @@ def tool_smart_edit(
         result["resolved_against_source"] = "explicit"
     elif _session_worktree is not None and _edits_name_relative_paths(edits):
         result["resolved_against"] = str(_session_worktree)
-        result["resolved_against_source"] = "session_cwd" if _session.source == session_root.SESSION_CWD else "inferred"
+        result["resolved_against_source"] = (
+            session_root.SESSION_CWD if _session.source == session_root.SESSION_CWD else "inferred"
+        )
     return _silence_clean_edit_result(result)
 
 
