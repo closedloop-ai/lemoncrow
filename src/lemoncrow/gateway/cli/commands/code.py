@@ -734,8 +734,22 @@ def code_index_cmd(
         from lemoncrow.core.foundation.paths import resolve_workspace_root
 
         repo_root = str(resolve_workspace_root())
-    engine = _code_context_engine(repo_root, db_path=Path(db_path) if db_path else None)
     force = reindex
+    seeded_worktree = False
+    if db_path is None:
+        # A linked worktree's index is seeded from its main checkout's, and --reindex
+        # re-seeds it: a full build would un-share every page of the clone.
+        from lemoncrow.infra.code_intel import worktree_seed
+        from lemoncrow.infra.code_intel.freshness import IndexRebuilding
+
+        try:
+            seed = worktree_seed.ensure_seeded(Path(repo_root).resolve(), reseed=reindex)
+        except IndexRebuilding as exc:
+            raise click.ClickException(str(exc)) from exc
+        if seed is not None and seed.seeded:
+            force = False
+        seeded_worktree = worktree_seed.seeded_main_root(Path(repo_root).resolve()) is not None
+    engine = _code_context_engine(repo_root, db_path=Path(db_path) if db_path else None)
     if as_json:
         payload = engine.index_repo(
             force=force,
@@ -748,10 +762,11 @@ def code_index_cmd(
             engine._deleted_history_adapter()._ensure_history_ready()
         except Exception:
             logging.exception("Failed to prepare background indexes")
-        try:
-            _trigger_zoekt_with_progress(Path(repo_root).resolve(), quiet=True)
-        except Exception:
-            logging.exception("Failed to prewarm Zoekt index")
+        if not seeded_worktree:  # a seeded worktree searches its main checkout's Zoekt index
+            try:
+                _trigger_zoekt_with_progress(Path(repo_root).resolve(), quiet=True)
+            except Exception:
+                logging.exception("Failed to prewarm Zoekt index")
         _emit(payload, as_json=True)
         return
 
@@ -767,7 +782,8 @@ def code_index_cmd(
     )
 
     git_summary = _index_git_history_with_progress(engine, frame_prefix=frame_prefix)
-    _trigger_zoekt_with_progress(Path(repo_root).resolve(), frame_prefix=frame_prefix)
+    if not seeded_worktree:
+        _trigger_zoekt_with_progress(Path(repo_root).resolve(), frame_prefix=frame_prefix)
 
     stats_line = (
         f"{click.style('✓', fg='green')}  Indexed {payload['files_indexed']} files, {payload['symbols_indexed']} "

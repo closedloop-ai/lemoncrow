@@ -719,6 +719,15 @@ SETTINGS: list[SettingSpec] = [
         "Enable the on-disk tag cache for repo-map generation.",
     ),
     SettingSpec(
+        "code_context.worktree_engine_idle_s",
+        "LEMONCROW_WORKTREE_ENGINE_IDLE_S",
+        "float",
+        1800.0,
+        "code_context",
+        "Seconds a git worktree's code engine may go without a request before the daemon unloads it "
+        "(its index stays on disk; the next request reopens it). The main checkout's engine never unloads.",
+    ),
+    SettingSpec(
         "code_context.zoekt_gate",
         "LEMONCROW_ZOEKT_GATE",
         "bool",

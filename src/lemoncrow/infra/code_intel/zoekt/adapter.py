@@ -41,6 +41,10 @@ _NOISE_PATH_PARTS = frozenset(
 _SOURCE_PATH_PARTS = ("src", "lemoncrow")
 _SUPERVISORS: dict[str, ZoektSupervisor] = {}
 _SUPERVISORS_LOCK = threading.Lock()
+#: Checkout root -> the root whose Zoekt index serves it. A seeded worktree's
+#: files are its main checkout's at the same relative paths, so main's server
+#: supplies its candidates instead of a build and a server per worktree.
+_ROOT_OVERRIDES: dict[str, Path] = {}
 
 
 @dataclass(frozen=True)
@@ -55,8 +59,11 @@ class ZoektBackendHealth:
 class ZoektSupervisor:
     """Session-scoped lifecycle owner for the search backend."""
 
-    def __init__(self, repo_root: str | Path) -> None:
+    def __init__(self, repo_root: str | Path, *, checkout_root: str | Path | None = None) -> None:
+        # repo_root is the checkout whose index and server answer; checkout_root
+        # is the one results are read from and must exist in (a seeded worktree).
         self.repo_root = Path(repo_root).resolve()
+        self.checkout_root = Path(checkout_root).resolve() if checkout_root is not None else self.repo_root
         self._binary_resolution: ZoektBinaryResolution | None = None
         self._client: ZoektClient | None = None
         self._indexer = ZoektIndexer(self.repo_root)
@@ -90,9 +97,18 @@ class ZoektSupervisor:
         cached = self._route_cache.get(cache_key)
         if cached is not None:
             return cached
-        should_route = self._indexer.line_count(search_path) >= threshold
+        should_route = self._indexer.line_count(self._served_path(Path(search_path))) >= threshold
         self._route_cache[cache_key] = should_route
         return should_route
+
+    def _served_path(self, path: Path) -> Path:
+        """*path* under the checkout, re-rooted under the served one."""
+        if self.checkout_root == self.repo_root:
+            return path
+        try:
+            return self.repo_root / path.resolve().relative_to(self.checkout_root)
+        except ValueError:
+            return path
 
     def _resolution(self) -> ZoektBinaryResolution:
         if self._binary_resolution is None:
@@ -180,6 +196,9 @@ class ZoektSupervisor:
         """
         if zoekt_mode() == "off":
             return False
+        if self.checkout_root != self.repo_root:
+            # The served checkout's own supervisor owns its index and its build lock.
+            return get_zoekt_supervisor(self.repo_root).refresh_index_if_head_changed()
         if not (self.repo_root / ".git").exists():
             return False
         if not self._build_lock.acquire(blocking=False):
@@ -242,7 +261,7 @@ class ZoektSupervisor:
             return SearchReadResult(
                 matches=[], total_tokens=0, tokens_saved_vs_naive=0, cache_hit=False, backend="zoekt"
             )
-        rel_glob = _path_to_glob(self.repo_root, Path(search_path).resolve())
+        rel_glob = _path_to_glob(self.checkout_root, Path(search_path).resolve())
         raw_limit = max(max_files * 4, max_files, 20)
         raw_matches = client.search(query, num_matches=raw_limit, file_glob=rel_glob)
         reranked = _rank_zoekt_file_results(
@@ -272,7 +291,9 @@ class ZoektSupervisor:
         naive_tokens = 0
         for _score, file_match in selected:
             rel_path = _normalize_zoekt_path(file_match.path)
-            abs_path = self.repo_root / rel_path
+            abs_path = self.checkout_root / rel_path
+            if self.checkout_root != self.repo_root and not abs_path.is_file():
+                continue  # in the served checkout only; the worktree deleted or never had it
             lang = _detect_lang(rel_path)
             raw_line_text = "\n".join(match.line_text for match in file_match.matches if match.line_text)
             naive_tokens += _count_tokens(rel_path) + _count_tokens(raw_line_text)
@@ -416,14 +437,35 @@ def get_zoekt_supervisor(repo_root: str | Path) -> ZoektSupervisor:
     with _SUPERVISORS_LOCK:
         supervisor = _SUPERVISORS.get(root)
         if supervisor is None:
-            supervisor = ZoektSupervisor(root)
+            served = _ROOT_OVERRIDES.get(root)
+            supervisor = ZoektSupervisor(root) if served is None else ZoektSupervisor(served, checkout_root=root)
             _SUPERVISORS[root] = supervisor
         return supervisor
+
+
+def set_zoekt_root_override(checkout_root: str | Path, served_root: str | Path) -> None:
+    """Serve *checkout_root*'s Zoekt searches from *served_root*'s index and server."""
+    checkout = str(Path(checkout_root).resolve())
+    served = Path(served_root).resolve()
+    with _SUPERVISORS_LOCK:
+        if _ROOT_OVERRIDES.get(checkout) == served:
+            return
+        _ROOT_OVERRIDES[checkout] = served
+        _SUPERVISORS.pop(checkout, None)
+
+
+def clear_zoekt_root_override(checkout_root: str | Path) -> None:
+    """Undo :func:`set_zoekt_root_override` for *checkout_root*."""
+    checkout = str(Path(checkout_root).resolve())
+    with _SUPERVISORS_LOCK:
+        if _ROOT_OVERRIDES.pop(checkout, None) is not None:
+            _SUPERVISORS.pop(checkout, None)
 
 
 def reset_zoekt_supervisors() -> None:
     with _SUPERVISORS_LOCK:
         _SUPERVISORS.clear()
+        _ROOT_OVERRIDES.clear()
     reset_zoekt_servers()
 
 
@@ -440,6 +482,8 @@ def _path_to_glob(repo_root: Path, search_path: Path) -> str | None:
 __all__ = [
     "ZoektBackendHealth",
     "ZoektSupervisor",
+    "clear_zoekt_root_override",
     "get_zoekt_supervisor",
     "reset_zoekt_supervisors",
+    "set_zoekt_root_override",
 ]
