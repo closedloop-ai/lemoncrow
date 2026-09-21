@@ -199,22 +199,19 @@ def test_a_query_repeated_in_another_checkout_is_answered_and_blanked_only_in_th
 def _fresh_worktree(main: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A worktree the daemon has never opened, with pkg/only_c.py (zeta_only_c) that only it has.
 
-    Engines opened from here have autosync on (tests/gateway/conftest.py forces it
-    off), so opening the worktree seeds it and runs the real post-seed first refresh.
+    Callers are marked ``real_code_autosync`` (no conftest forced-off patch), and
+    this turns LEMONCROW_CODE_AUTOSYNC back on, so engines opened from here without
+    an explicit ``autosync_enabled`` have autosync on: opening the worktree seeds it
+    and runs the real post-seed first refresh.
     """
-    forced_off = CodeContextEngine.__init__
-
-    def with_autosync(self: CodeContextEngine, *args: Any, **kwargs: Any) -> None:
-        forced_off(self, *args, **kwargs)
-        self._autosync_enabled = True
-
-    monkeypatch.setattr(CodeContextEngine, "__init__", with_autosync)
+    monkeypatch.setenv("LEMONCROW_CODE_AUTOSYNC", "1")
     worktree = (main.parent / "wt_c").resolve()
     _git(main, "worktree", "add", "-q", "-b", "c", str(worktree))
     (worktree / "pkg" / "only_c.py").write_text("def zeta_only_c():\n    return 'c'\n", encoding="utf-8")
     return worktree
 
 
+@pytest.mark.real_code_autosync
 def test_the_first_search_in_a_fresh_worktree_waits_for_its_first_refresh(
     repos: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -229,6 +226,7 @@ def test_the_first_search_in_a_fresh_worktree_waits_for_its_first_refresh(
     assert mcp_server._INDEX_REFRESHING_NOTE not in first, first
 
 
+@pytest.mark.real_code_autosync
 def test_a_first_refresh_slower_than_the_wait_is_announced_and_a_retry_is_answered(
     repos: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -257,6 +255,7 @@ def test_a_first_refresh_slower_than_the_wait_is_announced_and_a_retry_is_answer
     assert "pkg/only_c.py" in retry, retry
 
 
+@pytest.mark.real_code_autosync
 def test_a_reworded_repeat_of_an_answer_from_the_refreshed_index_is_still_blanked(
     repos: tuple[Path, Path, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -164,6 +164,7 @@ pythonpath = ["src", "."]
 markers = [
     "slow: marks tests as slow",
     "ab: real A/B benchmark for MCP tool savings",
+    "real_code_autosync: keep CodeContextEngine autosync on (opts out of tests/gateway/conftest.py's forced-off patch)",
     ]
 
 [tool.mypy]

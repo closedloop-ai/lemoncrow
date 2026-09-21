@@ -8,7 +8,7 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _disable_code_autosync() -> None:
+def _disable_code_autosync(request: pytest.FixtureRequest) -> None:
     """Disable autosync for gateway tests to make them deterministic.
 
     MCP read tools never block on a cold index: a read returns immediately and
@@ -16,7 +16,11 @@ def _disable_code_autosync() -> None:
     the assertions and makes MCP-surface tests non-deterministic. With autosync
     disabled there is no worker, so tests that need a populated index build it
     explicitly (via index_repo) and observe a fully built index deterministically.
+    A test marked ``real_code_autosync`` opts out and gets the engine unpatched.
     """
+    if request.node.get_closest_marker("real_code_autosync"):
+        yield
+        return
     from lemoncrow.pro.capabilities.code_context import CodeContextEngine
 
     original_init = CodeContextEngine.__init__
