@@ -451,8 +451,6 @@ def _run_bash_tool(
     # directory) so the command still runs instead of hard-failing.
     if not Path(workspace).is_dir():
         workspace = os.getcwd()
-    # A command with no cwd runs in the linked worktree the session's recorded
-    # cwd puts it in (session_root step 3), else the workspace as before.
     _session_worktree = None if cwd else session_root.session_worktree(Path(workspace))
     effective_cwd = cwd or (str(_session_worktree) if _session_worktree is not None else workspace)
 

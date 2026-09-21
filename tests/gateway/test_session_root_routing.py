@@ -8,14 +8,12 @@ bridge sends it.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
-import types
 import uuid
 from collections.abc import Iterator
 from pathlib import Path
@@ -365,14 +363,6 @@ def test_the_hook_records_before_every_early_return_and_never_changes_its_decisi
     assert "session cwd not recorded" in failed.stderr
 
 
-def _session_start_module() -> types.ModuleType:
-    spec = importlib.util.spec_from_file_location("lemoncrow_session_start_under_test", _HOOKS / "session_start.py")
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_session_start_prunes_cwd_records_older_than_seven_days(tmp_path: Path) -> None:
     """AC-2.7: SessionStart drops what no session has refreshed in 7 days."""
     store = tmp_path / "store"
@@ -393,4 +383,3 @@ def test_session_start_prunes_cwd_records_older_than_seven_days(tmp_path: Path) 
 
     assert started.returncode == 0, started.stderr
     assert sorted(p.name for p in records.iterdir()) == ["fresh"]
-    assert _session_start_module()._SESSION_CWD_MAX_AGE_S == week

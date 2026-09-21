@@ -79,7 +79,6 @@ __all__ = [
 SESSION_CWD_DIRNAME = "session_cwd"
 #: Sessions whose bash cwd (and recorded-cwd read) is remembered at once.
 MAX_SESSIONS = 256
-#: A session's bash cwd is forgotten after this long without use.
 BASH_CWD_IDLE_S = 24 * 3600.0
 
 #: :attr:`SessionRoot.source` values: which precedence step answered.
