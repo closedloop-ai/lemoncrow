@@ -60,6 +60,7 @@ __all__ = [
     "UNAVAILABLE",
     "WORKTREE_ENGINE_IDLE_ENV",
     "SeedResult",
+    "checkpoint_index",
     "ensure_seeded",
     "forget_worktree",
     "is_seeded_index",
@@ -385,6 +386,34 @@ def _checkpoint(db: Path) -> bool:
         conn.close()
     # (0, -1, -1) is a database that is not in WAL mode: there is no WAL to carry.
     return int(log_frames) == int(checkpointed)
+
+
+def checkpoint_index(store: Path, *, attempts: int = 3, pause_s: float = 0.5) -> bool:
+    """Fold the WALs of the index databases in *store* into their files; True when all are empty.
+
+    Run after a reindex, so a seed usually finds a small WAL: a clone carries the
+    un-checkpointed WAL along, and checkpointing it later rewrites -- un-shares --
+    every page it touches. SQLite's own auto-checkpoint stops short while a reader
+    holds an older snapshot and does not run again until the next commit, which
+    left symphony-alpha with 195k frames (808 MB) in fts.sqlite's WAL: a 5.4 s
+    checkpoint on the seed's path.
+    """
+    pending = [store / name for name in INDEX_DBS if (store / name).is_file()]
+    for attempt in range(max(1, attempts)):
+        if attempt:
+            time.sleep(pause_s)
+        remaining: list[Path] = []
+        for db in pending:
+            try:
+                done = _checkpoint(db)
+            except sqlite3.Error:
+                done = False
+            if not done:
+                remaining.append(db)
+        pending = remaining
+        if not pending:
+            return True
+    return False
 
 
 def _snapshot(main_store: Path, staging: Path) -> tuple[float, float, tuple[str, ...]]:

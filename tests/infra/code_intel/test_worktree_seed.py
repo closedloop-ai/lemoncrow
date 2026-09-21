@@ -343,6 +343,42 @@ def test_a_seeded_engine_takes_zoekt_from_main_and_reads_its_own_head(repos: tup
     assert ZoektServer(worktree).current_git_head() == head
 
 
+def _db_file_alone_has_probe(db: Path, tmp: Path) -> bool:
+    """Whether the database file, without its WAL, already holds the probe row."""
+    tmp.mkdir(exist_ok=True)
+    shutil.copyfile(db, tmp / db.name)
+    conn = sqlite3.connect(tmp / db.name)
+    try:
+        return conn.execute("SELECT 1 FROM engine_state WHERE key = 'probe'").fetchone() is not None
+    except sqlite3.DatabaseError:
+        return False  # a partly checkpointed file is no snapshot at all without its WAL
+    finally:
+        conn.close()
+        shutil.rmtree(tmp)
+
+
+def test_checkpoint_index_folds_the_wal_a_reader_held_back(repos: tuple[Path, Path], tmp_path: Path) -> None:
+    """After a reindex the CLI folds main's WAL in, so a later seed finds it small."""
+    main, _worktree = repos
+    db = _db(main)
+    keeper = sqlite3.connect(db, isolation_level=None)  # keeps the WAL from being deleted on close
+    keeper.execute("BEGIN")
+    keeper.execute("SELECT COUNT(*) FROM files").fetchone()
+    writer = sqlite3.connect(db)
+    writer.execute("INSERT INTO engine_state(key, value) VALUES ('probe', '1')")
+    writer.commit()
+    writer.close()
+    try:
+        assert worktree_seed.checkpoint_index(workspace_dir(main), attempts=1) is False
+        assert not _db_file_alone_has_probe(db, tmp_path / "before")
+        keeper.execute("ROLLBACK")
+
+        assert worktree_seed.checkpoint_index(workspace_dir(main)) is True
+        assert _db_file_alone_has_probe(db, tmp_path / "after"), "the WAL was left for the seed to carry"
+    finally:
+        keeper.close()
+
+
 def test_the_main_checkout_engine_is_unchanged(repos: tuple[Path, Path]) -> None:
     main, _worktree = repos
     before = _state(main)

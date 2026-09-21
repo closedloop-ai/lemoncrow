@@ -734,12 +734,13 @@ def code_index_cmd(
         from lemoncrow.core.foundation.paths import resolve_workspace_root
 
         repo_root = str(resolve_workspace_root())
+    from lemoncrow.infra.code_intel import worktree_seed
+
     force = reindex
     seeded_worktree = False
     if db_path is None:
         # A linked worktree's index is seeded from its main checkout's, and --reindex
         # re-seeds it: a full build would un-share every page of the clone.
-        from lemoncrow.infra.code_intel import worktree_seed
         from lemoncrow.infra.code_intel.freshness import IndexRebuilding
 
         try:
@@ -758,6 +759,7 @@ def code_index_cmd(
             include_globs=list(include_globs) or None,
             exclude_globs=list(exclude_globs) or None,
         ).model_dump(mode="json")
+        worktree_seed.checkpoint_index(Path(engine.db_path).parent)  # so a worktree seed finds a small WAL
         try:
             engine._deleted_history_adapter()._ensure_history_ready()
         except Exception:
@@ -780,6 +782,7 @@ def code_index_cmd(
         success_description="Indexed code",
         frame_prefix=frame_prefix,
     )
+    worktree_seed.checkpoint_index(Path(engine.db_path).parent)  # so a worktree seed finds a small WAL
 
     git_summary = _index_git_history_with_progress(engine, frame_prefix=frame_prefix)
     if not seeded_worktree:
