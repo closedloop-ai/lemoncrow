@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -2080,6 +2081,112 @@ def test_incremental_index_updates_changed_and_removed_files(tmp_path: Path) -> 
         ).fetchone()
     assert row is not None
     assert int(row["n"]) == 0
+
+
+_FTS_TABLES = ("file_line_fts", "file_path_trigram", "symbol_fts", "symbol_trigram")
+_FTS_DELETE = re.compile(r"\s*DELETE FROM (" + "|".join(_FTS_TABLES) + r")\s+WHERE")
+
+
+def test_incremental_index_leaves_no_rows_for_replaced_or_removed_files(tmp_path: Path) -> None:
+    """Every table drops a changed file's old rows and a removed file's rows; the rest stay."""
+    _write_fixture_repo(tmp_path)
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    engine.index_repo()
+    untouched = "tests/test_checkout.py"
+    with engine._connect() as conn:
+        untouched_lines = conn.execute(
+            "SELECT COUNT(*) FROM file_line_fts WHERE file_path = ?", (untouched,)
+        ).fetchone()[0]
+    assert untouched_lines > 0
+
+    (tmp_path / "src" / "orders.py").write_text("class RenamedService:\n    pass\n", encoding="utf-8")
+    (tmp_path / "src" / "checkout.py").unlink()
+    engine.index_repo(force=False)
+
+    with engine._connect() as conn:
+
+        def count(sql: str, *args: object) -> int:
+            return int(conn.execute(sql, args).fetchone()[0])
+
+        indexed = "SELECT file_path FROM files"
+        assert count(f"SELECT COUNT(*) FROM file_line_fts WHERE file_path NOT IN ({indexed})") == 0
+        assert count(f"SELECT COUNT(*) FROM file_path_trigram WHERE file_path NOT IN ({indexed})") == 0
+        assert count(f'SELECT COUNT(*) FROM "references" WHERE file_path NOT IN ({indexed})') == 0
+        assert count(f"SELECT COUNT(*) FROM call_edges WHERE caller_file_path NOT IN ({indexed})") == 0
+        assert count(f"SELECT COUNT(*) FROM imports WHERE source_file NOT IN ({indexed})") == 0
+        live_symbols = "SELECT symbol_id FROM symbols"
+        assert count(f"SELECT COUNT(*) FROM symbol_fts WHERE symbol_id NOT IN ({live_symbols})") == 0
+        assert count(f"SELECT COUNT(*) FROM symbol_trigram WHERE symbol_id NOT IN ({live_symbols})") == 0
+
+        assert count("SELECT COUNT(*) FROM files WHERE file_path = 'src/checkout.py'") == 0
+        assert (
+            count("SELECT COUNT(*) FROM file_line_fts WHERE file_path = 'src/orders.py' AND text LIKE '%OrderService%'")
+            == 0
+        )
+        assert (
+            count("SELECT COUNT(*) FROM symbols WHERE file_path = 'src/orders.py' AND symbol_name = 'RenamedService'")
+            == 1
+        )
+        assert count("SELECT COUNT(*) FROM file_line_fts WHERE file_path = ?", untouched) == untouched_lines
+
+
+def test_incremental_index_scans_each_fts_table_once_per_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The FTS5 tables are rowid-keyed, so a delete filtered on file_path or symbol_id
+    scans the whole table. Issued per file, an incremental run cost one full scan per
+    changed file -- ~2 s each on a 12M-line index -- and a run after a pull outlived
+    the autosync subprocess's 600 s timeout, so it never committed.
+    """
+    _write_fixture_repo(tmp_path)
+    for i in range(6):
+        (tmp_path / "src" / f"extra{i}.py").write_text(f"def extra{i}():\n    return {i}\n", encoding="utf-8")
+    engine = CodeContextEngine(tmp_path, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    engine.index_repo()
+    for i in range(6):
+        (tmp_path / "src" / f"extra{i}.py").write_text(f"def extra{i}():\n    return {i + 100}\n", encoding="utf-8")
+    (tmp_path / "src" / "checkout.py").unlink()
+
+    statements: list[str] = []
+    connect = engine._connect
+
+    def traced_connect(*args: object, **kwargs: object) -> sqlite3.Connection:
+        conn = connect(*args, **kwargs)  # type: ignore[arg-type]
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(engine, "_connect", traced_connect)
+    stats = engine.index_repo(force=False)
+
+    assert stats.files_indexed == 6
+    deletes = [m.group(1) for s in statements if (m := _FTS_DELETE.match(s))]
+    assert sorted(deletes) == sorted(_FTS_TABLES), f"7 stale files cost {len(deletes)} FTS scans"
+
+
+def test_dir_cached_relpath_resolves_exactly_like_safe_relpath(tmp_path: Path) -> None:
+    """Resolving each directory once must not change what any file resolves to."""
+    from lemoncrow.pro.capabilities.code_context.engine import _dir_cached_relpath, _safe_relpath
+
+    root = (tmp_path / "repo").resolve()
+    outside = (tmp_path / "outside").resolve()
+    (root / "real").mkdir(parents=True)
+    outside.mkdir()
+    (root / "real" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (outside / "b.py").write_text("y = 2\n", encoding="utf-8")
+    (root / "linked_dir").symlink_to(root / "real")
+    (root / "linked_file.py").symlink_to(root / "real" / "a.py")
+    (root / "escape.py").symlink_to(outside / "b.py")
+    (root / "escape_dir").symlink_to(outside)
+    paths = [
+        root / "real" / "a.py",
+        root / "linked_dir" / "a.py",
+        root / "linked_file.py",
+        root / "escape.py",
+        root / "escape_dir" / "b.py",
+        root / "real" / "missing.py",
+    ]
+
+    relpath = _dir_cached_relpath(root)
+
+    assert [relpath(p) for p in paths] == [_safe_relpath(root, p) for p in paths]
 
 
 def test_search_symbols_filters_with_zoekt_candidate_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

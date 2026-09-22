@@ -974,6 +974,31 @@ def _safe_relpath(repo_root: Path, path: Path) -> str:
         return str(resolved)
 
 
+def _dir_cached_relpath(repo_root: Path) -> Callable[[Path], str]:
+    """``_safe_relpath`` that resolves each directory once instead of once per file.
+
+    ``Path.resolve`` lstat()s every component of the path, so one call per file of
+    a 17k-file tree is ~2 s of syscalls on every index run. A file that is not
+    itself a symlink resolves to its parent's resolution joined with its name, and
+    parents repeat, so only they need resolving -- and only once each.
+    """
+    parents: dict[Path, Path] = {}
+
+    def relpath(path: Path) -> str:
+        if path.is_symlink():
+            return _safe_relpath(repo_root, path)
+        parent = parents.get(path.parent)
+        if parent is None:
+            parent = parents[path.parent] = path.parent.resolve()
+        resolved = parent / path.name
+        try:
+            return str(resolved.relative_to(repo_root))
+        except ValueError:
+            return str(resolved)
+
+    return relpath
+
+
 # Binary/non-text extensions to skip when walking non-source files for the
 # Python-text-search fallback.  Kept small and conservative — the walk is
 # only reached when rg is unavailable and the FTS index is empty.
@@ -4283,9 +4308,11 @@ class CodeContextEngine:
 
                 to_extract: list[tuple[Path, bytes]] = []  # (path, source_bytes)
                 current_paths: set[str] = set()
+                stale: list[str] = []
+                relpath = _dir_cached_relpath(self.repo_root)
 
                 for path in all_files:
-                    rel = _safe_relpath(self.repo_root, path)
+                    rel = relpath(path)
                     current_paths.add(rel)
                     try:
                         stat = path.stat()
@@ -4293,7 +4320,7 @@ class CodeContextEngine:
                         continue
                     if stat.st_size > _MAX_FILE_BYTES:
                         if rel in existing:
-                            self._delete_file_index(conn, rel)
+                            stale.append(rel)
                         continue
                     previous = existing.get(rel)
                     # Fast path: a file whose (size, mtime) matches the indexed row
@@ -4324,12 +4351,11 @@ class CodeContextEngine:
                             (int(stat.st_mtime_ns), self.repo_id, rel),
                         )
                         continue
-                    self._delete_file_index(conn, rel)
+                    stale.append(rel)
                     to_extract.append((path, source_bytes))
 
                 removed_paths = set(existing.keys()) - current_paths
-                for rel in sorted(removed_paths):
-                    self._delete_file_index(conn, rel)
+                self._delete_files_index(conn, [*stale, *sorted(removed_paths)])
 
                 if to_extract:
                     paths = [item[0] for item in to_extract]
@@ -4464,47 +4490,47 @@ class CodeContextEngine:
             (str(_CODE_INDEXER_SEMANTICS_VERSION),),
         )
 
-    def _delete_file_index(self, conn: sqlite3.Connection, rel: str) -> None:
-        conn.execute("DELETE FROM file_line_fts WHERE repo_id = ? AND file_path = ?", (self.repo_id, rel))
-        conn.execute("DELETE FROM file_path_trigram WHERE repo_id = ? AND file_path = ?", (self.repo_id, rel))
+    def _delete_files_index(self, conn: sqlite3.Connection, rels: list[str]) -> None:
+        """Remove every indexed row for the files *rels*, in one pass per table.
+
+        The FTS5 tables are keyed by rowid alone -- ``file_path`` and ``symbol_id``
+        are UNINDEXED columns -- so any delete filtered on them scans the whole
+        table. Issued once per file, that was ~2 s per file on a 12M-line index:
+        an incremental run after a pull (hundreds of changed files) took longer
+        than the autosync subprocess's 600 s timeout, was killed before it
+        committed, and the next run started over. Filtering every table on the
+        whole batch at once costs one scan per FTS table per run. The regular
+        tables are indexed on these columns, so the batch costs them nothing.
+        """
+        if not rels:
+            return
+        batch = json.dumps(rels)
+        paths = "SELECT value FROM json_each(?)"
+        symbols = f"SELECT symbol_id FROM symbols WHERE repo_id = ? AND file_path IN ({paths})"
+        conn.execute(f"DELETE FROM file_line_fts WHERE repo_id = ? AND file_path IN ({paths})", (self.repo_id, batch))
         conn.execute(
-            """
-            DELETE FROM symbol_trigram
-            WHERE symbol_id IN (
-                SELECT symbol_id FROM symbols WHERE repo_id = ? AND file_path = ?
-            )
-            """,
-            (self.repo_id, rel),
+            f"DELETE FROM file_path_trigram WHERE repo_id = ? AND file_path IN ({paths})", (self.repo_id, batch)
         )
-        conn.execute(
-            """
-            DELETE FROM symbol_fts
-            WHERE symbol_id IN (
-                SELECT symbol_id FROM symbols WHERE repo_id = ? AND file_path = ?
-            )
-            """,
-            (self.repo_id, rel),
-        )
-        # Prune persisted embeddings for this file's symbols *before* the symbols
+        conn.execute(f"DELETE FROM symbol_trigram WHERE symbol_id IN ({symbols})", (self.repo_id, batch))
+        conn.execute(f"DELETE FROM symbol_fts WHERE symbol_id IN ({symbols})", (self.repo_id, batch))
+        # Prune persisted embeddings for these files' symbols *before* the symbols
         # themselves. symbol_id encodes the file content hash, so an edited or
         # removed file yields fresh ids -- without this the old vectors orphan
         # (never overwritten, never cleaned) and pollute semantic ranking. The
         # vector table is created lazily, so guard against its absence.
         with contextlib.suppress(sqlite3.OperationalError):
             conn.execute(
-                """
-                DELETE FROM symbol_vectors
-                WHERE repo_id = ? AND symbol_id IN (
-                    SELECT symbol_id FROM symbols WHERE repo_id = ? AND file_path = ?
-                )
-                """,
-                (self.repo_id, self.repo_id, rel),
+                f"DELETE FROM symbol_vectors WHERE repo_id = ? AND symbol_id IN ({symbols})",
+                (self.repo_id, self.repo_id, batch),
             )
-        conn.execute("DELETE FROM symbols WHERE repo_id = ? AND file_path = ?", (self.repo_id, rel))
-        conn.execute("DELETE FROM imports WHERE repo_id = ? AND source_file = ?", (self.repo_id, rel))
-        conn.execute('DELETE FROM "references" WHERE repo_id = ? AND file_path = ?', (self.repo_id, rel))
-        conn.execute("DELETE FROM call_edges WHERE repo_id = ? AND caller_file_path = ?", (self.repo_id, rel))
-        conn.execute("DELETE FROM files WHERE repo_id = ? AND file_path = ?", (self.repo_id, rel))
+        for table, column in (
+            ("symbols", "file_path"),
+            ("imports", "source_file"),
+            ('"references"', "file_path"),
+            ("call_edges", "caller_file_path"),
+            ("files", "file_path"),
+        ):
+            conn.execute(f"DELETE FROM {table} WHERE repo_id = ? AND {column} IN ({paths})", (self.repo_id, batch))
 
     def tool_index(
         self,
@@ -8726,7 +8752,7 @@ class CodeContextEngine:
         # Skip symbols whose vector is already current. symbol_id encodes the file
         # content hash, so an unchanged symbol keeps its id across reindexes and is
         # skipped here; an edited symbol gets a new id and its stale vector is pruned
-        # by _delete_file_index. index_version stays provenance-only -- gating on it
+        # by _delete_files_index. index_version stays provenance-only -- gating on it
         # would make every reindex re-embed the whole repo instead of just the delta.
         fresh = self._ann_symbol_index.existing_stamped_ids(conn, embedder_name=embedder.name, embedding_dim=dim)
         pending = [sym for sym in (_row_to_symbol(row) for row in rows) if sym.symbol_id not in fresh]
@@ -11503,6 +11529,8 @@ class CodeContextEngine:
         # autosync always on in practice; index will be built by the worker
 
     def _excluded(self, path: Path, patterns: list[str]) -> bool:
+        if not patterns:
+            return False
         rel = _safe_relpath(self.repo_root, path)
         return any(fnmatch.fnmatch(rel, pattern) for pattern in patterns)
 
@@ -13407,8 +13435,7 @@ class CodeContextEngine:
                     return
                 with self._connect() as conn:
                     self._init_schema(conn)
-                    for rel in rels:
-                        self._delete_file_index(conn, rel)
+                    self._delete_files_index(conn, rels)
                     results = (
                         self._parallel_extract(existing_paths, total=len(existing_paths)) if existing_paths else []
                     )
