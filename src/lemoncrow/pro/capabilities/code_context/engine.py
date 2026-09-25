@@ -2673,6 +2673,14 @@ _AUTOSYNC_DEFAULT_POLL_MS = 300_000
 _AUTOSYNC_GIT_HEAD_TIMEOUT_S = 3.0
 
 
+@dataclass(frozen=True)
+class _IndexedBaseline:
+    """The tree signature and git HEAD an index run started from; None where unrecorded."""
+
+    signature: str | None = None
+    head: str | None = None
+
+
 def _resolve_autosync_index_max_workers() -> int:
     """Worker count for background autosync indexing.
 
@@ -4357,6 +4365,9 @@ class CodeContextEngine:
     ) -> IndexStats:
         """Unlocked inner — callers must hold ``self._autosync_lock``."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Read before the scan, so a change landing mid-scan differs from the recorded
+        # baseline and the next autosync check reindexes it rather than taking it as done.
+        baseline = _IndexedBaseline(self._source_tree_signature(), self._autosync_git_head())
         all_files = [
             path
             for path in iter_source_files(
@@ -4608,6 +4619,7 @@ class CodeContextEngine:
         with self._connect() as conn:
             self._init_schema(conn)
             self._stamp_indexer_semantics_version(conn)
+            self._record_indexed_baseline(conn, baseline)
 
         # Compute+persist the centrality map for the new index_version NOW so the
         # O(edges) power iteration is charged to indexing, never to the first
@@ -4685,6 +4697,44 @@ class CodeContextEngine:
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """,
             (str(_CODE_INDEXER_SEMANTICS_VERSION),),
+        )
+
+    def _indexed_baseline_key(self) -> str:
+        # Per repo: a shared db_path holds several repos' indexes.
+        return f"autosync_baseline:{self.repo_id}"
+
+    def _record_indexed_baseline(self, conn: sqlite3.Connection, baseline: _IndexedBaseline) -> None:
+        conn.execute(
+            """
+            INSERT INTO engine_state(key, value) VALUES (?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """,
+            (self._indexed_baseline_key(), json.dumps({"signature": baseline.signature, "head": baseline.head})),
+        )
+
+    def _indexed_baseline(self) -> _IndexedBaseline:
+        """What the last completed index run of this repo started from.
+
+        The autosync loop measures change against this, not against its own first
+        look at the tree: an engine is replaced whenever the index version moves, and
+        a replacement that took the tree as it found it would treat every change made
+        since the last index run as already indexed.
+        """
+        try:
+            with self._connect() as conn:
+                self._init_schema(conn)
+                row = conn.execute(
+                    "SELECT value FROM engine_state WHERE key = ?", (self._indexed_baseline_key(),)
+                ).fetchone()
+            data = json.loads(str(row["value"])) if row is not None else {}
+        except (sqlite3.Error, ValueError):
+            return _IndexedBaseline()
+        if not isinstance(data, dict):
+            return _IndexedBaseline()
+        signature, head = data.get("signature"), data.get("head")
+        return _IndexedBaseline(
+            signature if isinstance(signature, str) and signature else None,
+            head if isinstance(head, str) and head else None,
         )
 
     def _delete_files_index(self, conn: sqlite3.Connection, rels: list[str]) -> None:
@@ -14923,13 +14973,12 @@ class CodeContextEngine:
         """
         if known_change is not None:
             self._autosync_state = "syncing"
-            if not self._run_index_subprocess():
+            if not self._reindex_and_adopt_baseline():
                 # Reindex failed; leave the signature/pending state stale so the
                 # next poll retries instead of recording a failed sync as done.
                 self._autosync_state = "idle"
                 self._record_autosync_event(event="reindex", reason=known_change, reindexed=False)
                 return False
-            self._autosync_signature = self._source_tree_signature()
             self._autosync_last_sync_ms = int(time.time() * 1000)
             self._autosync_pending_events = 0
             self._autosync_state = "idle"
@@ -14938,13 +14987,20 @@ class CodeContextEngine:
             return True
 
         current_signature = self._source_tree_signature()
+        reason = "source_signature_changed"
         if self._autosync_signature is None:
-            self._autosync_signature = current_signature
-            self._autosync_last_sync_ms = int(time.time() * 1000)
-            self._autosync_state = "idle"
-            self._record_autosync_event(event="bootstrap", reason="seed_signature", reindexed=False)
-            return False
-        if current_signature == self._autosync_signature:
+            recorded = self._indexed_baseline().signature
+            if recorded is None:
+                # Indexed before baselines were recorded: nothing says what it covers.
+                reason = "no_indexed_baseline"
+            else:
+                self._autosync_signature = recorded
+                if current_signature == recorded:
+                    self._autosync_last_sync_ms = int(time.time() * 1000)
+                    self._autosync_state = "idle"
+                    self._record_autosync_event(event="bootstrap", reason="indexed_baseline", reindexed=False)
+                    return False
+        elif current_signature == self._autosync_signature:
             self._autosync_state = "idle"
             self._autosync_pending_events = 0
             self._record_autosync_event(event="full_check", reason="unchanged", reindexed=False)
@@ -14957,18 +15013,34 @@ class CodeContextEngine:
             self._record_autosync_event(event="change_detected", reason="within_debounce_window", reindexed=False)
             return False
         self._autosync_state = "syncing"
-        if not self._run_index_subprocess():
+        if not self._reindex_and_adopt_baseline():
             # Reindex failed; leave the signature/pending state stale so the next
             # poll retries instead of recording a failed sync as complete.
             self._autosync_state = "idle"
-            self._record_autosync_event(event="reindex", reason="source_signature_changed", reindexed=False)
+            self._record_autosync_event(event="reindex", reason=reason, reindexed=False)
             return False
-        self._autosync_signature = self._source_tree_signature()
         self._autosync_last_sync_ms = int(time.time() * 1000)
         self._autosync_pending_events = 0
         self._autosync_state = "idle"
         self._autosync_reindex_count += 1
-        self._record_autosync_event(event="reindex", reason="source_signature_changed", reindexed=True)
+        self._record_autosync_event(event="reindex", reason=reason, reindexed=True)
+        return True
+
+    def _reindex_and_adopt_baseline(self) -> bool:
+        """Run the index subprocess; on success, measure from the baseline it recorded.
+
+        A run can succeed without recording one -- a seeded worktree index it declines
+        to rebuild still carries the main checkout's baseline. Adopting that would
+        re-detect the same change and reindex again on every tick, so a run that left
+        the baseline untouched falls back to the tree and HEAD as they are now.
+        """
+        before = self._indexed_baseline()
+        if not self._run_index_subprocess():
+            return False
+        after = self._indexed_baseline()
+        recorded = after if after != before else _IndexedBaseline()
+        self._autosync_signature = recorded.signature or self._source_tree_signature()
+        self._autosync_head = recorded.head or self._autosync_git_head() or self._autosync_head
         return True
 
     def _maybe_refresh_zoekt_index(self) -> None:
@@ -15205,15 +15277,15 @@ class CodeContextEngine:
 
     def _autosync_poll_locked(self, now_ms: int) -> None:
         head = self._autosync_git_head()
-        if head is not None and self._autosync_head is not None and head != self._autosync_head:
+        if head is not None and self._autosync_head is None:
+            # Like the tree signature: start from the HEAD the index was built at.
+            self._autosync_head = self._indexed_baseline().head or head
+        if head is not None and head != self._autosync_head:
             # On failure keep the old HEAD, so the next tick retries.
             if self._maybe_autosync_reindex_locked(known_change="head_moved"):
-                self._autosync_head = head
                 # The reindex reseeded the tree signature: that is a full check.
                 self._autosync_last_full_check_ms = now_ms
             return
-        if head is not None:
-            self._autosync_head = head
         last = self._autosync_last_full_check_ms
         if last is None or now_ms - last >= max(self._autosync_poll_ms, _AUTOSYNC_MIN_POLL_MS):
             self._autosync_last_full_check_ms = now_ms

@@ -9,6 +9,8 @@ from pathlib import Path
 from time import time
 from typing import Any
 
+from .server import _git_dirs, _read_git_head
+
 _TEXT_SUFFIXES = {
     ".py",
     ".ts",
@@ -91,22 +93,19 @@ class ZoektIndexer:
         snapshot = self.ensure_snapshot()
         return int(max(0, time() - snapshot.indexed_at))
 
-    def _snapshot_cache_path(self) -> Path:
-        return self.repo_root / ".git" / "lemoncrow" / "zoekt_snapshot.json"
+    def _snapshot_cache_path(self) -> Path | None:
+        # The checkout's own git admin directory: a linked worktree's `.git` is a
+        # file, and its admin directory goes away with `git worktree remove`.
+        dirs = _git_dirs(self.repo_root)
+        return None if dirs is None else dirs[0] / "lemoncrow" / "zoekt_snapshot.json"
 
     def _current_head(self) -> str | None:
-        head_file = self.repo_root / ".git" / "HEAD"
-        try:
-            ref = head_file.read_text(encoding="utf-8").strip()
-            if ref.startswith("ref: "):
-                ref_path = self.repo_root / ".git" / ref[5:]
-                return ref_path.read_text(encoding="utf-8").strip()
-            return ref
-        except OSError:
-            return None
+        return _read_git_head(self.repo_root)
 
     def _load_snapshot_from_disk(self) -> ZoektIndexSnapshot | None:
         cache_path = self._snapshot_cache_path()
+        if cache_path is None:
+            return None
         try:
             data = json.loads(cache_path.read_text(encoding="utf-8"))
             stored_head = data.get("head")
@@ -114,11 +113,13 @@ class ZoektIndexer:
             if current_head is None or stored_head != current_head:
                 return None
             return ZoektIndexSnapshot.from_dict(data["snapshot"])
-        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        except (OSError, KeyError, TypeError, ValueError):
             return None
 
     def _save_snapshot_to_disk(self, snapshot: ZoektIndexSnapshot) -> None:
         cache_path = self._snapshot_cache_path()
+        if cache_path is None:
+            return
         current_head = self._current_head()
         payload = json.dumps({"head": current_head, "snapshot": snapshot.to_dict()})
         tmp = cache_path.with_suffix(".tmp")
