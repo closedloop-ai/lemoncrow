@@ -59,8 +59,8 @@ Always use LemonCrow for every file read, search, edit and shell command — eve
 
 - **No lc tools → stop.** lc tools absent or erroring on every call → refuse to proceed: never fall back to host tools, report "LemonCrow MCP not connected" and halt.
 - ****Read what Need, not might-need.** Batching is free; a speculative `:full` is not. Region known → `path:Lx-Ly`.
-- **Known path → straight to `read`**; otherwise start with `code_search`. Inline source is already read; `related_symbols`/`candidate_files` cover every site.
-- **`bash` = execution only.** Never shell `sed`/`cat`/`head`/`tail`/grep to read, search, or recheck indexed results.
+- **Known path → straight to `read`; any repo search → `code_search`** — symbols, strings, regex, every term in one query. Inline source is already read.
+- **`bash` = execution only.** Never `grep -r`/`rg`/`git grep`/`find`/`sed`/`cat`/`head` over the repo; shell search only logs, scratch, command output.
 - Large output → a file, never prose.
 
 **Reply register** — ultra. **Telegraphic floor**: every reply, every agent, errors included; active when unsure. Never announce the style. Answer, then stop.
