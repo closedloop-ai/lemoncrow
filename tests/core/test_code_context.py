@@ -19,7 +19,7 @@ from lemoncrow.pro.capabilities.code_context.call_graph import (
     CallGraphNode,
     traverse_call_graph,
 )
-from lemoncrow.pro.capabilities.code_context.engine import _CODE_INDEXER_SEMANTICS_VERSION
+from lemoncrow.pro.capabilities.code_context.engine import _CODE_INDEXER_SEMANTICS_VERSION, _IndexedBaseline
 from lemoncrow.pro.capabilities.code_context.models import SymbolRecord, TextMatch
 from lemoncrow.pro.capabilities.code_context.output_policy import TRUNCATION_MARKER
 from lemoncrow.pro.code_intel.cross_lang.runner import CrossLangRunner
@@ -2166,10 +2166,20 @@ class _AutosyncProbe:
             self.tree_walks += 1
             return real_signature()
 
+        def record_baseline() -> None:
+            # What a completed index run leaves behind; the walk is the subprocess's, not the loop's.
+            with engine._connect() as conn:
+                engine._init_schema(conn)
+                engine._record_indexed_baseline(conn, _IndexedBaseline(real_signature(), engine._autosync_git_head()))
+
         def run_index_subprocess(*, force: bool = False) -> bool:
             self.reindexes.append(self.tree_walks)
-            return reindex_results.pop(0) if reindex_results else True
+            ok = reindex_results.pop(0) if reindex_results else True
+            if ok:
+                record_baseline()
+            return ok
 
+        record_baseline()
         monkeypatch.setattr(engine, "_source_tree_signature", signature)
         monkeypatch.setattr(engine, "_run_index_subprocess", run_index_subprocess)
         monkeypatch.setattr(engine, "index_ready", lambda: True)
@@ -2322,6 +2332,87 @@ def test_autosync_tick_leaves_change_detection_to_a_live_file_watcher(
     assert head_reads == []
     assert probe.tree_walks == 0
     assert probe.reindexes == []
+
+
+def _indexed_git_fixture(tmp_path: Path) -> CodeContextEngine:
+    repo = tmp_path / "repo"
+    _init_git_fixture_repo(repo)
+    _write_fixture_repo(repo)
+    _commit_all(repo, "initial")
+    engine = CodeContextEngine(repo, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    engine.index_repo()
+    return engine
+
+
+def _replacement_engine(engine: CodeContextEngine) -> CodeContextEngine:
+    """What the engine cache builds once the index version moves: a new engine on the same index."""
+    return CodeContextEngine(engine.repo_root, db_path=engine.db_path, autosync_enabled=False)
+
+
+def _finds(engine: CodeContextEngine, name: str) -> bool:
+    return any(s.symbol_name == name for s in engine.search_symbols(name, mode="lexical", limit=5, auto_index=False))
+
+
+def test_a_replacement_engine_indexes_a_commit_made_since_the_last_index_run(tmp_path: Path) -> None:
+    engine = _indexed_git_fixture(tmp_path)
+    (engine.repo_root / "src" / "orders.py").write_text("class CommittedBeforeItLooked:\n    pass\n", encoding="utf-8")
+    _commit_all(engine.repo_root, "move HEAD")
+
+    replacement = _replacement_engine(engine)
+    replacement._autosync_tick(0)
+
+    assert _finds(replacement, "CommittedBeforeItLooked")
+    assert replacement._autosync_history[-1]["reason"] == "head_moved"
+
+
+def test_a_replacement_engine_indexes_a_working_tree_change_made_since_the_last_index_run(tmp_path: Path) -> None:
+    engine = _indexed_git_fixture(tmp_path)
+    (engine.repo_root / "src" / "orders.py").write_text("class EditedBeforeItLooked:\n    pass\n", encoding="utf-8")
+
+    replacement = _replacement_engine(engine)
+    replacement._autosync_tick(0)
+
+    assert _finds(replacement, "EditedBeforeItLooked")
+    assert replacement._autosync_history[-1]["reason"] == "source_signature_changed"
+
+
+def test_a_change_made_during_an_index_run_is_reindexed_by_the_next_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = tmp_path / "repo"
+    _init_git_fixture_repo(repo)
+    _write_fixture_repo(repo)
+    _commit_all(repo, "initial")
+    engine = CodeContextEngine(repo, db_path=tmp_path / "code.sqlite", autosync_enabled=False)
+    real_extract = engine._parallel_extract
+
+    def extract_while_the_tree_changes(*args: object, **kwargs: object) -> object:
+        results = real_extract(*args, **kwargs)  # type: ignore[arg-type]
+        (repo / "src" / "orders.py").write_text("class WrittenMidScan:\n    pass\n", encoding="utf-8")
+        return results
+
+    monkeypatch.setattr(engine, "_parallel_extract", extract_while_the_tree_changes)
+    engine.index_repo()
+    monkeypatch.undo()
+    assert not _finds(engine, "WrittenMidScan")
+
+    replacement = _replacement_engine(engine)
+    replacement._autosync_tick(0)
+
+    assert _finds(replacement, "WrittenMidScan")
+
+
+def test_an_index_without_a_recorded_baseline_is_reindexed_on_the_first_check(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, probe = _autosync_probe_engine(tmp_path, monkeypatch)
+    with engine._connect() as conn:
+        conn.execute("DELETE FROM engine_state WHERE key = ?", (engine._indexed_baseline_key(),))
+
+    engine._autosync_tick(0)
+
+    assert len(probe.reindexes) == 1
+    assert engine._autosync_history[-1]["reason"] == "no_indexed_baseline"
 
 
 def test_incremental_index_noop_does_not_bump_version(tmp_path: Path) -> None:
