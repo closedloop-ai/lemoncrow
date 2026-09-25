@@ -2402,6 +2402,23 @@ def test_a_change_made_during_an_index_run_is_reindexed_by_the_next_check(
     assert _finds(replacement, "WrittenMidScan")
 
 
+def test_a_reindex_that_records_no_baseline_is_not_rerun_on_every_tick(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    engine, _ = _autosync_probe_engine(tmp_path, monkeypatch, git=True)
+    # A seeded worktree index carries the main checkout's baseline, and an index run that
+    # declines to rebuild it (stale semantics, main not yet rebuilt) succeeds but records nothing.
+    with engine._connect() as conn:
+        engine._record_indexed_baseline(conn, _IndexedBaseline("main-signature", "0" * 40))
+    runs: list[int] = []
+    monkeypatch.setattr(engine, "_run_index_subprocess", lambda *, force=False: runs.append(1) or True)
+
+    for minute in range(3):
+        engine._autosync_tick(minute * _AUTOSYNC_MINUTE_MS)
+
+    assert len(runs) == 1
+
+
 def test_an_index_without_a_recorded_baseline_is_reindexed_on_the_first_check(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

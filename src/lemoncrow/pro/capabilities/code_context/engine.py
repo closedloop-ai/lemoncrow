@@ -14973,13 +14973,12 @@ class CodeContextEngine:
         """
         if known_change is not None:
             self._autosync_state = "syncing"
-            if not self._run_index_subprocess():
+            if not self._reindex_and_adopt_baseline():
                 # Reindex failed; leave the signature/pending state stale so the
                 # next poll retries instead of recording a failed sync as done.
                 self._autosync_state = "idle"
                 self._record_autosync_event(event="reindex", reason=known_change, reindexed=False)
                 return False
-            self._autosync_signature = self._indexed_baseline().signature or self._source_tree_signature()
             self._autosync_last_sync_ms = int(time.time() * 1000)
             self._autosync_pending_events = 0
             self._autosync_state = "idle"
@@ -15014,18 +15013,34 @@ class CodeContextEngine:
             self._record_autosync_event(event="change_detected", reason="within_debounce_window", reindexed=False)
             return False
         self._autosync_state = "syncing"
-        if not self._run_index_subprocess():
+        if not self._reindex_and_adopt_baseline():
             # Reindex failed; leave the signature/pending state stale so the next
             # poll retries instead of recording a failed sync as complete.
             self._autosync_state = "idle"
             self._record_autosync_event(event="reindex", reason=reason, reindexed=False)
             return False
-        self._autosync_signature = self._indexed_baseline().signature or self._source_tree_signature()
         self._autosync_last_sync_ms = int(time.time() * 1000)
         self._autosync_pending_events = 0
         self._autosync_state = "idle"
         self._autosync_reindex_count += 1
         self._record_autosync_event(event="reindex", reason=reason, reindexed=True)
+        return True
+
+    def _reindex_and_adopt_baseline(self) -> bool:
+        """Run the index subprocess; on success, measure from the baseline it recorded.
+
+        A run can succeed without recording one -- a seeded worktree index it declines
+        to rebuild still carries the main checkout's baseline. Adopting that would
+        re-detect the same change and reindex again on every tick, so a run that left
+        the baseline untouched falls back to the tree and HEAD as they are now.
+        """
+        before = self._indexed_baseline()
+        if not self._run_index_subprocess():
+            return False
+        after = self._indexed_baseline()
+        recorded = after if after != before else _IndexedBaseline()
+        self._autosync_signature = recorded.signature or self._source_tree_signature()
+        self._autosync_head = recorded.head or self._autosync_git_head() or self._autosync_head
         return True
 
     def _maybe_refresh_zoekt_index(self) -> None:
@@ -15268,7 +15283,6 @@ class CodeContextEngine:
         if head is not None and head != self._autosync_head:
             # On failure keep the old HEAD, so the next tick retries.
             if self._maybe_autosync_reindex_locked(known_change="head_moved"):
-                self._autosync_head = self._indexed_baseline().head or head
                 # The reindex reseeded the tree signature: that is a full check.
                 self._autosync_last_full_check_ms = now_ms
             return
