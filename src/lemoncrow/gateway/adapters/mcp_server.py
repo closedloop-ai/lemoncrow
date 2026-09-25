@@ -270,15 +270,15 @@ SERVER_VERSION = lemoncrow_version
 # not-planned — and opencode) plus owned lanes keep the full persona block.
 SERVER_INSTRUCTIONS = (
     "LemonCrow replaces the grep→read→re-read loop.\n"
-    "- Lead with `code_search`: one call = ranked matches (top source inline, "
-    "rest as path:Lx-Ly pointers) + related_symbols + candidate_files. Inline "
-    "source = already read; never shell-grep or re-verify indexed results.\n"
+    "- Any repo search (symbols, strings, regex) → `code_search`, all terms in ONE call; "
+    "inline source = already read.\n"
     "- Known path/symbols → `read`: ONE call, files=[...], exact :Lx-Ly ranges, "
     "never the same file twice. Need, not might-need: a speculative :full costs "
     "more than the turn it saves. Never cat/sed/head/tail.\n"
     "- ALL edits in ONE `edit` edits[] array; prefer {path: 'f.py:Lx-Ly', new} over old/new.\n"
     "- Independent calls (any tools) → ONE message.\n"
-    "- `bash` = execution only (tests, git, builds). Large output → a file, never inline prose.\n"
+    "- `bash` = execution only (tests, git, builds), never `grep -r`/`rg`/`git grep`/`find` on the repo. "
+    "Large output → a file, never prose.\n"
     "- Graphical data (plots, pixel grids, UI) → write a PNG and `read` it; "
     "don't infer visuals from raw bytes."
 )
