@@ -80,7 +80,8 @@ dependencies = [
 [project.optional-dependencies]
 mcp = ["mcp>=1.0"]
 memory = ["letta-client>=1.7.12"]
-memory-server = ["letta>=0.16.7"]
+# <0.17: from 0.34 (Oct 2026) the `letta` name ships "Letta Code", a terminal app, not the server.
+memory-server = ["letta>=0.16.7,<0.17"]
 smart = ["ollama>=0.4.0"]
 cloud = ["openai>=1.0"]
 postgres = [
