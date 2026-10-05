@@ -537,6 +537,7 @@ def _run_bash_tool(
         command,
         allowed_write_roots=[_shell_workspace_root, *_claude_additional_dirs(_shell_workspace_root)],
         cwd=effective_cwd,
+        search_root=_shell_workspace_root,
     )
 
     if policy.action == "block":

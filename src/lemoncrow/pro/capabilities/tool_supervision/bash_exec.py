@@ -1351,6 +1351,10 @@ def _file_write_within_allowed(command: str, allowed_roots: list[Path] | None) -
 
 
 def _split_command_segments(command: str) -> list[list[str]]:
+    return [segment for segment, _ in _split_command_segments_with_pipes(command)]
+
+
+def _split_command_segments_with_pipes(command: str) -> list[tuple[list[str], bool]]:
     """Split a command line into segments on shell control operators.
 
     ``bash -c`` runs the whole line, so blocklist checks that only inspect
@@ -1375,17 +1379,23 @@ def _split_command_segments(command: str) -> list[list[str]]:
         tokens = shlex.split(normalized, comments=False)
     except ValueError:
         return []
-    segments: list[list[str]] = []
+    # Each segment carries whether its stdin is a pipe (the operator before it was `|`).
+    segments: list[tuple[list[str], bool]] = []
     current: list[str] = []
+    previous_operator: str | None = None
+    piped = False
     for tok in tokens:
         if tok in operators:
             if current:
-                segments.append(current)
+                segments.append((current, piped))
                 current = []
+            previous_operator = tok
             continue
+        if not current:
+            piped = previous_operator == "|"
         current.append(tok)
     if current:
-        segments.append(current)
+        segments.append((current, piped))
     return segments
 
 
@@ -1820,6 +1830,357 @@ def _redirect_known_bad(command: str) -> CommandPolicyDecision | None:
     return None  # sed -i / other sed / other find / wget / git navigation -> ALLOW
 
 
+# Repo-wide content search through the shell (`grep -r`, `rg`, `git grep`) over
+# the indexed repo is blocked in favour of `code_search`. Instructions alone did
+# not move Opus 5.5: its build agents sent 5-10% of repo searches to code_search
+# (Oct 2026 transcript audit), against 15-18% for Opus 5. What the index cannot
+# answer still runs: single files, anything outside the repo (logs, scratch,
+# other checkouts), dependency and build dirs, other revisions (`git grep PAT
+# REV`), stdin, and searches whose output feeds another command (`| xargs`,
+# `$(...)`). code_search is ranked and capped, so exhaustive enumeration (every
+# match before a rename) keeps a way through: the opt-in prefix.
+SHELL_SEARCH_OPT_IN = "LEMONCROW_SHELL_SEARCH=1"
+_SHELL_SEARCH_OPT_IN_RE = re.compile(r"(?:^|[\s;&|(])LEMONCROW_SHELL_SEARCH=1(?=\s)")
+_SEARCH_OUTPUT_CONSUMED_RE = re.compile(r"\|\s*(?:xargs|while|parallel)\b|\$\(|`")
+_SHELL_SEARCH_BLOCK_REASON = (
+    "repo-wide shell search blocked: use `code_search` (symbols, strings, regex; all terms in one call). "
+    "Shell search still runs on single files, logs, scratch, dependency/build dirs and other revisions "
+    "(`git grep PATTERN REV`). Need every textual match, e.g. before a rename? Re-run with "
+    f"`{SHELL_SEARCH_OPT_IN} ` in front of the search command."
+)
+# Directories the code index skips; a search confined to one is not the index's job.
+_UNINDEXED_DIR_NAMES = frozenset(
+    {
+        ".git",
+        ".next",
+        ".turbo",
+        ".venv",
+        "venv",
+        "__pycache__",
+        ".mypy_cache",
+        ".pytest_cache",
+        "node_modules",
+        "vendor",
+        "dist",
+        "build",
+        "out",
+        "target",
+        "coverage",
+    }
+)
+# Flags whose value may be the next token. Short ones also end a bundled cluster
+# (`-iA3`, `-ie PAT`). `-e`/`-f` supply the pattern, so no operand is the pattern.
+_GREP_VALUE_FLAGS = frozenset(
+    {
+        "-e",
+        "-f",
+        "-A",
+        "-B",
+        "-C",
+        "-m",
+        "-d",
+        "-D",
+        "--regexp",
+        "--file",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--max-count",
+        "--include",
+        "--exclude",
+        "--exclude-dir",
+        "--exclude-from",
+        "--label",
+        "--binary-files",
+        "--devices",
+        "--directories",
+        "--group-separator",
+    }
+)
+_RG_VALUE_FLAGS = frozenset(
+    {
+        "-e",
+        "-f",
+        "-g",
+        "-t",
+        "-T",
+        "-A",
+        "-B",
+        "-C",
+        "-m",
+        "-M",
+        "-j",
+        "-r",
+        "-E",
+        "-d",
+        "--regexp",
+        "--file",
+        "--glob",
+        "--iglob",
+        "--type",
+        "--type-not",
+        "--type-add",
+        "--type-clear",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--max-count",
+        "--max-columns",
+        "--max-depth",
+        "--max-filesize",
+        "--threads",
+        "--replace",
+        "--encoding",
+        "--sort",
+        "--sortr",
+        "--color",
+        "--colors",
+        "--context-separator",
+        "--field-match-separator",
+        "--path-separator",
+        "--pre",
+        "--pre-glob",
+        "--ignore-file",
+    }
+)
+# rg flags that reach files the index skips (ignored/vendored), or list files instead of searching.
+_RG_OUT_OF_INDEX_FLAGS = frozenset(
+    {
+        "--no-ignore",
+        "--no-ignore-vcs",
+        "--no-ignore-dot",
+        "--no-ignore-parent",
+        "--no-ignore-global",
+        "--no-ignore-files",
+        "--no-ignore-exclude",
+        "--unrestricted",
+        "--files",
+        "--type-list",
+    }
+)
+_GIT_GREP_VALUE_FLAGS = frozenset(
+    {
+        "-e",
+        "-f",
+        "-A",
+        "-B",
+        "-C",
+        "-m",
+        "--after-context",
+        "--before-context",
+        "--context",
+        "--max-count",
+        "--max-depth",
+        "--threads",
+    }
+)
+# git options that take a separate value before the subcommand (`git -C dir grep`).
+_GIT_GLOBAL_VALUE_FLAGS = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env"})
+_GLOB_CHARS_RE = re.compile(r"[*?\[]")
+
+
+@dataclass(frozen=True)
+class _SearchArgs:
+    long_flags: frozenset[str]
+    short_flags: frozenset[str]
+    operands: list[str]  # everything after the pattern
+
+
+def _parse_search_args(args: list[str], value_flags: frozenset[str]) -> _SearchArgs | None:
+    """Split a grep-family argument list into flags and the operands after the pattern.
+
+    None when there is no pattern at all (malformed, or a non-search invocation).
+    """
+    long_flags: set[str] = set()
+    short_flags: set[str] = set()
+    operands: list[str] = []
+    pattern_from_flag = False
+    after_double_dash = False
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        i += 1
+        if after_double_dash or tok == "-" or not tok.startswith("-"):
+            operands.append(tok)
+            continue
+        if tok == "--":
+            after_double_dash = True
+            continue
+        if tok.startswith("--"):
+            name = tok.split("=", 1)[0]
+            long_flags.add(name)
+            pattern_from_flag |= name in ("--regexp", "--file")
+            if "=" not in tok and name in value_flags:
+                i += 1
+            continue
+        for pos, ch in enumerate(tok[1:], start=1):
+            short_flags.add(ch)
+            if f"-{ch}" in value_flags:
+                pattern_from_flag |= ch in "ef"
+                if pos == len(tok) - 1:
+                    i += 1  # value is the next token
+                break  # the rest of the cluster is this flag's value
+    if not pattern_from_flag:
+        if not operands:
+            return None
+        operands = operands[1:]
+    return _SearchArgs(frozenset(long_flags), frozenset(short_flags), operands)
+
+
+def _resolve_search_operands(operands: list[str], cwd: Path) -> list[Path] | None:
+    """The paths a search covers (cwd when none are named); None if one is opaque (`$VAR`)."""
+    if not operands:
+        return [cwd]
+    targets: list[Path] = []
+    for op in operands:
+        if "$" in op:
+            return None
+        glob = _GLOB_CHARS_RE.search(op)
+        if glob:
+            # `src/*.ts` searches inside src: judge the literal directory prefix.
+            prefix = op[: glob.start()]
+            op = prefix.rsplit("/", 1)[0] if "/" in prefix else "."
+        path = Path(op).expanduser()
+        targets.append(path if path.is_absolute() else cwd / path)
+    return targets
+
+
+def _git_grep_targets(tokens: list[str], cwd: Path) -> list[Path] | None:
+    """Paths a `git [-C dir] grep` searches in the working tree; None when it is not one,
+    or when it searches a revision instead (an operand that is not a path)."""
+    i = 1
+    while i < len(tokens) and tokens[i].startswith("-"):
+        if tokens[i] in _GIT_GLOBAL_VALUE_FLAGS and i + 1 < len(tokens):
+            if tokens[i] == "-C":
+                if "$" in tokens[i + 1]:
+                    return None
+                cwd = cwd / Path(tokens[i + 1]).expanduser()
+            i += 2
+            continue
+        i += 1
+    if i >= len(tokens) or tokens[i] != "grep":
+        return None
+    args = tokens[i + 1 :]
+    if "--" in args:
+        split = args.index("--")
+        parsed = _parse_search_args(args[:split], _GIT_GREP_VALUE_FLAGS)
+        if parsed is None or parsed.operands:
+            return None  # operands before `--` are revisions
+        pathspecs = args[split + 1 :]
+    else:
+        parsed = _parse_search_args(args, _GIT_GREP_VALUE_FLAGS)
+        if parsed is None:
+            return None
+        pathspecs = parsed.operands
+        for op in pathspecs:
+            if not op.startswith(":") and not _GLOB_CHARS_RE.search(op) and not (cwd / op).exists():
+                return None  # not a path, so a revision
+    # Pathspec magic (`:!dir`, `:(glob)...`) narrows the search inside cwd.
+    return _resolve_search_operands([p for p in pathspecs if not p.startswith(":")], cwd)
+
+
+def _repo_search_targets(tokens: list[str], cwd: Path) -> list[Path] | None:
+    """Paths a recursive content search covers; None when *tokens* is not one."""
+    head = os.path.basename(tokens[0]).lower()
+    if head in ("grep", "egrep", "fgrep"):
+        parsed = _parse_search_args(tokens[1:], _GREP_VALUE_FLAGS)
+        recursive = parsed is not None and (
+            bool(parsed.short_flags & {"r", "R"})
+            or bool(parsed.long_flags & {"--recursive", "--dereference-recursive"})
+        )
+        return _resolve_search_operands(parsed.operands, cwd) if parsed is not None and recursive else None
+    if head == "rg":
+        parsed = _parse_search_args(tokens[1:], _RG_VALUE_FLAGS)
+        if parsed is None or "u" in parsed.short_flags or parsed.long_flags & _RG_OUT_OF_INDEX_FLAGS:
+            return None
+        return _resolve_search_operands(parsed.operands, cwd)
+    if head == "git":
+        return _git_grep_targets(tokens, cwd)
+    return None
+
+
+def _indexed_repo_root(workspace: Path) -> Path | None:
+    """Main checkout root of the git repo holding *workspace*; a linked worktree resolves
+    to its main checkout, whose tree contains `.claude/worktrees/*`."""
+    for directory in (workspace, *workspace.parents):
+        dot_git = directory / ".git"
+        if dot_git.is_dir():
+            return directory
+        if dot_git.is_file():
+            try:
+                gitdir = dot_git.read_text(errors="replace").strip().removeprefix("gitdir:").strip()
+            except OSError:
+                return directory
+            marker = f"{os.sep}.git{os.sep}worktrees{os.sep}"
+            return Path(gitdir.split(marker, 1)[0]).resolve() if marker in gitdir else directory
+    return None
+
+
+def _covered_by_index(target: Path, repo_root: Path) -> bool:
+    try:
+        resolved = target.resolve()
+        relative = resolved.relative_to(repo_root)
+    except (OSError, ValueError):
+        return False
+    if any(part in _UNINDEXED_DIR_NAMES for part in relative.parts):
+        return False
+    return resolved.is_dir() and not _git_ignored(resolved)
+
+
+def _git_ignored(directory: Path) -> bool:
+    """Whether *directory* is gitignored (campaign state, caches), judged by the checkout
+    holding it -- a worktree's own, even when the main checkout ignores the worktree dir.
+    A failed check counts as ignored, so the search runs."""
+    top = next((d for d in (directory, *directory.parents) if (d / ".git").exists()), None)
+    if top is None or top == directory:
+        return False
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(top), "check-ignore", "-q", "--", str(directory.relative_to(top))],
+            capture_output=True,
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return proc.returncode != 1
+
+
+def _cd_target(tokens: list[str], cwd: Path) -> Path | None:
+    if len(tokens) == 1:
+        return Path.home()
+    destination = tokens[1]
+    if destination == "-" or "$" in destination:
+        return None
+    path = Path(destination).expanduser()
+    return path if path.is_absolute() else cwd / path
+
+
+def _shell_repo_search_block(command: str, *, cwd: Path, repo_root: Path) -> CommandPolicyDecision | None:
+    """Block a recursive grep/rg/git grep over the indexed repo (see SHELL_SEARCH_OPT_IN).
+
+    Fails open: whatever it cannot follow statically (`cd -`, `$VAR` paths) runs.
+    """
+    if _SHELL_SEARCH_OPT_IN_RE.search(command) or _SEARCH_OUTPUT_CONSUMED_RE.search(command):
+        return None
+    current = cwd
+    for segment, piped in _split_command_segments_with_pipes(command):
+        tokens = _strip_command_prefixes(segment)
+        if not tokens:
+            continue
+        if tokens[0] == "cd":
+            moved = _cd_target(tokens, current)
+            if moved is None:
+                return None
+            current = moved
+            continue
+        if piped:
+            continue  # searches its stdin, not the repo
+        targets = _repo_search_targets(tokens, current)
+        if targets and any(_covered_by_index(t, repo_root) for t in targets):
+            return CommandPolicyDecision(category="search", action="block", reason=_SHELL_SEARCH_BLOCK_REASON)
+    return None
+
+
 # Pipeline-aware rewrite (tier 1 detect + tier 2 safe rewrite). A streaming hex
 # formatter over a large file piped into `tail` forces the formatter to process
 # the ENTIRE file -- `tail` can't SIGPIPE-abort it early the way `head` can, so
@@ -1985,8 +2346,14 @@ def _rewrite_pipeline(command: str, cwd: str | Path | None) -> CommandPolicyDeci
 
 
 def classify_command(
-    command: str, *, allowed_write_roots: list[Path] | None = None, cwd: str | Path | None = None
+    command: str,
+    *,
+    allowed_write_roots: list[Path] | None = None,
+    cwd: str | Path | None = None,
+    search_root: str | Path | None = None,
 ) -> CommandPolicyDecision:
+    """*search_root* (the agent's workspace) turns on the repo-wide shell search block
+    for the git repo holding it; without it no search is blocked."""
     resolved_cwd = Path(cwd).resolve() if cwd else None
     # Block checks run per segment: bash -c executes the whole line, so chaining
     # and command substitution must not slip a dangerous segment past tokens[0].
@@ -1994,6 +2361,15 @@ def classify_command(
         blocked = _block_check_segment(segment, cwd=resolved_cwd)
         if blocked is not None:
             return blocked
+
+    if search_root is not None:
+        repo_root = _indexed_repo_root(Path(search_root).resolve())
+        if repo_root is not None:
+            search_blocked = _shell_repo_search_block(
+                command, cwd=resolved_cwd or Path(search_root).resolve(), repo_root=repo_root
+            )
+            if search_blocked is not None:
+                return search_blocked
 
     # Shell file-writes (`cat > file`, inline `python -c` open/write) must stay
     # inside the allowed write roots; outside them the edit tool is the right
