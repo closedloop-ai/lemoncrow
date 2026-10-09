@@ -1838,15 +1838,31 @@ def _redirect_known_bad(command: str) -> CommandPolicyDecision | None:
 # other checkouts), dependency and build dirs, other revisions (`git grep PAT
 # REV`), stdin, and searches whose output feeds another command (`| xargs`,
 # `$(...)`). code_search is ranked and capped, so exhaustive enumeration (every
-# match before a rename) keeps a way through: the opt-in prefix.
+# file to touch before a rename) keeps a way through: the opt-in prefix, set as an
+# assignment on the search itself, lets through only searches that list files or
+# count matches. Matching lines stay code_search's job -- an opt-in that unlocked
+# every search was prefixed onto 6x more searches than were ever blocked.
 SHELL_SEARCH_OPT_IN = "LEMONCROW_SHELL_SEARCH=1"
-_SHELL_SEARCH_OPT_IN_RE = re.compile(r"(?:^|[\s;&|(])LEMONCROW_SHELL_SEARCH=1(?=\s)")
 _SEARCH_OUTPUT_CONSUMED_RE = re.compile(r"\|\s*(?:xargs|while|parallel)\b|\$\(|`")
 _SHELL_SEARCH_BLOCK_REASON = (
     "repo-wide shell search blocked: use `code_search` (symbols, strings, regex; all terms in one call). "
     "Shell search still runs on single files, logs, scratch, dependency/build dirs and other revisions "
-    "(`git grep PATTERN REV`). Need every textual match, e.g. before a rename? Re-run with "
-    f"`{SHELL_SEARCH_OPT_IN} ` in front of the search command."
+    "(`git grep PATTERN REV`). Need every match, e.g. before a rename? List the files: "
+    f"`{SHELL_SEARCH_OPT_IN} grep -rl PATTERN DIR` (or `-c`, `git grep -l`). The prefix goes directly on "
+    "the search command and lets only file lists and counts through."
+)
+_SHELL_COMPOUND_KEYWORDS = frozenset({"do", "then", "else", "elif", "if", "while", "until", "!", "time"})
+# Output modes that print file names or per-file counts instead of matching lines.
+_LIST_SHORT_FLAGS = frozenset({"l", "L", "c"})
+_LIST_LONG_FLAGS = frozenset(
+    {
+        "--files-with-matches",
+        "--files-with-match",
+        "--files-without-match",
+        "--count",
+        "--count-matches",
+        "--name-only",
+    }
 )
 # Directories the code index skips; a search confined to one is not the index's job.
 _UNINDEXED_DIR_NAMES = frozenset(
@@ -2027,6 +2043,20 @@ def _parse_search_args(args: list[str], value_flags: frozenset[str]) -> _SearchA
     return _SearchArgs(frozenset(long_flags), frozenset(short_flags), operands)
 
 
+@dataclass(frozen=True)
+class _RepoSearch:
+    targets: list[Path]
+    lists_matches: bool  # prints file names or counts, not matching lines
+
+
+def _repo_search(parsed: _SearchArgs, operands: list[str], cwd: Path) -> _RepoSearch | None:
+    targets = _resolve_search_operands(operands, cwd)
+    if targets is None:
+        return None
+    lists = bool(parsed.short_flags & _LIST_SHORT_FLAGS or parsed.long_flags & _LIST_LONG_FLAGS)
+    return _RepoSearch(targets, lists)
+
+
 def _resolve_search_operands(operands: list[str], cwd: Path) -> list[Path] | None:
     """The paths a search covers (cwd when none are named); None if one is opaque (`$VAR`)."""
     if not operands:
@@ -2045,8 +2075,8 @@ def _resolve_search_operands(operands: list[str], cwd: Path) -> list[Path] | Non
     return targets
 
 
-def _git_grep_targets(tokens: list[str], cwd: Path) -> list[Path] | None:
-    """Paths a `git [-C dir] grep` searches in the working tree; None when it is not one,
+def _git_grep_search(tokens: list[str], cwd: Path) -> _RepoSearch | None:
+    """What a `git [-C dir] grep` searches in the working tree; None when it is not one,
     or when it searches a revision instead (an operand that is not a path)."""
     i = 1
     while i < len(tokens) and tokens[i].startswith("-"):
@@ -2076,26 +2106,26 @@ def _git_grep_targets(tokens: list[str], cwd: Path) -> list[Path] | None:
             if not op.startswith(":") and not _GLOB_CHARS_RE.search(op) and not (cwd / op).exists():
                 return None  # not a path, so a revision
     # Pathspec magic (`:!dir`, `:(glob)...`) narrows the search inside cwd.
-    return _resolve_search_operands([p for p in pathspecs if not p.startswith(":")], cwd)
+    return _repo_search(parsed, [p for p in pathspecs if not p.startswith(":")], cwd)
 
 
-def _repo_search_targets(tokens: list[str], cwd: Path) -> list[Path] | None:
-    """Paths a recursive content search covers; None when *tokens* is not one."""
+def _recursive_search(tokens: list[str], cwd: Path) -> _RepoSearch | None:
+    """What a recursive content search covers; None when *tokens* is not one."""
     head = os.path.basename(tokens[0]).lower()
     if head in ("grep", "egrep", "fgrep"):
         parsed = _parse_search_args(tokens[1:], _GREP_VALUE_FLAGS)
-        recursive = parsed is not None and (
-            bool(parsed.short_flags & {"r", "R"})
-            or bool(parsed.long_flags & {"--recursive", "--dereference-recursive"})
-        )
-        return _resolve_search_operands(parsed.operands, cwd) if parsed is not None and recursive else None
+        if parsed is None or not (
+            parsed.short_flags & {"r", "R"} or parsed.long_flags & {"--recursive", "--dereference-recursive"}
+        ):
+            return None
+        return _repo_search(parsed, parsed.operands, cwd)
     if head == "rg":
         parsed = _parse_search_args(tokens[1:], _RG_VALUE_FLAGS)
         if parsed is None or "u" in parsed.short_flags or parsed.long_flags & _RG_OUT_OF_INDEX_FLAGS:
             return None
-        return _resolve_search_operands(parsed.operands, cwd)
+        return _repo_search(parsed, parsed.operands, cwd)
     if head == "git":
-        return _git_grep_targets(tokens, cwd)
+        return _git_grep_search(tokens, cwd)
     return None
 
 
@@ -2155,28 +2185,46 @@ def _cd_target(tokens: list[str], cwd: Path) -> Path | None:
     return path if path.is_absolute() else cwd / path
 
 
-def _shell_repo_search_block(command: str, *, cwd: Path, repo_root: Path) -> CommandPolicyDecision | None:
+def _shell_repo_search_block(
+    command: str, *, cwd: Path, repo_root: Path, opted_in: bool = False
+) -> CommandPolicyDecision | None:
     """Block a recursive grep/rg/git grep over the indexed repo (see SHELL_SEARCH_OPT_IN).
 
-    Fails open: whatever it cannot follow statically (`cd -`, `$VAR` paths) runs.
+    Follows `cd` and inline shells (`bash -c '...'`). The opt-in counts only as an
+    assignment on the search's own segment, or on the inline shell running it --
+    never an `export` earlier in the chain. Fails open: whatever it cannot follow
+    statically (`cd -`, `$VAR` paths) runs.
     """
-    if _SHELL_SEARCH_OPT_IN_RE.search(command) or _SEARCH_OUTPUT_CONSUMED_RE.search(command):
+    if _SEARCH_OUTPUT_CONSUMED_RE.search(command):
         return None
     current = cwd
     for segment, piped in _split_command_segments_with_pipes(command):
         tokens = _strip_command_prefixes(segment)
+        # `for x in ...; do grep ...; done`: the loop body's command follows the keyword.
+        while tokens and tokens[0] in _SHELL_COMPOUND_KEYWORDS:
+            tokens = _strip_command_prefixes(tokens[1:])
         if not tokens:
             continue
+        segment_opted_in = opted_in or SHELL_SEARCH_OPT_IN in segment[: len(segment) - len(tokens)]
         if tokens[0] == "cd":
             moved = _cd_target(tokens, current)
             if moved is None:
                 return None
             current = moved
             continue
+        if os.path.basename(tokens[0]).lower() in _SHELL_INTERPRETERS:
+            payload = _inline_shell_payload(tokens)
+            if payload:
+                blocked = _shell_repo_search_block(payload, cwd=current, repo_root=repo_root, opted_in=segment_opted_in)
+                if blocked is not None:
+                    return blocked
+            continue
         if piped:
             continue  # searches its stdin, not the repo
-        targets = _repo_search_targets(tokens, current)
-        if targets and any(_covered_by_index(t, repo_root) for t in targets):
+        search = _recursive_search(tokens, current)
+        if search is None or (segment_opted_in and search.lists_matches):
+            continue
+        if any(_covered_by_index(t, repo_root) for t in search.targets):
             return CommandPolicyDecision(category="search", action="block", reason=_SHELL_SEARCH_BLOCK_REASON)
     return None
 
