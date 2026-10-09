@@ -57,13 +57,24 @@ def _blocked(command: str, repo: Path, cwd: Path | None = None) -> bool:
         "cd src && grep -rn f .",
         "ls; grep -rn f src",
         "timeout 10 rg f src",
+        "bash -c 'grep -rn f src'",  # inline shell
+        "for s in f g; do git grep -n $s -- src; done",  # loop body
+        "if true; then rg f src; fi",
+        'sh -c "cd src && rg f"',
+        # the opt-in does not unlock searches that print matching lines
+        "LEMONCROW_SHELL_SEARCH=1 grep -rn f src",
+        "cd src && LEMONCROW_SHELL_SEARCH=1 rg f",
+        "LEMONCROW_SHELL_SEARCH=1 bash -c 'grep -rn f src'",
+        # nor counts from anywhere but the search's own segment
+        "export LEMONCROW_SHELL_SEARCH=1; grep -rl f src",
+        "LEMONCROW_SHELL_SEARCH=1 ls && grep -rl f src",
     ],
 )
 def test_a_recursive_search_of_the_repo_is_blocked_and_names_the_alternatives(repo: Path, command: str) -> None:
     decision = _decide(command, repo)
     assert decision.action == "block", command
     assert "code_search" in (decision.reason or "")
-    assert bx.SHELL_SEARCH_OPT_IN in (decision.reason or "")
+    assert f"{bx.SHELL_SEARCH_OPT_IN} grep -rl" in (decision.reason or "")
 
 
 def test_a_search_inside_a_worktree_of_the_repo_is_blocked(repo: Path) -> None:
@@ -92,8 +103,16 @@ def test_a_search_inside_a_worktree_of_the_repo_is_blocked(repo: Path) -> None:
         "sed -i s/f/g/ $(grep -rl f src)",
         "grep -rn f $DIR",  # opaque path
         "cd - && grep -rn f .",
-        "LEMONCROW_SHELL_SEARCH=1 grep -rn f src",  # explicit opt-in
-        "cd src && LEMONCROW_SHELL_SEARCH=1 rg f",
+        # explicit opt-in on a search that lists files or counts matches
+        "LEMONCROW_SHELL_SEARCH=1 grep -rl f src",
+        "LEMONCROW_SHELL_SEARCH=1 grep -rc f src",
+        "LEMONCROW_SHELL_SEARCH=1 grep -r --files-with-matches f src | head",
+        "cd src && LEMONCROW_SHELL_SEARCH=1 rg -l f",
+        "LEMONCROW_SHELL_SEARCH=1 rg --count-matches f src",
+        "LEMONCROW_SHELL_SEARCH=1 git grep -l f -- src",
+        "env LEMONCROW_SHELL_SEARCH=1 git grep --name-only f",
+        "LEMONCROW_SHELL_SEARCH=1 bash -c 'cd src && grep -rl f .'",
+        "bash -c 'grep -n f src/pkg/mod.py'",
         "echo 'grep -rn f src'",
         "grep -rn f does-not-exist",
     ],
@@ -130,7 +149,7 @@ def test_the_mcp_bash_tool_returns_the_block_without_running_the_search(
     assert result["blocked"] is True
     assert "code_search" in result["blocked_reason"]
 
-    allowed = bash._run_bash_tool(command="LEMONCROW_SHELL_SEARCH=1 grep -rn 'def f' src", cwd=str(repo))
+    allowed = bash._run_bash_tool(command="LEMONCROW_SHELL_SEARCH=1 grep -rl 'def f' src", cwd=str(repo))
     assert isinstance(allowed, dict)
     assert not allowed.get("blocked")
     assert "mod.py" in str(allowed.get("stdout"))
