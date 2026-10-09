@@ -172,11 +172,18 @@ jobs:
           # lc-debt: fixes blocked by a pin, not accepted risk. mitmproxy (benchmarks
           # only; no newer release) pins cryptography<=48.1 and h2==4.3.0, so the fixed
           # versions cannot resolve. Drop these ignores once mitmproxy lifts the pins.
+          # lc-debt: CVE-2026-104851 (fsspec <2026.6.0) is fixed only under datasets>=5.1,
+          # which needs huggingface-hub>=1.31, which the semantic extra's
+          # sentence-transformers<5 (transformers<5) cannot use. The flaw is in fsspec's
+          # ReferenceFileSystem (Kerchunk reference JSON); nothing here opens one -- datasets
+          # is used only by the SWE-bench benchmark loader. Drop this ignore with the move
+          # to sentence-transformers 5.
           uvx pip-audit --requirement requirements-audit-filtered.txt \
             --ignore-vuln PYSEC-2026-3552 \
             --ignore-vuln PYSEC-2026-3553 \
             --ignore-vuln PYSEC-2026-3554 \
-            --ignore-vuln PYSEC-2026-3628
+            --ignore-vuln PYSEC-2026-3628 \
+            --ignore-vuln CVE-2026-104851
 
   macos-install:
     name: macOS install script (bash 3.2 compat)
