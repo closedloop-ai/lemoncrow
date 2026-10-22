@@ -168,6 +168,7 @@ def test_owned_edit_blocks_test_weakening(tmp_path, monkeypatch) -> None:
     # The owned runtime no longer publishes a self-authorize bypass; an edit that
     # WEAKENS a test (removes an assertion) is rolled back by the detector.
     monkeypatch.setenv("CLAUDE_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("LEMONCROW_TEST_CONTRACT_GUARD", "1")
     target = tmp_path / "tests" / "test_contract.py"
     target.parent.mkdir()
     target.write_text("def test_x():\n    assert value == 'old'\n    assert other == 1\n", encoding="utf-8")
