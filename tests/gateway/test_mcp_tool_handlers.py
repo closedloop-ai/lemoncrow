@@ -1367,6 +1367,7 @@ def test_smart_edit_blocks_test_assertion_removal(
     # roll back and surface a counterexample (the detector trips only on weakening).
     _ = store_root
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEMONCROW_TEST_CONTRACT_GUARD", "1")
     target = Path("tests/test_parser.py")
     target.parent.mkdir()
     target.write_text("def test_x():\n    assert compute() == 5\n    assert other() == 9\n", encoding="utf-8")
@@ -1396,11 +1397,43 @@ def test_smart_edit_blocks_test_assertion_removal(
     assert "assert compute() == 5" in target.read_text(encoding="utf-8")
 
 
+def test_smart_edit_test_contract_guard_off_by_default(
+    store_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _ = store_root
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("LEMONCROW_TEST_CONTRACT_GUARD", raising=False)
+    target = Path("tests/test_parser.py")
+    target.parent.mkdir()
+    target.write_text("def test_x():\n    assert compute() == 5\n    assert other() == 9\n", encoding="utf-8")
+
+    payload = _result(
+        _call(
+            "edit",
+            {
+                "edits": [
+                    {
+                        "file_path": str(target),
+                        "old_string": "    assert compute() == 5\n    assert other() == 9\n",
+                        "new_string": "    assert other() == 9\n",
+                    }
+                ],
+                "post_edit_hooks": False,
+            },
+        )
+    )
+
+    assert payload.get("rolled_back") is not True
+    assert "test_weakening" not in payload
+    assert "assert compute() == 5" not in target.read_text(encoding="utf-8")
+
+
 def test_smart_edit_blocks_test_skip_addition(
     store_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _ = store_root
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEMONCROW_TEST_CONTRACT_GUARD", "1")
     target = Path("tests/test_parser.py")
     target.parent.mkdir()
     target.write_text("def test_x():\n    assert compute() == 5\n", encoding="utf-8")
@@ -1432,6 +1465,7 @@ def test_smart_edit_allows_additive_test_edit(
     # Adding a new assertion to an existing test passes freely -- no friction.
     _ = store_root
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEMONCROW_TEST_CONTRACT_GUARD", "1")
     target = Path("tests/test_parser.py")
     target.parent.mkdir()
     target.write_text("def test_x():\n    assert compute() == 5\n", encoding="utf-8")
@@ -1464,6 +1498,7 @@ def test_smart_edit_allows_assertion_value_change(
     # assertions and passes -- the detector guards removal/skip, not value edits.
     _ = store_root
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEMONCROW_TEST_CONTRACT_GUARD", "1")
     target = Path("tests/test_parser.py")
     target.parent.mkdir()
     target.write_text("def test_x():\n    assert compute() == 5\n", encoding="utf-8")
@@ -1496,6 +1531,7 @@ def test_smart_edit_allows_test_weakening_paired_with_production_change(
     # as a genuine refactor (contract moved with the code), not a reward-hack.
     _ = store_root
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("LEMONCROW_TEST_CONTRACT_GUARD", "1")
     test_file = Path("tests/test_parser.py")
     test_file.parent.mkdir()
     test_file.write_text("def test_x():\n    assert compute() == 5\n    assert other() == 9\n", encoding="utf-8")

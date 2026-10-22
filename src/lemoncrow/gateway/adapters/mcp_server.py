@@ -7023,8 +7023,9 @@ _SESSION_CREATED_FILES: set[str] = set()
 # fixing the code. We trip ONLY on that signal -- additive edits (new tests or
 # assertions) and in-place assertion modifications pass freely. Heuristic and
 # language-fuzzy by design: it errs toward allowing, surfacing a counterexample +
-# rollback only on a clear net assertion-removal or skip/xfail addition. Operator
-# off-switch: LEMONCROW_TEST_CONTRACT_GUARD=0.
+# rollback only on a clear net assertion-removal or skip/xfail addition. Off by
+# default (it blocked legitimate test-only cleanup); opt in with
+# LEMONCROW_TEST_CONTRACT_GUARD=1.
 _ASSERTION_RE = re.compile(r"\bassert|\bexpect\s*\(|\bEXPECT_|\bASSERT_|\.should\b")
 _SKIP_XFAIL_RE = re.compile(
     r"@(?:pytest\.mark\.)?(?:skip|skipif|xfail)\b|@unittest\.skip|\bt\.Skip[a-zA-Z]*\("
@@ -7033,8 +7034,8 @@ _SKIP_XFAIL_RE = re.compile(
 
 
 def _test_contract_guard_enabled() -> bool:
-    """Whether the test-weakening guard runs (operator off-switch, default on)."""
-    return os.environ.get("LEMONCROW_TEST_CONTRACT_GUARD", "").strip().lower() not in ("0", "false", "no", "off")
+    """Whether the test-weakening guard runs (operator opt-in, default off)."""
+    return os.environ.get("LEMONCROW_TEST_CONTRACT_GUARD", "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def _classify_test_weakening(old_content: str, new_content: str) -> str | None:
